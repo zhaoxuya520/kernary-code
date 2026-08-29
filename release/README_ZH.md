@@ -14,6 +14,19 @@ bin/kernary exec --json "检查项目并运行测试"
 bin/harness --version
 ```
 
+## 首次模型设置
+
+发布版本不会默认启用 `fake/deterministic`。未配置模型时可以浏览命令和设置，但普通任务、Team、Review 与 Headless/Exec 会返回 `MODEL_NOT_CONFIGURED`，不会伪造 Agent 完成事件。
+
+在交互终端输入 `/` 打开完整命令面板，然后依次选择：
+
+```text
+/connect
+/model
+```
+
+方向键选择候选，Tab 补全；API Key 通过独立 Secure Lane 输入并进入 OS Credential Store。终端编辑支持左右光标、Home/End、Delete/Backspace、Ctrl+A/E/U/K/W、Ctrl+Left/Right 和安全 Bracketed Paste。
+
 `doctor`、`--help`、completion 和 man 生成不会创建项目 `.harness` 状态。
 
 ## 模型目录

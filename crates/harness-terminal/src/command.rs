@@ -75,9 +75,6 @@ pub enum SlashCommand {
     GoalHistory {
         limit: usize,
     },
-    Login {
-        provider: Option<String>,
-    },
     Lsp {
         operation: LspCommand,
     },
@@ -483,6 +480,29 @@ struct CommandSpec {
     description: &'static str,
 }
 
+/// 输入候选同时携带替换文本和帮助信息，避免 TUI 只显示裸命令名。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputSuggestion {
+    pub replacement: String,
+    pub label: String,
+    pub description: String,
+}
+
+impl InputSuggestion {
+    #[must_use]
+    pub fn new(
+        replacement: impl Into<String>,
+        label: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            replacement: replacement.into(),
+            label: label.into(),
+            description: description.into(),
+        }
+    }
+}
+
 const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/agent",
@@ -613,11 +633,6 @@ const COMMANDS: &[CommandSpec] = &[
         name: "/inspect",
         synopsis: "/inspect <session|config|context|memory|vector|repository|cache|tool|agent|plan>",
         description: "统一查看一个 Harness 子系统的当前只读状态",
-    },
-    CommandSpec {
-        name: "/login",
-        synopsis: "/login [openai|codex|anthropic|gemini|deepseek|openrouter|compatible]",
-        description: "显示安全登录入口；API Key 不作为 Slash 参数",
     },
     CommandSpec {
         name: "/lsp",
@@ -985,9 +1000,6 @@ impl CommandRegistry {
             "/goal" => SlashCommand::GoalSet {
                 text: remainder.to_owned(),
             },
-            "/login" => SlashCommand::Login {
-                provider: (!remainder.is_empty()).then(|| remainder.to_owned()),
-            },
             "/lsp" => SlashCommand::Lsp {
                 operation: parse_lsp(remainder)?,
             },
@@ -1167,6 +1179,32 @@ impl CommandRegistry {
         matches
     }
 
+    /// 返回可滚动 Slash 面板使用的完整候选。
+    ///
+    /// 根命令候选包含 synopsis 与说明；常用枚举参数也可以继续补全。
+    #[must_use]
+    pub fn suggestions(&self, input: &str) -> Vec<InputSuggestion> {
+        let normalized = input.trim_start();
+        if !normalized.starts_with('/') {
+            return Vec::new();
+        }
+        if normalized.contains(char::is_whitespace) {
+            return argument_suggestions(normalized);
+        }
+        COMMANDS
+            .iter()
+            .filter(|spec| spec.name.starts_with(normalized))
+            .map(|spec| {
+                let replacement = if spec.synopsis == spec.name {
+                    spec.name.to_owned()
+                } else {
+                    format!("{} ", spec.name)
+                };
+                InputSuggestion::new(replacement, spec.synopsis, spec.description)
+            })
+            .collect()
+    }
+
     #[must_use]
     pub fn help(&self, command: Option<&str>) -> Vec<String> {
         if let Some(command) = command {
@@ -1191,6 +1229,111 @@ impl CommandRegistry {
         );
         lines
     }
+}
+
+fn argument_suggestions(input: &str) -> Vec<InputSuggestion> {
+    let Some((command, remainder)) = input.split_once(char::is_whitespace) else {
+        return Vec::new();
+    };
+    let prefix = remainder.trim_start();
+    let values: &[(&str, &str)] = match command {
+        "/mode" => &[
+            ("lite", "最小资源与单 Agent 模式"),
+            ("balanced", "默认质量与资源平衡模式"),
+            ("full", "完整工具与多 Agent 模式"),
+            ("custom", "使用自定义预算与能力设置"),
+        ],
+        "/reasoning" | "/think" => &[
+            ("off", "关闭推理预算"),
+            ("minimal", "最小推理"),
+            ("low", "低推理"),
+            ("medium", "中等推理"),
+            ("high", "高推理"),
+            ("xhigh", "超高推理（需模型支持）"),
+            ("max", "最大推理（需模型支持）"),
+        ],
+        "/agents" => &[
+            ("normal", "标准 Agent 状态"),
+            ("verbose", "完整 Agent 能力与边界"),
+            ("compact", "紧凑单行状态"),
+            ("tree", "控制面与 Worker 树"),
+        ],
+        "/permissions" => &[
+            ("safe", "所有敏感操作询问"),
+            ("ask", "按规则询问"),
+            ("auto", "仅不可信操作询问"),
+            ("full", "Sandbox 内自动执行"),
+            ("custom", "使用自定义规则"),
+            ("rules", "列出持久权限规则"),
+            ("rule add ", "添加 allow/ask/deny 规则"),
+            ("rule remove ", "删除指定规则"),
+        ],
+        "/vector" => &[
+            ("status", "显示向量硬门与后端状态"),
+            ("on", "有 Embedding Model 时允许语义检索"),
+            ("off", "强制 lexical 路径"),
+            ("auto", "按能力与模式自动选择"),
+            ("purge", "清除向量投影"),
+        ],
+        "/git" => &[
+            ("status", "显示工作树状态"),
+            ("diff", "显示未提交差异"),
+            ("log", "显示最近提交"),
+            ("branch", "显示当前分支"),
+        ],
+        "/compact" => &[
+            ("auto", "按阈值决定是否压缩"),
+            ("safe", "保留关键证据的安全压缩"),
+            ("aggressive", "先 checkpoint 再强力压缩"),
+        ],
+        "/trace" => &[
+            ("status", "显示 Trace 状态"),
+            ("on", "开启有界 Trace"),
+            ("off", "关闭 Trace"),
+            ("last ", "查看最近 Trace 事件"),
+        ],
+        "/review" => &[("unstaged", "审查未暂存变更"), ("staged", "审查已暂存变更")],
+        "/browser" => &[
+            ("status", "显示 Browser Runtime 状态"),
+            ("open", "显式打开隔离浏览器"),
+            ("navigate ", "导航到 URL"),
+            ("actions", "列出可交互元素"),
+            ("handoff", "交还用户控制"),
+            ("reclaim", "收回 Agent 控制"),
+            ("close", "关闭隔离浏览器"),
+        ],
+        "/index" => &[
+            ("status", "显示 Repository Index 状态"),
+            ("build", "构建完整索引"),
+            ("update", "增量更新索引"),
+            ("clear", "清除索引"),
+            ("map", "显示代码地图"),
+            ("search ", "搜索 Repository Index"),
+        ],
+        _ => return help_argument_suggestions(command, prefix),
+    };
+    values
+        .iter()
+        .filter(|(value, _)| value.starts_with(prefix))
+        .map(|(value, description)| {
+            let replacement = format!("{command} {value}");
+            InputSuggestion::new(replacement.clone(), replacement, *description)
+        })
+        .collect()
+}
+
+fn help_argument_suggestions(command: &str, prefix: &str) -> Vec<InputSuggestion> {
+    if command != "/help" {
+        return Vec::new();
+    }
+    COMMANDS
+        .iter()
+        .filter(|spec| spec.name.trim_start_matches('/').starts_with(prefix))
+        .map(|spec| {
+            let replacement = format!("/help {}", spec.name.trim_start_matches('/'));
+            InputSuggestion::new(replacement, spec.synopsis, spec.description)
+        })
+        .collect()
 }
 
 fn parse_reasoning(value: &str) -> Result<ReasoningLevel, CommandParseError> {
@@ -1809,6 +1952,20 @@ mod tests {
                 "/steer"
             ]
         );
+        let suggestions = registry.suggestions("/");
+        assert_eq!(suggestions.len(), COMMANDS.len());
+        assert!(suggestions.iter().all(|suggestion| {
+            suggestion.label.starts_with('/') && !suggestion.description.is_empty()
+        }));
+        assert!(
+            suggestions
+                .iter()
+                .all(|suggestion| !suggestion.label.starts_with("/login"))
+        );
+        assert_eq!(
+            registry.suggestions("/mode b")[0].replacement,
+            "/mode balanced"
+        );
     }
 
     #[test]
@@ -2241,6 +2398,13 @@ mod tests {
             ParsedInput::Command(SlashCommand::Logout {
                 provider: "openai".to_owned()
             })
+        );
+        assert_eq!(
+            registry
+                .parse("/login")
+                .expect_err("slash login removed")
+                .code,
+            "unknown-command"
         );
         assert_eq!(
             registry

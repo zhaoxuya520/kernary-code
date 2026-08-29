@@ -54,6 +54,7 @@ clap_mangen = "=0.3.3"
 crossterm = "0.29"
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm_0_29"] }
 unicode-normalization = "0.1"
+unicode-width = "0.2"
 ureq = { version = "3.4", features = ["json", "platform-verifier"] }
 keyring = { version = "4.1", features = ["v1"] }
 process-wrap = { version = "9.1", default-features = false, features = ["std", "job-object", "process-group"] }

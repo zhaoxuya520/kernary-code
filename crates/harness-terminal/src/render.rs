@@ -140,10 +140,18 @@ impl PlainRenderer {
                 reasoning_requested,
                 reasoning_effective,
                 reasoning_mapping,
-            } => format!(
-                "Model {provider}/{model} · reasoning {reasoning_requested} → {} ({reasoning_mapping})",
-                reasoning_effective.as_deref().unwrap_or("unsupported")
-            ),
+            } => {
+                if (provider == "fake" && model == "deterministic")
+                    || (provider == "kernary-internal" && model == "unconfigured")
+                {
+                    "Model 未配置 · 使用 /connect 和 /model 完成首次设置".to_owned()
+                } else {
+                    format!(
+                        "Model {provider}/{model} · reasoning {reasoning_requested} → {} ({reasoning_mapping})",
+                        reasoning_effective.as_deref().unwrap_or("unsupported")
+                    )
+                }
+            }
             HarnessEvent::ModelUsage {
                 input_tokens,
                 cached_input_tokens,

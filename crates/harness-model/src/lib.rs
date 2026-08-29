@@ -11,6 +11,7 @@ mod reasoning;
 mod registry;
 mod runtime;
 mod types;
+mod unconfigured;
 
 pub use contract::validate_event_contract;
 pub use fake::{FakeModelProvider, FakeScenario};
@@ -24,4 +25,7 @@ pub use runtime::{
 pub use types::{
     CompletionStatus, ModelCapability, ModelError, ModelErrorKind, ModelEvent, ModelInputItem,
     ModelMessageRole, ModelRequest, ModelUsage, ReasoningMapping, ResponseFormat, ToolDefinition,
+};
+pub use unconfigured::{
+    UNCONFIGURED_MODEL_ID, UNCONFIGURED_PROVIDER_ID, UnconfiguredModelProvider,
 };

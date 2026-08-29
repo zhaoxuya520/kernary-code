@@ -51,9 +51,11 @@ use harness_memory::{
     EmbeddingConfig, HttpEmbeddingConfig, HttpEmbeddingFactory, MemoryKind, ProjectMemory,
     RepositoryIndex, RetrievalMode, SemanticCapability,
 };
+#[cfg(debug_assertions)]
+use harness_model::FakeModelProvider;
 use harness_model::{
-    CancellationToken, FakeModelProvider, ModelCapability, ModelRegistry, ModelRuntime,
-    ReasoningLevel,
+    CancellationToken, ModelCapability, ModelRegistry, ModelRuntime, ReasoningLevel,
+    UNCONFIGURED_MODEL_ID, UNCONFIGURED_PROVIDER_ID, UnconfiguredModelProvider,
 };
 use harness_permission::{
     ApprovalPolicy, PermissionEngine, PermissionRule, PermissionRuleAction, PermissionRuleEffect,
@@ -71,12 +73,12 @@ use harness_skill::{SkillRegistry, SkillSource};
 use harness_storage::{ProjectMaintenance, ProjectStateLock, SqliteKernelStore};
 use harness_terminal::{
     AgentDisplayMode, BackendResponse, BrowserCommand as BrowserCliCommand, BudgetCommand,
-    CommandRegistry, CompactCommandMode, FailoverCommand, GitCommand, IndexCommand, JsonRenderer,
-    LspCommand, MASCOT_NAME, McpCommand, MemoryCommand, PRODUCT_NAME, PRODUCT_SHORT_NAME,
-    ParsedInput, PermissionCommand, PlainRenderer, PluginCommand, QueueCommand, RenderStyle,
-    SecretPrompt, SettingLayer, SettingsCommand, SkillCommand, SlashCommand, TAGLINE, TeamCommand,
-    TerminalBackend, TerminalCapabilities, TerminalSnapshot, TraceCommand, TuiOptions,
-    VectorCommand, run_tui,
+    CommandRegistry, CompactCommandMode, FailoverCommand, GitCommand, IndexCommand,
+    InputSuggestion, JsonRenderer, LspCommand, MASCOT_NAME, McpCommand, MemoryCommand,
+    PRODUCT_NAME, PRODUCT_SHORT_NAME, ParsedInput, PermissionCommand, PlainRenderer, PluginCommand,
+    QueueCommand, RenderStyle, SecretPrompt, SettingLayer, SettingsCommand, SkillCommand,
+    SlashCommand, TAGLINE, TeamCommand, TerminalBackend, TerminalCapabilities, TerminalSnapshot,
+    TraceCommand, TuiOptions, VectorCommand, run_tui,
 };
 use harness_tool::{ToolInvocationJournal, ToolInvocationStatus, ToolRegistry, ToolRuntime};
 use harness_types::{
@@ -219,6 +221,85 @@ enum AuthProvider {
 
 type Application = HarnessApplication<SqliteKernelStore, SystemClock, ProcessIdGenerator>;
 
+const INTERNAL_TEST_PROVIDER: &str = "fake";
+const INTERNAL_TEST_MODEL: &str = "deterministic";
+
+fn is_internal_test_model(provider: &ProviderId, model: &ModelId) -> bool {
+    provider.as_str() == INTERNAL_TEST_PROVIDER && model.as_str() == INTERNAL_TEST_MODEL
+}
+
+fn is_unconfigured_model(provider: &ProviderId, model: &ModelId) -> bool {
+    provider.as_str() == UNCONFIGURED_PROVIDER_ID && model.as_str() == UNCONFIGURED_MODEL_ID
+}
+
+fn is_hidden_internal_model(provider: &ProviderId, model: &ModelId) -> bool {
+    is_internal_test_model(provider, model) || is_unconfigured_model(provider, model)
+}
+
+fn is_hidden_internal_model_name(selection: &str) -> bool {
+    selection == "fake/deterministic" || selection == "kernary-internal/unconfigured"
+}
+
+#[cfg(debug_assertions)]
+fn internal_test_model_enabled() -> bool {
+    compat_env_var("HARNESS_ENABLE_TEST_MODEL")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+}
+
+#[cfg(not(debug_assertions))]
+const fn internal_test_model_enabled() -> bool {
+    false
+}
+
+fn selection_is_ready(
+    catalog: &ProviderCatalog,
+    credentials: &dyn CredentialStore,
+    provider_id: &ProviderId,
+    model_id: &ModelId,
+    test_model_enabled: bool,
+) -> bool {
+    if is_internal_test_model(provider_id, model_id) {
+        return test_model_enabled;
+    }
+    if is_unconfigured_model(provider_id, model_id) {
+        return false;
+    }
+    let Some(provider) = catalog.get(provider_id) else {
+        return false;
+    };
+    if !provider
+        .routes
+        .iter()
+        .any(|route| route.models.iter().any(|candidate| candidate == model_id))
+    {
+        return false;
+    }
+    if !provider.credential_required {
+        return true;
+    }
+    provider
+        .credential_id
+        .as_deref()
+        .is_some_and(|credential_id| {
+            credentials
+                .get(&CredentialId::new(credential_id))
+                .is_ok_and(|secret| secret.is_some())
+        })
+}
+
+fn slash_requires_ready_model(command: &SlashCommand) -> bool {
+    matches!(
+        command,
+        SlashCommand::Reasoning { .. }
+            | SlashCommand::Review { .. }
+            | SlashCommand::Resume
+            | SlashCommand::Team {
+                operation: TeamCommand::Create { .. } | TeamCommand::Workflow { .. }
+            }
+    )
+}
+
 struct AppBackend {
     application: Application,
     registry: CommandRegistry,
@@ -231,12 +312,15 @@ struct AppBackend {
     event_log: VecDeque<EventEnvelope>,
     background_team: Option<BackgroundTeam>,
     pending_credential: Option<PendingCredential>,
+    model_ready: bool,
+    test_model_enabled: bool,
     /// 最后释放，保证 Application 与后台 Worker 都已停止。
     _project_lock: ProjectStateLock,
 }
 
 struct PendingCredential {
     request_id: String,
+    provider_id: ProviderId,
     display_name: String,
     credential_id: String,
 }
@@ -256,6 +340,149 @@ impl AppBackend {
             lines: vec![format!("! {error}")],
             ..BackendResponse::default()
         }
+    }
+
+    fn model_not_configured_response(&self) -> BackendResponse {
+        Self::response_error(
+            "MODEL_NOT_CONFIGURED: 尚未配置可用的真实模型；输入 /connect 选择 Provider，再输入 /model 选择模型",
+        )
+    }
+
+    fn provider_credential_ready(&self, provider_id: &ProviderId) -> Result<bool, String> {
+        let catalog = load_provider_catalog(Path::new(&self.project_root))
+            .map_err(|error| error.to_string())?;
+        let provider = catalog
+            .get(provider_id)
+            .ok_or_else(|| format!("Provider Catalog 中不存在 {provider_id}"))?;
+        if !provider.credential_required {
+            return Ok(true);
+        }
+        let credential_id = provider
+            .credential_id
+            .as_deref()
+            .ok_or_else(|| format!("Provider {provider_id} 缺少 credential_id"))?;
+        let store =
+            OsCredentialStore::new("dev.openai.harness").map_err(|error| error.to_string())?;
+        store
+            .get(&CredentialId::new(credential_id))
+            .map(|secret| secret.is_some())
+            .map_err(|error| error.to_string())
+    }
+
+    fn select_model(&mut self, provider: String, model: String) -> BackendResponse {
+        let provider_id = ProviderId::from(provider);
+        let model_id = ModelId::from(model);
+        if is_hidden_internal_model(&provider_id, &model_id)
+            && !(self.test_model_enabled && is_internal_test_model(&provider_id, &model_id))
+        {
+            return Self::response_error(
+                "fake/deterministic 仅供显式测试使用，发布版本不能选择测试模型",
+            );
+        }
+        match self.provider_credential_ready(&provider_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Self::response_error(format!(
+                    "CredentialRequired: {provider_id} 尚未连接；先输入 /connect {provider_id}"
+                ));
+            }
+            Err(error) => return Self::response_error(error),
+        }
+        match self.application.select_model(provider_id, model_id) {
+            Ok(model) => {
+                self.model_ready = true;
+                BackendResponse {
+                    lines: Self::model_lines(&model),
+                    ..BackendResponse::default()
+                }
+            }
+            Err(error) => Self::response_error(error),
+        }
+    }
+
+    fn input_suggestions(&self, input: &str) -> Vec<InputSuggestion> {
+        let normalized = input.trim_start();
+        let Some((command, remainder)) = normalized.split_once(char::is_whitespace) else {
+            return Vec::new();
+        };
+        let prefix = remainder.trim_start();
+        if matches!(command, "/connect" | "/logout")
+            || (command == "/models" && prefix.starts_with("refresh "))
+        {
+            let (replacement_prefix, provider_prefix) = if command == "/models" {
+                (
+                    "/models refresh ",
+                    prefix.trim_start_matches("refresh ").trim(),
+                )
+            } else {
+                (
+                    if command == "/connect" {
+                        "/connect "
+                    } else {
+                        "/logout "
+                    },
+                    prefix,
+                )
+            };
+            let Ok(catalog) = load_provider_catalog(Path::new(&self.project_root)) else {
+                return Vec::new();
+            };
+            return catalog
+                .list()
+                .into_iter()
+                .filter(|provider| provider.id.as_str().starts_with(provider_prefix))
+                .map(|provider| {
+                    let credential = if provider.credential_required {
+                        "secure credential"
+                    } else {
+                        "no credential required"
+                    };
+                    InputSuggestion::new(
+                        format!("{replacement_prefix}{}", provider.id),
+                        format!("{} · {}", provider.id, provider.display_name),
+                        format!("{} route(s) · {credential}", provider.routes.len()),
+                    )
+                })
+                .collect();
+        }
+        if command != "/model" {
+            return Vec::new();
+        }
+        let catalog = load_provider_catalog(Path::new(&self.project_root)).ok();
+        self.application
+            .models()
+            .into_iter()
+            .filter(|capability| {
+                !is_unconfigured_model(&capability.provider_id, &capability.model_id)
+                    && (self.test_model_enabled
+                        || !is_internal_test_model(&capability.provider_id, &capability.model_id))
+            })
+            .filter_map(|capability| {
+                let selection = format!("{}/{}", capability.provider_id, capability.model_id);
+                selection.starts_with(prefix).then(|| {
+                    let credential = catalog
+                        .as_ref()
+                        .and_then(|catalog| catalog.get(&capability.provider_id))
+                        .map_or("custom route", |provider| {
+                            if provider.credential_required {
+                                "use /connect before selection"
+                            } else {
+                                "local/keyless route"
+                            }
+                        });
+                    InputSuggestion::new(
+                        format!("/model {selection}"),
+                        selection,
+                        format!(
+                            "ctx {} · output {} · tools {} · {credential}",
+                            capability.context_window_tokens,
+                            capability.max_output_tokens,
+                            capability.tool_calling
+                        ),
+                    )
+                })
+            })
+            .collect()
     }
 
     fn persist_mcp_configs(
@@ -455,6 +682,7 @@ impl AppBackend {
         let request_id = format!("provider-credential:{provider_id}");
         self.pending_credential = Some(PendingCredential {
             request_id: request_id.clone(),
+            provider_id,
             display_name: definition.display_name.clone(),
             credential_id,
         });
@@ -515,6 +743,11 @@ impl AppBackend {
     }
 
     fn status_lines(status: &StatusView) -> Vec<String> {
+        let model = if is_hidden_internal_model_name(&status.model) {
+            "未配置".to_owned()
+        } else {
+            status.model.clone()
+        };
         vec![
             format!(
                 "Session  {} · {:?}",
@@ -525,7 +758,7 @@ impl AppBackend {
                 status.goal.as_deref().unwrap_or("<empty>"),
                 if status.goal_locked { " [locked]" } else { "" }
             ),
-            format!("Model    {} · reasoning {}", status.model, status.reasoning),
+            format!("Model    {model} · reasoning {}", status.reasoning),
             format!(
                 "Mode     {} · session version {}",
                 status.mode, status.session_version
@@ -1483,6 +1716,12 @@ impl AppBackend {
     }
 
     fn model_lines(model: &ModelView) -> Vec<String> {
+        if is_hidden_internal_model(&model.provider_id, &model.model_id) {
+            return vec![
+                "Model      未配置".to_owned(),
+                "下一步     /connect 选择 Provider，然后 /model 选择真实模型".to_owned(),
+            ];
+        }
         vec![
             format!("Model      {}/{}", model.provider_id, model.model_id),
             format!(
@@ -1894,6 +2133,7 @@ impl TerminalBackend for AppBackend {
             Err(error) => return Self::response_error(error),
         };
         match parsed {
+            ParsedInput::Text(_) if !self.model_ready => self.model_not_configured_response(),
             ParsedInput::Text(text) if self.background_team.is_some() => {
                 match self.application.steer(&text) {
                     Ok(steering) => {
@@ -1920,6 +2160,11 @@ impl TerminalBackend for AppBackend {
                 },
                 Err(error) => Self::response_error(error),
             },
+            ParsedInput::Command(command)
+                if !self.model_ready && slash_requires_ready_model(&command) =>
+            {
+                self.model_not_configured_response()
+            }
             ParsedInput::Command(command) => match command {
                 SlashCommand::Account => match self.application.account() {
                     Ok(account) => BackendResponse {
@@ -2281,20 +2526,6 @@ impl TerminalBackend for AppBackend {
                     lines: self.registry.help(command.as_deref()),
                     ..BackendResponse::default()
                 },
-                SlashCommand::Login { provider } => {
-                    let provider = provider.unwrap_or_else(|| "openai".to_owned());
-                    if provider == "codex" {
-                        BackendResponse {
-                            lines: vec![
-                                "Codex 使用官方 delegated auth；请运行：kernary login codex"
-                                    .to_owned(),
-                            ],
-                            ..BackendResponse::default()
-                        }
-                    } else {
-                        self.begin_provider_connect(Some(provider))
-                    }
-                }
                 SlashCommand::Connect { provider } => self.begin_provider_connect(provider),
                 SlashCommand::Lsp { operation } => self.handle_lsp(operation),
                 SlashCommand::Memory { operation } => match operation {
@@ -2565,16 +2796,9 @@ impl TerminalBackend for AppBackend {
                     },
                     Err(error) => Self::response_error(error),
                 },
-                SlashCommand::ModelSelect { provider, model } => match self
-                    .application
-                    .select_model(ProviderId::from(provider), ModelId::from(model))
-                {
-                    Ok(model) => BackendResponse {
-                        lines: Self::model_lines(&model),
-                        ..BackendResponse::default()
-                    },
-                    Err(error) => Self::response_error(error),
-                },
+                SlashCommand::ModelSelect { provider, model } => {
+                    self.select_model(provider, model)
+                }
                 SlashCommand::Models { refresh, provider } => {
                     let refreshed_provider = provider.clone();
                     let mut models = if refresh {
@@ -2588,6 +2812,11 @@ impl TerminalBackend for AppBackend {
                     } else {
                         self.application.models()
                     };
+                    models.retain(|model| {
+                        !is_unconfigured_model(&model.provider_id, &model.model_id)
+                            && (self.test_model_enabled
+                                || !is_internal_test_model(&model.provider_id, &model.model_id))
+                    });
                     if refresh
                         && let Some(provider) = refreshed_provider.as_deref()
                     {
@@ -2866,7 +3095,14 @@ impl TerminalBackend for AppBackend {
                 },
                 SlashCommand::Provider => match self.application.model() {
                     Ok(model) => BackendResponse {
-                        lines: vec![format!("Provider: {}", model.provider_id)],
+                        lines: vec![if is_hidden_internal_model(
+                            &model.provider_id,
+                            &model.model_id,
+                        ) {
+                            "Provider: 未配置".to_owned()
+                        } else {
+                            format!("Provider: {}", model.provider_id)
+                        }],
                         ..BackendResponse::default()
                     },
                     Err(error) => Self::response_error(error),
@@ -3300,7 +3536,14 @@ impl TerminalBackend for AppBackend {
         let cache = self.application.cache();
         match status {
             Ok(status) => TerminalSnapshot {
-                model: status.model,
+                model: if self.model_ready {
+                    status.model
+                } else if is_hidden_internal_model_name(&status.model) {
+                    "未配置".to_owned()
+                } else {
+                    format!("{} [未连接]", status.model)
+                },
+                model_configured: self.model_ready,
                 mode: status.mode,
                 reasoning: status.reasoning,
                 context_percent: context.as_ref().map_or(0, |context| context.percent),
@@ -3312,6 +3555,7 @@ impl TerminalBackend for AppBackend {
             },
             Err(_) => TerminalSnapshot {
                 model: "unavailable".to_owned(),
+                model_configured: false,
                 mode: "lite".to_owned(),
                 reasoning: "off".to_owned(),
                 context_percent: context.as_ref().map_or(0, |context| context.percent),
@@ -3370,18 +3614,36 @@ impl TerminalBackend for AppBackend {
             Err(error) => return Self::response_error(error),
         };
         if let Err(error) = store.put(
-            &CredentialId::new(pending.credential_id),
+            &CredentialId::new(&pending.credential_id),
             SecretString::new(secret),
         ) {
             return Self::response_error(error);
         }
+        if self
+            .application
+            .model()
+            .is_ok_and(|model| model.provider_id == pending.provider_id)
+        {
+            self.model_ready = true;
+        }
         BackendResponse {
-            lines: vec![format!(
-                "{} credential 已保存到 OS Credential Store",
-                pending.display_name
-            )],
+            lines: vec![
+                format!(
+                    "{} credential 已保存到 OS Credential Store",
+                    pending.display_name
+                ),
+                if self.model_ready {
+                    "当前模型已可用，可以开始输入任务。".to_owned()
+                } else {
+                    format!("下一步输入 /model 并选择 {} 模型。", pending.provider_id)
+                },
+            ],
             ..BackendResponse::default()
         }
+    }
+
+    fn complete_input(&self, input: &str) -> Vec<InputSuggestion> {
+        self.input_suggestions(input)
     }
 
     fn poll(&mut self) -> BackendResponse {
@@ -3491,6 +3753,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let (provider, model) = parse_model_selection(selection)?;
         backend.application.select_model(provider, model)?;
     }
+    if matches!(
+        &cli.command,
+        Some(Command::Run { .. } | Command::Exec { .. })
+    ) && !backend.model_ready
+    {
+        return Err(
+            "MODEL_NOT_CONFIGURED: 先运行 `kernary connect <provider>`，再使用 `--model provider/model`"
+                .into(),
+        );
+    }
     match cli.command {
         Some(Command::Run {
             prompt,
@@ -3572,6 +3844,7 @@ fn run_models_command(
     } else {
         application.models()
     };
+    models.retain(|model| !is_hidden_internal_model(&model.provider_id, &model.model_id));
     let filter_provider = provider.or_else(|| refreshed_provider.clone());
     if let Some(provider) = filter_provider {
         models.retain(|model| model.provider_id.as_str() == provider);
@@ -3859,16 +4132,39 @@ fn build_backend(
     let session_id = SessionId::from("session:default");
     let persisted = store.recover_session(&session_id)?;
     let config = load_runtime_config(project_root, &persisted.settings)?;
+    let test_model_enabled = internal_test_model_enabled();
     let persisted_selection = persisted
         .model
         .provider_id
         .clone()
-        .zip(persisted.model.model_id.clone());
+        .zip(persisted.model.model_id.clone())
+        .filter(|(provider, model)| {
+            !is_unconfigured_model(provider, model)
+                && (test_model_enabled || !is_internal_test_model(provider, model))
+        });
     let requested_selection = requested_model.map(parse_model_selection).transpose()?;
-    let initial_selection = persisted_selection
+    if let Some((provider, model)) = requested_selection.as_ref()
+        && is_hidden_internal_model(provider, model)
+        && !(test_model_enabled && is_internal_test_model(provider, model))
+    {
+        return Err("内部占位/测试模型不能用于发布运行".into());
+    }
+    let initial_selection = requested_selection
         .clone()
-        .or_else(|| requested_selection.clone())
-        .unwrap_or_else(|| (ProviderId::from("fake"), ModelId::from("deterministic")));
+        .or_else(|| persisted_selection.clone())
+        .unwrap_or_else(|| {
+            if test_model_enabled {
+                (
+                    ProviderId::from(INTERNAL_TEST_PROVIDER),
+                    ModelId::from(INTERNAL_TEST_MODEL),
+                )
+            } else {
+                (
+                    ProviderId::from(UNCONFIGURED_PROVIDER_ID),
+                    ModelId::from(UNCONFIGURED_MODEL_ID),
+                )
+            }
+        });
 
     let credentials: Arc<dyn CredentialStore> =
         Arc::new(OsCredentialStore::new("dev.openai.harness")?);
@@ -3878,17 +4174,28 @@ fn build_backend(
             provider_catalog.extend_explicit_single_route_model(provider_id, model_id.clone())?;
         }
     }
+    let model_ready = selection_is_ready(
+        &provider_catalog,
+        credentials.as_ref(),
+        &initial_selection.0,
+        &initial_selection.1,
+        test_model_enabled,
+    );
     let mut model_registry = ModelRegistry::new();
-    let fake_delay = compat_env_var("HARNESS_FAKE_EVENT_DELAY_MILLIS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::ZERO);
-    model_registry.register(Arc::new(if fake_delay.is_zero() {
-        FakeModelProvider::echo()
-    } else {
-        FakeModelProvider::echo_with_delay(fake_delay)
-    }))?;
+    model_registry.register(Arc::new(UnconfiguredModelProvider))?;
+    #[cfg(debug_assertions)]
+    if test_model_enabled {
+        let fake_delay = compat_env_var("HARNESS_FAKE_EVENT_DELAY_MILLIS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::ZERO);
+        model_registry.register(Arc::new(if fake_delay.is_zero() {
+            FakeModelProvider::echo()
+        } else {
+            FakeModelProvider::echo_with_delay(fake_delay)
+        }))?;
+    }
     for (provider_name, model_env, endpoint, credential_id, reasoning_field) in [(
         "compatible",
         "HARNESS_COMPAT_MODEL",
@@ -4261,6 +4568,8 @@ fn build_backend(
             event_log: VecDeque::new(),
             background_team: None,
             pending_credential: None,
+            model_ready,
+            test_model_enabled,
             _project_lock: project_lock,
         },
         subscription,
@@ -5091,8 +5400,8 @@ fn doctor(
             "unicode": capabilities.unicode,
             "name": capabilities.terminal_name,
         },
-        "model": "fake/deterministic",
-        "provider": "fake",
+        "model": "unconfigured",
+        "provider": serde_json::Value::Null,
         "providers": {
             "catalogCount": providers.len(),
             "customConfigPresent": provider_config_path.is_file(),
@@ -5152,7 +5461,7 @@ fn doctor(
         println!("{TAGLINE}");
         println!("Storage schema: {}", store.schema_version()?);
         println!("Terminal TTY: {}", capabilities.is_tty);
-        println!("Model: fake/deterministic");
+        println!("Model: unconfigured (由 Session 或 --model 在运行时选择)");
     }
     Ok(())
 }

@@ -13,11 +13,116 @@ type CliFactory = fn() -> Command;
 type DocumentationCase<'a> = (CliFactory, Vec<&'a str>, &'a str);
 
 fn harness() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_harness"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_harness"));
+    command.env("KERNARY_ENABLE_TEST_MODEL", "1");
+    command
 }
 
 fn kernary() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_kernary"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kernary"));
+    command.env("KERNARY_ENABLE_TEST_MODEL", "1");
+    command
+}
+
+fn kernary_without_test_model() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kernary"));
+    command.env_remove("KERNARY_ENABLE_TEST_MODEL");
+    command.env_remove("HARNESS_ENABLE_TEST_MODEL");
+    command
+}
+
+#[test]
+fn published_default_has_no_fake_model_and_refuses_unconfigured_work() {
+    let temporary = tempdir().expect("tempdir");
+    let output = kernary_without_test_model()
+        .current_dir(temporary.path())
+        .args(["run", "--headless", "do", "real", "work"])
+        .output()
+        .expect("unconfigured run");
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert!(stderr.contains("MODEL_NOT_CONFIGURED"), "stderr={stderr}");
+    assert!(!stdout.contains("deterministic:"), "stdout={stdout}");
+    assert!(!stdout.contains("Agent 已完成"), "stdout={stdout}");
+
+    let doctor = kernary_without_test_model()
+        .current_dir(temporary.path())
+        .args(["doctor", "--json"])
+        .output()
+        .expect("doctor");
+    assert!(doctor.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&doctor.stdout).expect("doctor json");
+    assert_eq!(report["model"], "unconfigured");
+    assert!(report["provider"].is_null());
+
+    let mut child = kernary_without_test_model()
+        .current_dir(temporary.path())
+        .args(["--ui", "plain", "--ascii"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("plain unconfigured");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"/model\n/models\nreal work\n/exit\n")
+        .expect("commands");
+    let plain = child.wait_with_output().expect("plain output");
+    assert!(plain.status.success());
+    let stdout = String::from_utf8(plain.stdout).expect("plain stdout");
+    assert!(stdout.contains("Model      未配置"), "stdout={stdout}");
+    assert!(stdout.contains("MODEL_NOT_CONFIGURED"), "stdout={stdout}");
+    assert!(!stdout.contains("fake/deterministic"), "stdout={stdout}");
+    assert!(
+        !stdout.contains("kernary-internal/unconfigured"),
+        "stdout={stdout}"
+    );
+    assert!(!stdout.contains("deterministic:"), "stdout={stdout}");
+}
+
+#[test]
+fn legacy_persisted_fake_selection_migrates_to_unconfigured_without_data_loss() {
+    let temporary = tempdir().expect("tempdir");
+    let mut legacy = kernary()
+        .current_dir(temporary.path())
+        .args(["--ui", "plain", "--ascii"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("legacy process");
+    legacy
+        .stdin
+        .as_mut()
+        .expect("legacy stdin")
+        .write_all(b"/goal set preserve-me\n/exit\n")
+        .expect("legacy commands");
+    assert!(legacy.wait().expect("legacy wait").success());
+
+    let mut migrated = kernary_without_test_model()
+        .current_dir(temporary.path())
+        .args(["--ui", "plain", "--ascii"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("migrated process");
+    migrated
+        .stdin
+        .as_mut()
+        .expect("migrated stdin")
+        .write_all(b"/goal\n/status\n/exit\n")
+        .expect("migrated commands");
+    let output = migrated.wait_with_output().expect("migrated output");
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("Goal: preserve-me"), "stdout={stdout}");
+    assert!(stdout.contains("Model    未配置"), "stdout={stdout}");
+    assert!(!stdout.contains("fake/deterministic"), "stdout={stdout}");
 }
 
 fn git_executable() -> Option<String> {
@@ -411,7 +516,7 @@ fn kernary_is_primary_harness_is_alias_and_both_share_durable_session() {
         .stdin
         .as_mut()
         .expect("stdin")
-        .write_all(b"/goal\n/model\n/exit\n")
+        .write_all(b"/goal\n/status\n/exit\n")
         .expect("commands");
     let output = primary.wait_with_output().expect("wait");
     assert!(output.status.success());
@@ -420,7 +525,7 @@ fn kernary_is_primary_harness_is_alias_and_both_share_durable_session() {
         stdout.contains("Goal: shared-brand-session"),
         "stdout={stdout}"
     );
-    assert!(stdout.contains("Reasoning  High"), "stdout={stdout}");
+    assert!(stdout.contains("reasoning high"), "stdout={stdout}");
     assert!(temporary.path().join(".harness/kernel.sqlite").is_file());
     assert!(!temporary.path().join(".kernary").exists());
 }
@@ -927,10 +1032,12 @@ fn plain_mode_accepts_slash_commands_from_stdin() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
     assert!(stdout.contains("Session  session:default"));
-    assert!(stdout.contains("Model      fake/deterministic"));
-    assert!(stdout.contains("Reasoning  Max"));
-    assert!(stdout.contains("ClampedDown"));
-    assert!(stdout.contains("Provider: fake"));
+    assert!(stdout.contains("Model      未配置"));
+    assert!(
+        stdout.contains("Model    未配置 | reasoning max"),
+        "stdout={stdout}"
+    );
+    assert!(stdout.contains("Provider: 未配置"));
     assert!(stdout.contains("files.read@1"));
     assert!(stdout.contains("Pending approvals: 0"));
     assert!(stdout.contains("Filesystem tools: canonical workspace containment active"));
@@ -1023,13 +1130,12 @@ fn model_and_reasoning_selection_resume_from_session_events() {
         .stdin
         .as_mut()
         .expect("stdin")
-        .write_all(b"/model\n/exit\n")
+        .write_all(b"/status\n/exit\n")
         .expect("write");
     let output = second.wait_with_output().expect("wait second");
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("stdout");
-    assert!(stdout.contains("Reasoning  Max"));
-    assert!(stdout.contains("High (ClampedDown)"));
+    assert!(stdout.contains("reasoning max"), "stdout={stdout}");
 }
 
 #[test]

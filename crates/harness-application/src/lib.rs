@@ -6188,6 +6188,44 @@ where
             return Ok(());
         }
         let state = self.recover_session()?;
+        let legacy_fake_selection = state.model.provider_id.as_ref().is_some_and(|provider| {
+            provider.as_str() == "fake"
+                && state
+                    .model
+                    .model_id
+                    .as_ref()
+                    .is_some_and(|model| model.as_str() == "deterministic")
+        });
+        let legacy_fake_is_registered = self
+            .model_runtime
+            .as_ref()
+            .expect("runtime 已检查")
+            .models()
+            .iter()
+            .any(|model| {
+                model.provider_id.as_str() == "fake" && model.model_id.as_str() == "deterministic"
+            });
+        if legacy_fake_selection && !legacy_fake_is_registered {
+            // 0.1 早期发布错误地把 deterministic 测试模型持久化为用户选择。
+            // 新发布版将它迁移为 Runtime 当前的显式“未配置”占位；只追加
+            // Session Event，不删除 Goal、Context 或其他历史。
+            let view = self
+                .model_runtime
+                .as_ref()
+                .expect("runtime 已检查")
+                .view()
+                .map_err(|error| ApplicationError::new(error.code, error.message))?;
+            self.apply_session_command(SessionCommand::SelectModel {
+                provider_id: view.provider_id.clone(),
+                model_id: view.model_id.clone(),
+            })?;
+            if state.model.reasoning != view.reasoning_requested {
+                self.apply_session_command(SessionCommand::SetReasoning {
+                    reasoning: view.reasoning_requested,
+                })?;
+            }
+            return self.publish_model_changed(&view);
+        }
         let runtime = self.model_runtime.as_mut().expect("runtime 已检查");
         match (
             state.model.provider_id.clone(),

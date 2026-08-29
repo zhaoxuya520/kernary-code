@@ -12,9 +12,9 @@ pub use brand::{
 };
 pub use command::{
     AgentDisplayMode, BrowserCommand, BudgetCommand, CommandRegistry, CompactCommandMode,
-    FailoverCommand, GitCommand, IndexCommand, LspCommand, McpCommand, MemoryCommand, ParsedInput,
-    PermissionCommand, PluginCommand, QueueCommand, SettingLayer, SettingsCommand, SkillCommand,
-    SlashCommand, TeamCommand, TraceCommand, VectorCommand,
+    FailoverCommand, GitCommand, IndexCommand, InputSuggestion, LspCommand, McpCommand,
+    MemoryCommand, ParsedInput, PermissionCommand, PluginCommand, QueueCommand, SettingLayer,
+    SettingsCommand, SkillCommand, SlashCommand, TeamCommand, TraceCommand, VectorCommand,
 };
 pub use render::{ActivityIcon, JsonRenderer, PlainRenderer, RenderStyle, TerminalCapabilities};
 pub use tui::{

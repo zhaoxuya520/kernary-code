@@ -17,11 +17,33 @@ kernary --help
 
 ```bash
 kernary
-kernary run --headless "检查当前项目"
-kernary exec --json "运行测试并总结结果"
 kernary providers
 kernary models --provider opencode-go
 ```
+
+Kernary 不会在未配置模型时用测试模型伪造结果。第一次进入终端后：
+
+```text
+/connect
+/model
+```
+
+`/connect` 使用不回显的安全输入通道保存 Provider Key；`/model` 只选择真实或本地模型。完成后即可提交普通任务，或运行：
+
+```bash
+kernary --model openai/gpt-5.6-sol exec --json "运行测试并总结结果"
+```
+
+未配置可用模型时，普通输入与 Headless/Exec 会明确返回 `MODEL_NOT_CONFIGURED`，不会创建 Agent Mission 或模拟 Usage。
+
+## 终端输入
+
+- `←` / `→`：按 Unicode 字符移动光标；`Ctrl+←` / `Ctrl+→`：按单词移动；
+- `Home` / `End`、`Delete` / `Backspace`：在任意输入位置编辑；
+- `Ctrl+A` / `Ctrl+E`、`Ctrl+U` / `Ctrl+K` / `Ctrl+W`：兼容常用 Shell 行编辑；
+- 输入 `/`：打开完整可滚动命令面板；`↑` / `↓` 选择，`Tab` 补全，`Esc` 关闭；
+- `/connect ` 与 `/model `：动态列出 Provider 与模型；
+- Bracketed Paste 会作为单行文本插入，不会因换行意外提交多条命令。
 
 ## 核心能力
 
@@ -45,7 +67,7 @@ cargo build --release -p harness-cli --bins
 cargo test --workspace --locked
 ```
 
-Rust toolchain 版本见 `rust-toolchain.toml`。
+Rust toolchain 版本见 `rust-toolchain.toml`。完整中文架构索引见 [TERMINAL_HARNESS_DESIGN_INDEX_ZH.md](TERMINAL_HARNESS_DESIGN_INDEX_ZH.md)。
 
 ## npm 包结构
 
