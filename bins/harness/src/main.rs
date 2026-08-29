@@ -73,6 +73,7 @@ use harness_provider_compatible::{
     CompatibleProvider, CompatibleProviderConfig, CompatibleReasoningField,
 };
 use harness_provider_runtime::CatalogProviderRuntime;
+use harness_sandbox::{ProcessSandbox, SandboxMode};
 use harness_skill::{SkillRegistry, SkillSource};
 use harness_storage::{ProjectMaintenance, ProjectStateLock, SqliteKernelStore};
 use harness_terminal::{
@@ -130,6 +131,15 @@ struct Cli {
     /// 显式确认 CLI bypass 最高权限模式。
     #[arg(long, requires = "permission_mode", global = true)]
     confirm_bypass: bool,
+    /// 本次运行的系统级子进程沙箱。
+    #[arg(long, value_parser = ["read-only", "workspace-write", "danger-full-access"], global = true)]
+    sandbox: Option<String>,
+    /// 显式确认关闭系统级文件与网络边界。
+    #[arg(long, requires = "sandbox", global = true)]
+    confirm_dangerous_sandbox: bool,
+    /// 显式允许受限 Sandbox 内的子进程访问网络；默认关闭。
+    #[arg(long, global = true)]
+    sandbox_network_access: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -437,6 +447,7 @@ struct AppBackend {
     pending_setup: Option<SetupState>,
     model_ready: bool,
     test_model_enabled: bool,
+    process_sandbox: Arc<ProcessSandbox>,
     /// 最后释放，保证 Application 与后台 Worker 都已停止。
     _project_lock: ProjectStateLock,
 }
@@ -478,6 +489,12 @@ enum SetupState {
         mode: String,
         confirmation: String,
     },
+    SandboxDanger {
+        confirmation: String,
+    },
+    SandboxNetwork {
+        confirmation: String,
+    },
 }
 
 struct BackgroundTeam {
@@ -504,12 +521,66 @@ impl AppBackend {
         )
     }
 
+    fn sync_sandbox_policy(&self) -> Result<(), String> {
+        let settings = &self.application.config().settings;
+        self.process_sandbox
+            .set_policy(settings.sandbox_mode, settings.sandbox_network_access)
+            .map_err(|error| error.to_string())
+    }
+
+    fn sandbox_lines(&self) -> Result<Vec<String>, String> {
+        let status = self
+            .process_sandbox
+            .status()
+            .map_err(|error| error.to_string())?;
+        let mut lines = vec![
+            format!("Sandbox mode: {}", status.mode),
+            format!(
+                "Platform backend: {} · available={}",
+                status.backend, status.available
+            ),
+            format!("Filesystem boundary: {}", status.filesystem),
+            format!("Network boundary: {}", status.network),
+            format!("Process tree containment: {}", status.process_tree),
+            "Approval 与 Sandbox 相互独立：审批放行不会取消系统边界。".to_owned(),
+        ];
+        if let Some(warning) = status.warning {
+            lines.push(format!("WARNING: {warning}"));
+        }
+        Ok(lines)
+    }
+
+    fn set_sandbox_mode(&mut self, mode: &str) -> BackendResponse {
+        let view = match self
+            .application
+            .set_setting("sandbox.mode", mode, ConfigLayer::Session)
+        {
+            Ok(view) => view,
+            Err(error) => return Self::response_error(error),
+        };
+        if let Err(error) = self.sync_sandbox_policy() {
+            return Self::response_error(error);
+        }
+        let mut lines = Self::config_lines(&view, Some("sandbox"), false);
+        match self.sandbox_lines() {
+            Ok(status) => lines.extend(status),
+            Err(error) => return Self::response_error(error),
+        }
+        BackendResponse {
+            lines,
+            ..BackendResponse::default()
+        }
+    }
+
     fn reload_agent_instructions(&mut self) -> BackendResponse {
         self.agent_instructions = match load_agent_instructions(Path::new(&self.project_root)) {
             Ok(instructions) => instructions,
             Err(error) => return Self::response_error(error),
         };
         if let Err(error) = self.apply_agent_instructions() {
+            return Self::response_error(error);
+        }
+        if let Err(error) = self.sync_sandbox_policy() {
             return Self::response_error(error);
         }
         BackendResponse {
@@ -1269,6 +1340,51 @@ impl AppBackend {
                     Err(error) => Self::response_error(error),
                 }
             }
+            (SetupState::SandboxDanger { confirmation }, "sandbox-danger") => {
+                if value.trim() != confirmation {
+                    return self.retry_setup_input(
+                        SetupState::SandboxDanger { confirmation },
+                        "sandbox-danger",
+                        "确认关闭系统级 Sandbox",
+                        Some("输入显示的完整确认短语".to_owned()),
+                        "确认短语不匹配",
+                    );
+                }
+                let mut response = self.set_sandbox_mode("danger-full-access");
+                response.clear_view = true;
+                response
+            }
+            (SetupState::SandboxNetwork { confirmation }, "sandbox-network") => {
+                if value.trim() != confirmation {
+                    return self.retry_setup_input(
+                        SetupState::SandboxNetwork { confirmation },
+                        "sandbox-network",
+                        "确认允许 Sandbox 子进程联网",
+                        Some("输入显示的完整确认短语".to_owned()),
+                        "确认短语不匹配",
+                    );
+                }
+                let view = match self.application.set_setting(
+                    "sandbox.network-access",
+                    "true",
+                    ConfigLayer::Session,
+                ) {
+                    Ok(view) => view,
+                    Err(error) => return Self::response_error(error),
+                };
+                if let Err(error) = self.sync_sandbox_policy() {
+                    return Self::response_error(error);
+                }
+                let mut lines = Self::config_lines(&view, Some("sandbox"), false);
+                if let Ok(status) = self.sandbox_lines() {
+                    lines.extend(status);
+                }
+                BackendResponse {
+                    lines,
+                    clear_view: true,
+                    ..BackendResponse::default()
+                }
+            }
             (state, _) => {
                 self.pending_setup = Some(state);
                 Self::response_error("设置向导 request ID 不匹配")
@@ -1775,6 +1891,9 @@ impl AppBackend {
         if let Err(error) = self.apply_agent_instructions() {
             return Self::response_error(error);
         }
+        if let Err(error) = self.sync_sandbox_policy() {
+            return Self::response_error(error);
+        }
         self.registry = CommandRegistry::with_language(self.language());
         self.model_ready = self.application.model().ok().is_some_and(|model| {
             (!is_hidden_internal_model(&model.provider_id, &model.model_id)
@@ -1948,7 +2067,10 @@ impl AppBackend {
                 vec![
                     "Compression autoThreshold=80% · modes=safe/aggressive · checkpointBefore=true"
                         .to_owned(),
-                    format!("Current context={}%, checkpoints={}", view.percent, view.checkpoint_count),
+                    format!(
+                        "Current context={}%, checkpoints={}",
+                        view.percent, view.checkpoint_count
+                    ),
                 ]
             }),
             "memory" => self.application.memory_view().map(|view| {
@@ -1991,11 +2113,8 @@ impl AppBackend {
                 )]
             }),
             "permissions" => self.application.tools().map(|view| {
-                let mut lines = Self::config_lines(
-                    &self.application.config(),
-                    Some("permissions"),
-                    false,
-                );
+                let mut lines =
+                    Self::config_lines(&self.application.config(), Some("permissions"), false);
                 lines.push(format!(
                     "ApprovalPolicy={:?} rules={} pending={} grants={}",
                     view.approval_policy,
@@ -2005,22 +2124,17 @@ impl AppBackend {
                 ));
                 lines
             }),
-            "sandbox" => self.application.tools().map(|view| {
-                vec![format!(
-                    "Sandbox workspaceContainment=true processAllowlist={} browser={} hardDeny=true",
-                    view.tools
-                        .iter()
-                        .any(|tool| tool.canonical_name == "process.exec"),
-                    self.application
-                        .browser_view()
-                        .is_ok_and(|browser| browser.configured)
-                )]
-            }),
+            "sandbox" => Ok(self
+                .sandbox_lines()
+                .unwrap_or_else(|error| vec![format!("Sandbox unavailable · {error}")])),
             "browser" => self.application.browser_view().map(|view| {
                 vec![format!(
                     "Browser configured={} runtime={}",
                     view.configured,
-                    view.runtime.map_or_else(|| "sleeping".to_owned(), |runtime| format!("{:?}", runtime.status))
+                    view.runtime.map_or_else(
+                        || "sleeping".to_owned(),
+                        |runtime| format!("{:?}", runtime.status)
+                    )
                 )]
             }),
             "terminal" | "ui" => Ok(Self::config_lines(
@@ -2360,6 +2474,10 @@ impl AppBackend {
         }
         if let Ok(browser) = self.application.browser_view() {
             lines.push(format!("Browser configured={}", browser.configured));
+        }
+        match self.sandbox_lines() {
+            Ok(sandbox) => lines.extend(sandbox),
+            Err(error) => lines.push(format!("Sandbox unavailable · {error}")),
         }
         if let Ok(memory) = self.application.memory_view() {
             lines.push(format!(
@@ -3273,11 +3391,14 @@ impl TerminalBackend for AppBackend {
                             ..BackendResponse::default()
                         },
                         |file| BackendResponse {
-                            lines: vec![format!(
-                                "agent.md · scope={} · path={}",
-                                file.scope,
-                                file.path.display()
-                            ), file.content.clone()],
+                            lines: vec![
+                                format!(
+                                    "agent.md · scope={} · path={}",
+                                    file.scope,
+                                    file.path.display()
+                                ),
+                                file.content.clone(),
+                            ],
                             ..BackendResponse::default()
                         },
                     ),
@@ -3315,7 +3436,10 @@ impl TerminalBackend for AppBackend {
                     },
                     TeamCommand::Create { count, objective } => {
                         let objective = objective.or_else(|| {
-                            self.application.status().ok().and_then(|status| status.goal)
+                            self.application
+                                .status()
+                                .ok()
+                                .and_then(|status| status.goal)
                         });
                         let Some(objective) = objective else {
                             return Self::response_error(
@@ -3326,7 +3450,10 @@ impl TerminalBackend for AppBackend {
                     }
                     TeamCommand::Workflow { workers, objective } => {
                         let objective = objective.or_else(|| {
-                            self.application.status().ok().and_then(|status| status.goal)
+                            self.application
+                                .status()
+                                .ok()
+                                .and_then(|status| status.goal)
                         });
                         let Some(objective) = objective else {
                             return Self::response_error(
@@ -3350,7 +3477,10 @@ impl TerminalBackend for AppBackend {
                     }
                     TeamCommand::Adaptive { workers, objective } => {
                         let objective = objective.or_else(|| {
-                            self.application.status().ok().and_then(|status| status.goal)
+                            self.application
+                                .status()
+                                .ok()
+                                .and_then(|status| status.goal)
                         });
                         let Some(objective) = objective else {
                             return Self::response_error(
@@ -3668,17 +3798,160 @@ impl TerminalBackend for AppBackend {
                 SlashCommand::Connect { provider } => self.begin_provider_connect(provider),
                 SlashCommand::Lsp { operation } => self.handle_lsp(operation),
                 SlashCommand::Memory { operation } => match operation {
-                    MemoryCommand::Stats => match self.application.memory_view(){Ok(view)=>BackendResponse{lines:vec![format!("Memory records={} fts={} semantic={:?} vectorSchema={}",view.record_count,view.fts_indexed_count,view.semantic,view.vector_schema_present)],..Default::default()},Err(error)=>Self::response_error(error)},
-                    MemoryCommand::Search{mode,query}=>{let mode=match mode.as_str(){"metadata"=>RetrievalMode::Metadata,"lexical"=>RetrievalMode::Lexical,"semantic"=>RetrievalMode::Semantic,"hybrid"=>RetrievalMode::Hybrid,"auto"=>RetrievalMode::Auto,_=>return Self::response_error("Memory mode 仅支持 metadata/lexical/semantic/hybrid/auto")};match self.application.search_memory(&query,mode,8){Ok(response)=>BackendResponse{lines:std::iter::once(format!("Memory {:?} -> {:?} degraded={}",response.requested_mode,response.executed_mode,response.degraded)).chain(response.results.into_iter().map(|result|format!("{} · {} · {:.4} · {}",result.record.id,result.record.title,result.score,result.matched_by))).collect(),..Default::default()},Err(error)=>Self::response_error(error)}},
-                    MemoryCommand::Add{kind,title,content,tags}=>{let kind=match kind.as_str(){"architecture"=>MemoryKind::Architecture,"decision"=>MemoryKind::Decision,"contract"=>MemoryKind::Contract,"lesson"=>MemoryKind::Lesson,"failure"=>MemoryKind::Failure,"verification"=>MemoryKind::Verification,"meeting"=>MemoryKind::Meeting,_=>return Self::response_error("Memory kind 无效")};match self.application.add_memory(kind,title,content,tags){Ok(record)=>BackendResponse{lines:vec![format!("Memory added {} · {}",record.id,record.title)],..Default::default()},Err(error)=>Self::response_error(error)}},
-                    MemoryCommand::Forget{id}=>match self.application.forget_memory(&id){Ok(deleted)=>BackendResponse{lines:vec![format!("Memory {id} deleted={deleted}")],..Default::default()},Err(error)=>Self::response_error(error)},
+                    MemoryCommand::Stats => match self.application.memory_view() {
+                        Ok(view) => BackendResponse {
+                            lines: vec![format!(
+                                "Memory records={} fts={} semantic={:?} vectorSchema={}",
+                                view.record_count,
+                                view.fts_indexed_count,
+                                view.semantic,
+                                view.vector_schema_present
+                            )],
+                            ..Default::default()
+                        },
+                        Err(error) => Self::response_error(error),
+                    },
+                    MemoryCommand::Search { mode, query } => {
+                        let mode = match mode.as_str() {
+                            "metadata" => RetrievalMode::Metadata,
+                            "lexical" => RetrievalMode::Lexical,
+                            "semantic" => RetrievalMode::Semantic,
+                            "hybrid" => RetrievalMode::Hybrid,
+                            "auto" => RetrievalMode::Auto,
+                            _ => {
+                                return Self::response_error(
+                                    "Memory mode 仅支持 metadata/lexical/semantic/hybrid/auto",
+                                );
+                            }
+                        };
+                        match self.application.search_memory(&query, mode, 8) {
+                            Ok(response) => BackendResponse {
+                                lines: std::iter::once(format!(
+                                    "Memory {:?} -> {:?} degraded={}",
+                                    response.requested_mode,
+                                    response.executed_mode,
+                                    response.degraded
+                                ))
+                                .chain(response.results.into_iter().map(|result| {
+                                    format!(
+                                        "{} · {} · {:.4} · {}",
+                                        result.record.id,
+                                        result.record.title,
+                                        result.score,
+                                        result.matched_by
+                                    )
+                                }))
+                                .collect(),
+                                ..Default::default()
+                            },
+                            Err(error) => Self::response_error(error),
+                        }
+                    }
+                    MemoryCommand::Add {
+                        kind,
+                        title,
+                        content,
+                        tags,
+                    } => {
+                        let kind = match kind.as_str() {
+                            "architecture" => MemoryKind::Architecture,
+                            "decision" => MemoryKind::Decision,
+                            "contract" => MemoryKind::Contract,
+                            "lesson" => MemoryKind::Lesson,
+                            "failure" => MemoryKind::Failure,
+                            "verification" => MemoryKind::Verification,
+                            "meeting" => MemoryKind::Meeting,
+                            _ => return Self::response_error("Memory kind 无效"),
+                        };
+                        match self.application.add_memory(kind, title, content, tags) {
+                            Ok(record) => BackendResponse {
+                                lines: vec![format!(
+                                    "Memory added {} · {}",
+                                    record.id, record.title
+                                )],
+                                ..Default::default()
+                            },
+                            Err(error) => Self::response_error(error),
+                        }
+                    }
+                    MemoryCommand::Forget { id } => match self.application.forget_memory(&id) {
+                        Ok(deleted) => BackendResponse {
+                            lines: vec![format!("Memory {id} deleted={deleted}")],
+                            ..Default::default()
+                        },
+                        Err(error) => Self::response_error(error),
+                    },
                 },
                 SlashCommand::Index { operation } => match operation {
-                    IndexCommand::Status=>match self.application.repository_view(){Ok(view)=>BackendResponse{lines:vec![format!("Repository files={} symbols={} imports={} lspSymbols={} lspDiagnostics={} revision={}",view.file_count,view.symbol_count,view.import_count,view.lsp_symbol_count,view.lsp_diagnostic_count,view.revision)],..Default::default()},Err(error)=>Self::response_error(error)},
-                    IndexCommand::Update=>match self.application.update_repository(){Ok(stats)=>BackendResponse{lines:vec![format!("Index discovered={} indexed={} unchangedMetadata={} unchangedContent={} deleted={} skipped={}",stats.discovered,stats.indexed,stats.unchanged_metadata,stats.unchanged_content,stats.deleted,stats.skipped)],..Default::default()},Err(error)=>Self::response_error(error)},
-                    IndexCommand::Clear=>match self.application.clear_repository(){Ok(view)=>BackendResponse{lines:vec![format!("Repository index cleared · revision {}",view.revision)],..Default::default()},Err(error)=>Self::response_error(error)},
-                    IndexCommand::Map=>match self.application.repository_map(){Ok(map)=>BackendResponse{lines:map.lines().map(str::to_owned).collect(),..Default::default()},Err(error)=>Self::response_error(error)},
-                    IndexCommand::Search{query}=>match self.application.search_repository(&query,8){Ok(results)=>BackendResponse{lines:results.into_iter().map(|result|format!("{} · {} · {:.4} · {} · symbols={} · diagnostics={}",result.path,result.language,result.score,result.matched_by,result.symbols.join(","),result.diagnostics.join(" | "))).collect(),..Default::default()},Err(error)=>Self::response_error(error)},
+                    IndexCommand::Status => match self.application.repository_view() {
+                        Ok(view) => BackendResponse {
+                            lines: vec![format!(
+                                "Repository files={} symbols={} imports={} lspSymbols={} lspDiagnostics={} revision={}",
+                                view.file_count,
+                                view.symbol_count,
+                                view.import_count,
+                                view.lsp_symbol_count,
+                                view.lsp_diagnostic_count,
+                                view.revision
+                            )],
+                            ..Default::default()
+                        },
+                        Err(error) => Self::response_error(error),
+                    },
+                    IndexCommand::Update => match self.application.update_repository() {
+                        Ok(stats) => BackendResponse {
+                            lines: vec![format!(
+                                "Index discovered={} indexed={} unchangedMetadata={} unchangedContent={} deleted={} skipped={}",
+                                stats.discovered,
+                                stats.indexed,
+                                stats.unchanged_metadata,
+                                stats.unchanged_content,
+                                stats.deleted,
+                                stats.skipped
+                            )],
+                            ..Default::default()
+                        },
+                        Err(error) => Self::response_error(error),
+                    },
+                    IndexCommand::Clear => match self.application.clear_repository() {
+                        Ok(view) => BackendResponse {
+                            lines: vec![format!(
+                                "Repository index cleared · revision {}",
+                                view.revision
+                            )],
+                            ..Default::default()
+                        },
+                        Err(error) => Self::response_error(error),
+                    },
+                    IndexCommand::Map => match self.application.repository_map() {
+                        Ok(map) => BackendResponse {
+                            lines: map.lines().map(str::to_owned).collect(),
+                            ..Default::default()
+                        },
+                        Err(error) => Self::response_error(error),
+                    },
+                    IndexCommand::Search { query } => {
+                        match self.application.search_repository(&query, 8) {
+                            Ok(results) => BackendResponse {
+                                lines: results
+                                    .into_iter()
+                                    .map(|result| {
+                                        format!(
+                                            "{} · {} · {:.4} · {} · symbols={} · diagnostics={}",
+                                            result.path,
+                                            result.language,
+                                            result.score,
+                                            result.matched_by,
+                                            result.symbols.join(","),
+                                            result.diagnostics.join(" | ")
+                                        )
+                                    })
+                                    .collect(),
+                                ..Default::default()
+                            },
+                            Err(error) => Self::response_error(error),
+                        }
+                    }
                 },
                 SlashCommand::Inspect { target } => self.inspect(&target),
                 SlashCommand::Mcp { operation } => match operation {
@@ -3738,16 +4011,14 @@ impl TerminalBackend for AppBackend {
                         name: server_id,
                         enabled: true,
                         trust_annotations: false,
-                        transport: McpTransportConfig::StreamableHttp(
-                            McpStreamableHttpConfig {
-                                endpoint,
-                                bearer_credential_id: None,
-                                oauth: None,
-                                legacy_sse_fallback: false,
-                                request_timeout_millis: Some(30_000),
-                                max_response_bytes: Some(4 * 1024 * 1024),
-                            },
-                        ),
+                        transport: McpTransportConfig::StreamableHttp(McpStreamableHttpConfig {
+                            endpoint,
+                            bearer_credential_id: None,
+                            oauth: None,
+                            legacy_sse_fallback: false,
+                            request_timeout_millis: Some(30_000),
+                            max_response_bytes: Some(4 * 1024 * 1024),
+                        }),
                     }),
                     McpCommand::Remove { server_id } => self.remove_mcp_server(&server_id),
                     McpCommand::Enable { server_id } => self.set_mcp_enabled(&server_id, true),
@@ -3756,7 +4027,10 @@ impl TerminalBackend for AppBackend {
                         match self.application.mcp_oauth_start(&server_id) {
                             Ok(started) => BackendResponse {
                                 lines: vec![
-                                    format!("Open this URL in your browser: {}", started.authorization_url),
+                                    format!(
+                                        "Open this URL in your browser: {}",
+                                        started.authorization_url
+                                    ),
                                     format!("Callback: {}", started.redirect_uri),
                                     format!("Then run: /mcp auth finish {}", started.server_id),
                                 ],
@@ -3859,7 +4133,9 @@ impl TerminalBackend for AppBackend {
                                             "{} · {} · {}",
                                             resource.uri,
                                             resource.name,
-                                            resource.mime_type.unwrap_or_else(|| "unknown".to_owned())
+                                            resource
+                                                .mime_type
+                                                .unwrap_or_else(|| "unknown".to_owned())
                                         )
                                     })
                                     .collect(),
@@ -3935,16 +4211,17 @@ impl TerminalBackend for AppBackend {
                     },
                     Err(error) => Self::response_error(error),
                 },
-                SlashCommand::ModelSelect { provider, model } => {
-                    self.select_model(provider, model)
-                }
+                SlashCommand::ModelSelect { provider, model } => self.select_model(provider, model),
                 SlashCommand::ModelSelectCurrent { model } => {
                     let current = match self.application.model() {
                         Ok(current)
                             if !is_hidden_internal_model(
                                 &current.provider_id,
                                 &current.model_id,
-                            ) => current,
+                            ) =>
+                        {
+                            current
+                        }
                         Ok(_) => {
                             return Self::response_error(
                                 "尚未选择 Provider；先使用 /provider switch",
@@ -3972,28 +4249,26 @@ impl TerminalBackend for AppBackend {
                             && (self.test_model_enabled
                                 || !is_internal_test_model(&model.provider_id, &model.model_id))
                     });
-                    if refresh
-                        && let Some(provider) = refreshed_provider.as_deref()
-                    {
+                    if refresh && let Some(provider) = refreshed_provider.as_deref() {
                         models.retain(|model| model.provider_id.as_str() == provider);
                     }
                     let mut lines = if models.is_empty() {
-                            vec!["No registered models".to_owned()]
-                        } else {
-                            models
-                                .into_iter()
-                                .map(|model| {
-                                    format!(
-                                        "{}/{} · context={} · tools={} · structured={}",
-                                        model.provider_id,
-                                        model.model_id,
-                                        model.context_window_tokens,
-                                        model.tool_calling,
-                                        model.structured_output
-                                    )
-                                })
-                                .collect()
-                        };
+                        vec!["No registered models".to_owned()]
+                    } else {
+                        models
+                            .into_iter()
+                            .map(|model| {
+                                format!(
+                                    "{}/{} · context={} · tools={} · structured={}",
+                                    model.provider_id,
+                                    model.model_id,
+                                    model.context_window_tokens,
+                                    model.tool_calling,
+                                    model.structured_output
+                                )
+                            })
+                            .collect()
+                    };
                     if refresh
                         && let Some(provider) = refreshed_provider
                         && let Some(summary) = discovery_summary(
@@ -4013,17 +4288,18 @@ impl TerminalBackend for AppBackend {
                         lines: Self::config_lines(&self.application.config(), Some("mode"), false),
                         ..BackendResponse::default()
                     },
-                    Some(mode) => match self.application.set_setting(
-                        "mode",
-                        &mode,
-                        ConfigLayer::Session,
-                    ) {
-                        Ok(view) => BackendResponse {
-                            lines: Self::config_lines(&view, Some("mode"), false),
-                            ..BackendResponse::default()
-                        },
-                        Err(error) => Self::response_error(error),
-                    },
+                    Some(mode) => {
+                        match self
+                            .application
+                            .set_setting("mode", &mode, ConfigLayer::Session)
+                        {
+                            Ok(view) => BackendResponse {
+                                lines: Self::config_lines(&view, Some("mode"), false),
+                                ..BackendResponse::default()
+                            },
+                            Err(error) => Self::response_error(error),
+                        }
+                    }
                 },
                 SlashCommand::GoalShow => match self.application.status() {
                     Ok(status) => BackendResponse {
@@ -4170,8 +4446,7 @@ impl TerminalBackend for AppBackend {
                 },
                 SlashCommand::Permissions { operation } => match operation {
                     PermissionCommand::Show | PermissionCommand::Mode { .. } => {
-                        if let PermissionCommand::Mode { mode } = operation
-                        {
+                        if let PermissionCommand::Mode { mode } = operation {
                             if mode == "bypass" {
                                 let confirmation = "I UNDERSTAND BYPASS".to_owned();
                                 self.pending_setup = Some(SetupState::PermissionElevation {
@@ -4362,15 +4637,15 @@ impl TerminalBackend for AppBackend {
                         Ok(prepared) => {
                             let mut response = self.launch_background_team(
                                 prepared,
+                                format!("review={}", if staged { "staged" } else { "unstaged" }),
+                            );
+                            response.lines.insert(
+                                0,
                                 format!(
-                                    "review={}",
+                                    "Review Agent created from {} diff",
                                     if staged { "staged" } else { "unstaged" }
                                 ),
                             );
-                            response.lines.insert(0, format!(
-                                "Review Agent created from {} diff",
-                                if staged { "staged" } else { "unstaged" }
-                            ));
                             response
                         }
                         Err(error) => Self::response_error(error),
@@ -4430,50 +4705,74 @@ impl TerminalBackend for AppBackend {
                         }
                     }
                 }
-                SlashCommand::Sandbox => match self.application.tools() {
-                    Ok(view) => BackendResponse {
-                        lines: vec![
-                            "Filesystem tools: canonical workspace containment active".to_owned(),
-                            format!(
-                                "Process execution: {}",
-                                if view
-                                    .tools
-                                    .iter()
-                                    .any(|tool| tool.canonical_name == "process.exec")
-                                {
-                                    "exact executable allowlist; Agent high-risk calls require approval"
-                                } else {
-                                    "disabled (no executable allowlist)"
-                                }
-                            ),
-                            format!(
-                                "Process tree containment: {}",
-                                if cfg!(windows) {
-                                    "Windows Job Object"
-                                } else if cfg!(unix) {
-                                    "POSIX Process Group"
-                                } else {
-                                    "unavailable"
-                                }
-                            ),
-                            "OS filesystem isolation for subprocesses: unavailable (不会冒充 AppContainer/seccomp/sandbox-exec)".to_owned(),
-                            "Extension proxy: typed MCP/Plugin source binding active; remote MCP only via configured HTTPS/loopback endpoint".to_owned(),
-                            format!(
-                                "Direct Network Tool: unavailable · Browser Sandbox: {}",
-                                if view
-                                    .tools
-                                    .iter()
-                                    .any(|tool| tool.canonical_name.starts_with("browser."))
-                                {
-                                    "dedicated process adapter"
-                                } else {
-                                    "unavailable"
-                                }
-                            ),
-                        ],
-                        ..BackendResponse::default()
+                SlashCommand::Sandbox { mode } => match mode.as_deref() {
+                    None => match self.sandbox_lines() {
+                        Ok(lines) => BackendResponse {
+                            lines,
+                            ..BackendResponse::default()
+                        },
+                        Err(error) => Self::response_error(error),
                     },
-                    Err(error) => Self::response_error(error),
+                    Some("danger-full-access") => {
+                        let confirmation = "I UNDERSTAND DANGER FULL ACCESS".to_owned();
+                        self.pending_setup = Some(SetupState::SandboxDanger {
+                            confirmation: confirmation.clone(),
+                        });
+                        BackendResponse {
+                            lines: vec![
+                                "Danger full access 会关闭子进程的文件系统与网络边界；Approval 不能替代系统隔离。"
+                                    .to_owned(),
+                                format!("输入确认短语：{confirmation}"),
+                            ],
+                            input_prompt: Some(InputPrompt {
+                                request_id: "sandbox-danger".to_owned(),
+                                prompt: "确认关闭系统级 Sandbox".to_owned(),
+                                placeholder: Some(confirmation),
+                            }),
+                            ..BackendResponse::default()
+                        }
+                    }
+                    Some("network-on") => {
+                        let confirmation = "I UNDERSTAND NETWORK ACCESS".to_owned();
+                        self.pending_setup = Some(SetupState::SandboxNetwork {
+                            confirmation: confirmation.clone(),
+                        });
+                        BackendResponse {
+                            lines: vec![
+                                "允许联网后，受限命令仍受文件系统边界约束，但可以访问远程服务。"
+                                    .to_owned(),
+                                format!("输入确认短语：{confirmation}"),
+                            ],
+                            input_prompt: Some(InputPrompt {
+                                request_id: "sandbox-network".to_owned(),
+                                prompt: "确认允许 Sandbox 子进程联网".to_owned(),
+                                placeholder: Some(confirmation),
+                            }),
+                            ..BackendResponse::default()
+                        }
+                    }
+                    Some("network-off") => {
+                        let view = match self.application.set_setting(
+                            "sandbox.network-access",
+                            "false",
+                            ConfigLayer::Session,
+                        ) {
+                            Ok(view) => view,
+                            Err(error) => return Self::response_error(error),
+                        };
+                        if let Err(error) = self.sync_sandbox_policy() {
+                            return Self::response_error(error);
+                        }
+                        let mut lines = Self::config_lines(&view, Some("sandbox"), false);
+                        if let Ok(status) = self.sandbox_lines() {
+                            lines.extend(status);
+                        }
+                        BackendResponse {
+                            lines,
+                            ..BackendResponse::default()
+                        }
+                    }
+                    Some(mode) => self.set_sandbox_mode(mode),
                 },
                 SlashCommand::Skills { operation } => match operation {
                     SkillCommand::List => match self.application.skills() {
@@ -4572,9 +4871,7 @@ impl TerminalBackend for AppBackend {
                     },
                     Err(error) => Self::response_error(error),
                 },
-                SlashCommand::SessionSwitch { target } => {
-                    self.switch_session_response(&target)
-                }
+                SlashCommand::SessionSwitch { target } => self.switch_session_response(&target),
                 SlashCommand::SessionNew => {
                     if self.background_team.is_some() {
                         Self::response_error("Agent Team 运行期间不能新建 Session")
@@ -4614,37 +4911,59 @@ impl TerminalBackend for AppBackend {
                 }
                 SlashCommand::Settings { operation } => match operation {
                     SettingsCommand::Show { key } => self.settings_show(key.as_deref()),
-                    SettingsCommand::Set {
-                        key,
-                        value,
-                        layer,
-                    } => match self.application.set_setting(
-                        &key,
-                        &value,
-                        match layer {
-                            SettingLayer::Session => ConfigLayer::Session,
-                            SettingLayer::Runtime => ConfigLayer::Runtime,
-                        },
-                    ) {
-                        Ok(view) => BackendResponse {
+                    SettingsCommand::Set { key, value, layer } => {
+                        if key == "sandbox.mode" && value == "danger-full-access" {
+                            return Self::response_error(
+                                "请使用 `/sandbox danger-full-access` 完成二次确认",
+                            );
+                        }
+                        if key == "sandbox.network-access" && value == "true" {
+                            return Self::response_error(
+                                "请使用 `/sandbox network-on` 完成二次确认",
+                            );
+                        }
+                        let view = match self.application.set_setting(
+                            &key,
+                            &value,
+                            match layer {
+                                SettingLayer::Session => ConfigLayer::Session,
+                                SettingLayer::Runtime => ConfigLayer::Runtime,
+                            },
+                        ) {
+                            Ok(view) => view,
+                            Err(error) => return Self::response_error(error),
+                        };
+                        if key.starts_with("sandbox.")
+                            && let Err(error) = self.sync_sandbox_policy()
+                        {
+                            return Self::response_error(error);
+                        }
+                        BackendResponse {
                             lines: Self::config_lines(&view, Some(&key), false),
                             ..BackendResponse::default()
-                        },
-                        Err(error) => Self::response_error(error),
-                    },
-                    SettingsCommand::Reset { key, layer } => match self.application.clear_setting(
-                        &key,
-                        match layer {
-                            SettingLayer::Session => ConfigLayer::Session,
-                            SettingLayer::Runtime => ConfigLayer::Runtime,
-                        },
-                    ) {
-                        Ok(view) => BackendResponse {
+                        }
+                    }
+                    SettingsCommand::Reset { key, layer } => {
+                        let view = match self.application.clear_setting(
+                            &key,
+                            match layer {
+                                SettingLayer::Session => ConfigLayer::Session,
+                                SettingLayer::Runtime => ConfigLayer::Runtime,
+                            },
+                        ) {
+                            Ok(view) => view,
+                            Err(error) => return Self::response_error(error),
+                        };
+                        if key.starts_with("sandbox.")
+                            && let Err(error) = self.sync_sandbox_policy()
+                        {
+                            return Self::response_error(error);
+                        }
+                        BackendResponse {
                             lines: Self::config_lines(&view, Some(&key), false),
                             ..BackendResponse::default()
-                        },
-                        Err(error) => Self::response_error(error),
-                    },
+                        }
+                    }
                 },
                 SlashCommand::Steer { instruction } => match self.application.steer(&instruction) {
                     Ok(steering) => {
@@ -4728,8 +5047,26 @@ impl TerminalBackend for AppBackend {
                     Err(error) => Self::response_error(error),
                 },
                 SlashCommand::Vector { operation } => match operation {
-                    VectorCommand::Status=>match self.application.memory_view(){Ok(view)=>BackendResponse{lines:vec![format!("Vector {:?} · schemaPresent={}",view.semantic,view.vector_schema_present)],..Default::default()},Err(error)=>Self::response_error(error)},
-                    VectorCommand::Purge=>match self.application.purge_vectors(){Ok(view)=>BackendResponse{lines:vec![format!("Vector projection purged · schemaPresent={}",view.vector_schema_present)],..Default::default()},Err(error)=>Self::response_error(error)},
+                    VectorCommand::Status => match self.application.memory_view() {
+                        Ok(view) => BackendResponse {
+                            lines: vec![format!(
+                                "Vector {:?} · schemaPresent={}",
+                                view.semantic, view.vector_schema_present
+                            )],
+                            ..Default::default()
+                        },
+                        Err(error) => Self::response_error(error),
+                    },
+                    VectorCommand::Purge => match self.application.purge_vectors() {
+                        Ok(view) => BackendResponse {
+                            lines: vec![format!(
+                                "Vector projection purged · schemaPresent={}",
+                                view.vector_schema_present
+                            )],
+                            ..Default::default()
+                        },
+                        Err(error) => Self::response_error(error),
+                    },
                     VectorCommand::Setup => self.start_vector_setup(),
                     VectorCommand::Clear => self.clear_vector_provider(),
                     VectorCommand::Mode { mode } => match self.application.set_setting(
@@ -4837,6 +5174,7 @@ impl TerminalBackend for AppBackend {
                     .settings
                     .permission_mode
                     .to_string(),
+                sandbox_mode: self.application.config().settings.sandbox_mode.to_string(),
                 reasoning: status.reasoning,
                 context_percent: context.as_ref().map_or(0, |context| context.percent),
                 cache_percent: cache.effective_hit_rate_percent,
@@ -4858,6 +5196,7 @@ impl TerminalBackend for AppBackend {
                     .settings
                     .permission_mode
                     .to_string(),
+                sandbox_mode: self.application.config().settings.sandbox_mode.to_string(),
                 reasoning: "off".to_owned(),
                 context_percent: context.as_ref().map_or(0, |context| context.percent),
                 cache_percent: cache.effective_hit_rate_percent,
@@ -5105,6 +5444,15 @@ fn new_interactive_session_id() -> Result<SessionId, Box<dyn std::error::Error>>
 }
 
 pub fn main() -> ExitCode {
+    if harness_sandbox::is_internal_helper_invocation() {
+        return match harness_sandbox::run_internal_helper() {
+            Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
+            Err(error) => {
+                eprintln!("KernarySandboxError: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -5161,6 +5509,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if cli.confirm_bypass && cli.permission_mode.as_deref() != Some("bypass") {
         return Err("--confirm-bypass 只能与 --permission-mode bypass 一起使用".into());
     }
+    if cli.sandbox.as_deref() == Some("danger-full-access") && !cli.confirm_dangerous_sandbox {
+        return Err(
+            "Danger full access 必须同时提供 `--confirm-dangerous-sandbox`；该模式关闭系统级边界"
+                .into(),
+        );
+    }
+    if cli.confirm_dangerous_sandbox && cli.sandbox.as_deref() != Some("danger-full-access") {
+        return Err(
+            "--confirm-dangerous-sandbox 只能与 --sandbox danger-full-access 一起使用".into(),
+        );
+    }
+    let requested_sandbox = cli.sandbox.as_deref().map(SandboxMode::parse).transpose()?;
     let selected_session = if cli.command.is_none() {
         resolve_startup_session(
             &current_directory,
@@ -5179,6 +5539,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &current_directory,
         requested_model.as_deref(),
         selected_session,
+        requested_sandbox,
+        cli.confirm_dangerous_sandbox,
+        cli.sandbox_network_access,
     )?;
     backend.application.boot()?;
     for (key, value) in std::mem::take(&mut backend.seed_session_settings) {
@@ -5709,6 +6072,9 @@ fn build_backend(
     project_root: &Path,
     requested_model: Option<&str>,
     session_id: SessionId,
+    requested_sandbox: Option<SandboxMode>,
+    dangerous_sandbox_confirmed: bool,
+    sandbox_network_access_requested: bool,
 ) -> Result<(AppBackend, EventSubscription), Box<dyn std::error::Error>> {
     let startup_started = Instant::now();
     let state_directory = project_root.join(".harness");
@@ -5746,7 +6112,30 @@ fn build_backend(
     } else {
         &persisted.settings
     };
-    let config = load_runtime_config(project_root, config_values)?;
+    let mut config = load_runtime_config(project_root, config_values)?;
+    if let Some(mode) = requested_sandbox {
+        config.set_runtime("sandbox.mode", &mode.to_string())?;
+    }
+    if sandbox_network_access_requested {
+        config.set_runtime("sandbox.network-access", "true")?;
+    }
+    if config.effective().settings.sandbox_mode == SandboxMode::DangerFullAccess
+        && !dangerous_sandbox_confirmed
+    {
+        return Err(
+            "配置请求 danger-full-access，但本次启动未显式确认；使用 `--sandbox danger-full-access --confirm-dangerous-sandbox`"
+                .into(),
+        );
+    }
+    if config.effective().settings.sandbox_network_access
+        && config.effective().settings.sandbox_mode != SandboxMode::DangerFullAccess
+        && !sandbox_network_access_requested
+    {
+        return Err(
+            "配置请求 Sandbox 子进程联网，但本次启动未显式确认；使用 `--sandbox-network-access`"
+                .into(),
+        );
+    }
     let test_model_enabled = internal_test_model_enabled();
     let persisted_selection = model_seed
         .model
@@ -5911,6 +6300,12 @@ fn build_backend(
         )?),
     );
     let guard = WorkspacePathGuard::new(project_root)?;
+    let sandbox_settings = config.effective().settings;
+    let process_sandbox = Arc::new(ProcessSandbox::new(
+        project_root,
+        sandbox_settings.sandbox_mode,
+        sandbox_settings.sandbox_network_access,
+    )?);
     let patch_store = Arc::new(PatchStore::open(
         state_directory.join("patches"),
         guard.clone(),
@@ -6080,6 +6475,7 @@ fn build_backend(
         register_process_tool(
             &mut tool_registry,
             guard.clone(),
+            process_sandbox.clone(),
             process_tool_executables.clone(),
             Duration::from_secs(300),
             4 * 1024 * 1024,
@@ -6244,6 +6640,7 @@ fn build_backend(
             pending_setup: None,
             model_ready,
             test_model_enabled,
+            process_sandbox,
             _project_lock: project_lock,
         },
         subscription,
@@ -7072,6 +7469,8 @@ fn doctor(
         .iter()
         .filter(|provider| provider_model_cache.get(&provider.id).is_some())
         .count();
+    let sandbox_status =
+        ProcessSandbox::new(project_root, SandboxMode::WorkspaceWrite, false)?.status()?;
     let report = serde_json::json!({
         "schemaVersion": 1,
         "status": "ok",
@@ -7120,6 +7519,7 @@ fn doctor(
             "nativeBrowserOAuth": "disabled",
             "codexDelegated": true
         },
+        "sandbox": sandbox_status.clone(),
         "extensions": {
             "mcp": "oauth-pkce-streamable-http-legacy-sse-lazy",
             "plugin": "isolated-process-lazy",
@@ -7151,8 +7551,8 @@ fn doctor(
             "repositoryFusion": "file-hash-bound-symbols-diagnostics-evidence",
             "patchPreview": "rename-codeaction-preview-second-approval-recoverable-set"
         },
-        "stage": 20,
-        "stageTrack": "24-settings-vector-doctor-depth",
+        "stage": 21,
+        "stageTrack": "25-platform-native-subprocess-sandbox",
     });
     if json {
         println!("{report}");
@@ -7162,6 +7562,10 @@ fn doctor(
         println!("{TAGLINE}");
         println!("Storage schema: {}", store.schema_version()?);
         println!("Terminal TTY: {}", capabilities.is_tty);
+        println!(
+            "Sandbox: {} · backend={} · available={}",
+            sandbox_status.mode, sandbox_status.backend, sandbox_status.available
+        );
         println!("Model: unconfigured (由 Session 或 --model 在运行时选择)");
     }
     Ok(())

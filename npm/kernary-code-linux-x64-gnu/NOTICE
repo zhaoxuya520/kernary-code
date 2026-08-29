@@ -1,0 +1,10 @@
++Kernary Code
+Copyright 2026 Harness Contributors
+
+Portions of crates/harness-sandbox/src/windows.rs are based on the Windows
+sandbox design and implementation in OpenAI Codex, licensed under the Apache
+License, Version 2.0.
+
+OpenAI Codex
+Copyright 2025 OpenAI
+

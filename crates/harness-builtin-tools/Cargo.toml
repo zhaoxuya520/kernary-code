@@ -9,6 +9,7 @@ description = "Sandboxed builtin file, process and patch tools for Harness"
 
 [dependencies]
 harness-permission = { path = "../harness-permission" }
+harness-sandbox = { path = "../harness-sandbox" }
 harness-tool = { path = "../harness-tool" }
 harness-types = { path = "../harness-types" }
 serde_json.workspace = true

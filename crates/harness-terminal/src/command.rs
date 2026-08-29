@@ -147,7 +147,9 @@ pub enum SlashCommand {
     },
     Resume,
     Reset,
-    Sandbox,
+    Sandbox {
+        mode: Option<String>,
+    },
     Status,
     Steer {
         instruction: String,
@@ -809,8 +811,8 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/sandbox",
-        synopsis: "/sandbox",
-        description: "显示真实 Sandbox capability，不把 Permission 冒充隔离",
+        synopsis: "/sandbox [read-only|workspace-write|danger-full-access|network-on|network-off]",
+        description: "显示或切换系统级 Sandbox；危险模式需要再次确认",
     },
     CommandSpec {
         name: "/session",
@@ -1227,7 +1229,28 @@ impl CommandRegistry {
             },
             "/resume" if remainder.is_empty() => SlashCommand::Resume,
             "/reset" if matches!(remainder, "" | "context") => SlashCommand::Reset,
-            "/sandbox" if remainder.is_empty() => SlashCommand::Sandbox,
+            "/sandbox" if remainder.is_empty() => SlashCommand::Sandbox { mode: None },
+            "/sandbox"
+                if matches!(
+                    remainder,
+                    "read-only"
+                        | "workspace-write"
+                        | "danger-full-access"
+                        | "network-on"
+                        | "network-off"
+                ) =>
+            {
+                SlashCommand::Sandbox {
+                    mode: Some(remainder.to_owned()),
+                }
+            }
+            "/sandbox" => {
+                return Err(CommandParseError {
+                    code: "invalid-sandbox-mode",
+                    message: "Sandbox 仅支持 read-only/workspace-write/danger-full-access/network-on/network-off"
+                        .to_owned(),
+                });
+            }
             "/skills" => SlashCommand::Skills {
                 operation: parse_skill(remainder)?,
             },
@@ -1418,6 +1441,16 @@ fn argument_suggestions(input: &str) -> Vec<InputSuggestion> {
             ("rules", "列出持久权限规则"),
             ("rule add ", "添加 allow/ask/deny 规则"),
             ("rule remove ", "删除指定规则"),
+        ],
+        "/sandbox" => &[
+            ("read-only", "所有文件只读，网络默认关闭"),
+            (
+                "workspace-write",
+                "仅项目可写，保护 .git/.harness，网络默认关闭",
+            ),
+            ("danger-full-access", "关闭系统边界；需输入确认短语"),
+            ("network-on", "允许受限子进程联网；需输入确认短语"),
+            ("network-off", "关闭受限子进程网络访问"),
         ],
         "/vector" => &[
             ("status", "显示向量硬门与后端状态"),

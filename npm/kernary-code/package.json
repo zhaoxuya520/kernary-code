@@ -1,6 +1,6 @@
 {
   "name": "kernary-code",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Kernary Code terminal-native multi-agent coding runtime",
   "license": "Apache-2.0",
   "repository": {
@@ -16,14 +16,16 @@
   },
   "files": [
     "bin",
-    "README.md"
+    "README.md",
+    "LICENSE-APACHE",
+    "NOTICE"
   ],
   "engines": {
     "node": ">=18"
   },
   "optionalDependencies": {
-    "kernary-code-win32-x64": "0.4.0",
-    "kernary-code-linux-x64-gnu": "0.4.0"
+    "kernary-code-win32-x64": "0.5.0",
+    "kernary-code-linux-x64-gnu": "0.5.0"
   },
   "keywords": [
     "ai",

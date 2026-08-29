@@ -8,6 +8,7 @@ authors.workspace = true
 description = "Layered Kernary settings and runtime mode profiles"
 
 [dependencies]
+harness-sandbox = { path = "../harness-sandbox" }
 serde.workspace = true
 toml.workspace = true
 

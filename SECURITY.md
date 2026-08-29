@@ -14,6 +14,12 @@
 
 - Permission policy 不能替代 Sandbox；
 - Sandbox hard deny 不能被 Allow Rule 或 Full Mode 覆盖；
+- 默认 `workspace-write`；Windows 以受限 Token + capability ACL 强制写边界，Linux 以 bubblewrap namespace 强制文件与网络边界；
+- `.git` 与 `.harness` 在 `workspace-write` 中仍不可由子进程写入；`read-only` 只允许隔离临时目录写入；
+- Linux 缺少可信 `bwrap` 或平台后端启动失败时受限命令 fail closed，不静默退化；
+- Windows unelevated 后端的文件写边界是内核强制，默认断网是环境兼容层而非 WFP；`/sandbox` 会如实显示此差异；
+- Windows 项目 capability ACE 幂等写入；账户缺少 `WRITE_DAC` 时命令 fail closed；
+- `danger-full-access`、Sandbox 内联网与权限 `bypass` 都需要独立显式确认；项目配置不能静默启用它们；
 - API Key/OAuth token 不进入日志、Context、npm 包或仓库；
 - 未配置 Embedding Model 时不会初始化 Vector capability；
 - Workspace Patch 必须经过独立预览与二次审批。

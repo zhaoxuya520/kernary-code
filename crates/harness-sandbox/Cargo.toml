@@ -1,0 +1,33 @@
+[package]
+name = "harness-sandbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Platform-native subprocess sandbox for Kernary"
+
+[dependencies]
+serde.workspace = true
+sha2.workspace = true
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Threading",
+]
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"

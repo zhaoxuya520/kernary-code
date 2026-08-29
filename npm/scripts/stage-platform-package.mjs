@@ -19,6 +19,7 @@ const destinationBin = path.join(destinationRoot, 'bin');
 await mkdir(destinationBin, { recursive: true });
 await copyFile(path.resolve(binary), path.join(destinationBin, binaryName));
 await copyFile(path.join(root, 'LICENSE-APACHE'), path.join(destinationRoot, 'LICENSE-APACHE'));
+await copyFile(path.join(root, 'NOTICE'), path.join(destinationRoot, 'NOTICE'));
 if (platform === 'linux-x64-gnu') {
   await chmod(path.join(destinationBin, binaryName), 0o755);
 }

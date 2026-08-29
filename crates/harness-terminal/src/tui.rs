@@ -251,6 +251,7 @@ pub struct TerminalSnapshot {
     pub language: UiLanguage,
     pub mode: String,
     pub permission_mode: String,
+    pub sandbox_mode: String,
     pub reasoning: String,
     pub context_percent: u8,
     pub cache_percent: Option<u8>,
@@ -769,11 +770,18 @@ fn render_product_tui(frame: &mut Frame<'_>, view: TuiView<'_>) -> usize {
     if area.width >= 108 {
         runtime.extend([
             Span::styled("  ·  ", theme.muted),
+            Span::styled(format!("{} ", view.pack.sandbox_label), theme.muted),
+            Span::raw(view.snapshot.sandbox_mode.clone()),
+        ]);
+    }
+    if area.width >= 130 {
+        runtime.extend([
+            Span::styled("  ·  ", theme.muted),
             Span::styled(format!("{} ", view.pack.reasoning_label), theme.muted),
             Span::raw(view.snapshot.reasoning.clone()),
         ]);
     }
-    if area.width >= 118 {
+    if area.width >= 148 {
         runtime.extend([
             Span::styled("  ·  ", theme.muted),
             Span::styled(format!("{} ", view.pack.vector_label), theme.muted),
@@ -1541,6 +1549,7 @@ mod tests {
             language: UiLanguage::ZhCn,
             mode: "balanced".to_owned(),
             permission_mode: "manual".to_owned(),
+            sandbox_mode: "workspace-write".to_owned(),
             reasoning: "medium".to_owned(),
             context_percent: 42,
             cache_percent: Some(75),

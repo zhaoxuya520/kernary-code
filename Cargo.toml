@@ -22,6 +22,7 @@ members = [
     "crates/harness-provider-catalog",
     "crates/harness-provider-runtime",
     "crates/harness-permission",
+    "crates/harness-sandbox",
     "crates/harness-tool",
     "crates/harness-builtin-tools",
     "crates/harness-mcp",
@@ -35,7 +36,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
@@ -62,6 +63,7 @@ semver = "1.0"
 toml = "0.9"
 getrandom = "0.3"
 url = "2.5"
+windows-sys = "0.61"
 
 [profile.release]
 lto = "thin"

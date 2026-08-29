@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub use harness_sandbox::SandboxMode;
+
 const CONFIG_SCHEMA_VERSION: u32 = 1;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
@@ -165,6 +167,13 @@ pub struct PermissionPatch {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct SandboxPatch {
+    pub mode: Option<SandboxMode>,
+    pub network_access: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct FailoverPatch {
     pub enabled: Option<bool>,
     pub cost_confirmed: Option<bool>,
@@ -221,6 +230,8 @@ pub struct SettingsPatch {
     #[serde(default)]
     pub permissions: PermissionPatch,
     #[serde(default)]
+    pub sandbox: SandboxPatch,
+    #[serde(default)]
     pub failover: FailoverPatch,
     #[serde(default)]
     pub agents: AgentPatch,
@@ -240,6 +251,8 @@ pub struct EffectiveSettings {
     pub trace_enabled: bool,
     pub log_level: LogLevel,
     pub permission_mode: PermissionMode,
+    pub sandbox_mode: SandboxMode,
+    pub sandbox_network_access: bool,
     pub failover_enabled: bool,
     pub failover_cost_confirmed: bool,
     pub failover_targets: String,
@@ -258,6 +271,8 @@ impl Default for EffectiveSettings {
             trace_enabled: false,
             log_level: LogLevel::Info,
             permission_mode: PermissionMode::Manual,
+            sandbox_mode: SandboxMode::WorkspaceWrite,
+            sandbox_network_access: false,
             failover_enabled: false,
             failover_cost_confirmed: false,
             failover_targets: String::new(),
@@ -423,6 +438,14 @@ impl EffectiveConfigView {
             (
                 "permissions.mode".to_owned(),
                 self.settings.permission_mode.to_string(),
+            ),
+            (
+                "sandbox.mode".to_owned(),
+                self.settings.sandbox_mode.to_string(),
+            ),
+            (
+                "sandbox.network-access".to_owned(),
+                self.settings.sandbox_network_access.to_string(),
             ),
             (
                 "failover.enabled".to_owned(),
@@ -717,6 +740,8 @@ pub fn supported_setting_keys() -> &'static [&'static str] {
         "trace.enabled",
         "logging.level",
         "permissions.mode",
+        "sandbox.mode",
+        "sandbox.network-access",
         "failover.enabled",
         "failover.cost-confirmed",
         "failover.targets",
@@ -747,6 +772,8 @@ fn set_patch_value(patch: &mut SettingsPatch, key: &str, value: &str) -> Result<
         "trace.enabled" => patch.trace.enabled = Some(parse_bool(value)?),
         "logging.level" => patch.logging.level = Some(parse_log_level(value)?),
         "permissions.mode" => patch.permissions.mode = Some(parse_permission_mode(value)?),
+        "sandbox.mode" => patch.sandbox.mode = Some(parse_sandbox_mode(value)?),
+        "sandbox.network-access" => patch.sandbox.network_access = Some(parse_bool(value)?),
         "failover.enabled" => patch.failover.enabled = Some(parse_bool(value)?),
         "failover.cost-confirmed" => patch.failover.cost_confirmed = Some(parse_bool(value)?),
         "failover.targets" => {
@@ -791,6 +818,8 @@ fn clear_patch_value(patch: &mut SettingsPatch, key: &str) -> Result<(), ConfigE
         "trace.enabled" => patch.trace.enabled = None,
         "logging.level" => patch.logging.level = None,
         "permissions.mode" => patch.permissions.mode = None,
+        "sandbox.mode" => patch.sandbox.mode = None,
+        "sandbox.network-access" => patch.sandbox.network_access = None,
         "failover.enabled" => patch.failover.enabled = None,
         "failover.cost-confirmed" => patch.failover.cost_confirmed = None,
         "failover.targets" => patch.failover.targets = None,
@@ -844,6 +873,12 @@ fn apply_patch(
         patch.permissions.mode,
         settings.permission_mode,
         "permissions.mode"
+    );
+    apply!(patch.sandbox.mode, settings.sandbox_mode, "sandbox.mode");
+    apply!(
+        patch.sandbox.network_access,
+        settings.sandbox_network_access,
+        "sandbox.network-access"
     );
     apply!(
         patch.failover.enabled,
@@ -960,6 +995,10 @@ fn parse_permission_mode(value: &str) -> Result<PermissionMode, ConfigError> {
         "custom" => Ok(PermissionMode::Custom),
         _ => Err(ConfigError::new("config-permission-mode-invalid", value)),
     }
+}
+
+fn parse_sandbox_mode(value: &str) -> Result<SandboxMode, ConfigError> {
+    SandboxMode::parse(value).map_err(|_| ConfigError::new("config-sandbox-mode-invalid", value))
 }
 
 fn valid_failover_targets(value: &str) -> bool {

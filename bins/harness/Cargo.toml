@@ -39,6 +39,7 @@ harness-model = { path = "../../crates/harness-model" }
 harness-mcp = { path = "../../crates/harness-mcp" }
 harness-memory = { path = "../../crates/harness-memory" }
 harness-permission = { path = "../../crates/harness-permission" }
+harness-sandbox = { path = "../../crates/harness-sandbox" }
 harness-plugin = { path = "../../crates/harness-plugin" }
 harness-skill = { path = "../../crates/harness-skill" }
 harness-provider-openai = { path = "../../crates/harness-provider-openai" }

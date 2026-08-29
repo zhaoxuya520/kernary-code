@@ -71,6 +71,21 @@ kernary models --refresh ollama
 
 把 `examples/kernary.toml` 复制到项目根目录即可设置 Project 层。运行中可使用 `/config` 查看每项来源，使用 `/mode`、`/settings` 和 `/permissions` 写 Session 或 Runtime 层。权限分为 `manual`、`edit`、`auto`、`full`、`bypass`；TUI 使用 Shift+Tab 在前四级循环，最高 `bypass` 必须显式确认，任何等级都不能绕过 denied roots、Sandbox allowlist 或项目边界。
 
+## 系统级 Sandbox
+
+默认 `workspace-write`。Windows 使用受限 Primary Token、项目 capability ACL、私有 Desktop 与 Job Object；Linux 使用 `bubblewrap` mount/user/network namespace。项目外、`.git` 与 `.harness` 写入会被操作系统拒绝；`read-only` 只保留隔离临时目录写权限。Linux 未安装可信 `bwrap` 时命令 fail closed。
+
+```text
+/sandbox
+/sandbox read-only
+/sandbox workspace-write
+/sandbox network-on
+/sandbox network-off
+/sandbox danger-full-access
+```
+
+网络默认关闭；Windows 兼容后端会明确标注环境级断网不等于 WFP。`network-on` 与 `danger-full-access` 都有独立确认；非交互启动分别使用 `--sandbox-network-access` 和 `--sandbox danger-full-access --confirm-dangerous-sandbox`。
+
 ## Session 与私有辅助状态
 
 `kernary` 每次创建新 Session；`kernary -c` 继续当前项目最近会话，`kernary -r [id-or-title]` 从当前项目选择恢复。会话内使用 `/session`、`/session new`、`/session switch` 和 `/session rename`。标题由第一条有效对话本地生成，完整 Transcript 不随 Context 压缩删除。

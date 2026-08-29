@@ -354,8 +354,11 @@ fn doctor_json_reports_storage_and_terminal_capabilities() {
     assert!(value["providers"]["catalogCount"].as_u64().unwrap_or(0) >= 10);
     assert_eq!(value["providers"]["customConfigPresent"], false);
     assert_eq!(value["storageSchema"], 3);
-    assert_eq!(value["stage"], 20);
-    assert_eq!(value["stageTrack"], "24-settings-vector-doctor-depth");
+    assert_eq!(value["stage"], 21);
+    assert_eq!(value["stageTrack"], "25-platform-native-subprocess-sandbox");
+    assert_eq!(value["sandbox"]["mode"], "workspace-write");
+    assert!(value["sandbox"]["available"].as_bool().is_some());
+    assert!(value["sandbox"]["backend"].as_str().is_some());
     assert!(
         value["providers"]["discovery"]["configured"]
             .as_u64()
@@ -1129,8 +1132,9 @@ fn plain_mode_accepts_slash_commands_from_stdin() {
     assert!(stdout.contains("Provider: 未配置"));
     assert!(stdout.contains("files.read@1"));
     assert!(stdout.contains("Pending approvals: 0"));
-    assert!(stdout.contains("Filesystem tools: canonical workspace containment active"));
-    assert!(stdout.contains("OS filesystem isolation for subprocesses: unavailable"));
+    assert!(stdout.contains("Sandbox mode: workspace-write"));
+    assert!(stdout.contains("Platform backend:"));
+    assert!(stdout.contains("Filesystem boundary:"));
     assert!(stdout.contains("Goal: terminal goal"));
     assert!(stdout.contains("Context  series:"));
     assert!(stdout.contains("Auto compact active"));
@@ -1364,7 +1368,16 @@ fn git_status_runs_through_allowlisted_process_tool() {
     let mut child = harness()
         .current_dir(temporary.path())
         .env("HARNESS_GIT_EXECUTABLE", &git)
-        .args(["--ui", "plain", "--ascii", "--permission-mode", "full"])
+        .args([
+            "--ui",
+            "plain",
+            "--ascii",
+            "--permission-mode",
+            "full",
+            "--sandbox",
+            "danger-full-access",
+            "--confirm-dangerous-sandbox",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -1900,6 +1913,75 @@ fn cli_permission_levels_require_explicit_bypass_confirmation() {
 }
 
 #[test]
+fn sandbox_danger_and_network_access_require_explicit_confirmation() {
+    let dangerous = tempdir().expect("danger project");
+    let denied = kernary()
+        .current_dir(dangerous.path())
+        .args(["--sandbox", "danger-full-access"])
+        .output()
+        .expect("unconfirmed danger");
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("--confirm-dangerous-sandbox"));
+
+    let mut confirmed = kernary()
+        .current_dir(dangerous.path())
+        .args([
+            "--ui",
+            "plain",
+            "--ascii",
+            "--sandbox",
+            "danger-full-access",
+            "--confirm-dangerous-sandbox",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("confirmed danger");
+    confirmed
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"/sandbox\n/exit\n")
+        .expect("commands");
+    let output = confirmed.wait_with_output().expect("danger output");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("Sandbox mode: danger-full-access"));
+    assert!(stdout.contains("Filesystem boundary: unrestricted"));
+
+    let network = tempdir().expect("network project");
+    let mut child = kernary()
+        .current_dir(network.path())
+        .args(["--ui", "plain", "--ascii"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("network prompt");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(
+            b"/settings set sandbox.network-access true session\n/sandbox network-on\nI UNDERSTAND NETWORK ACCESS\n/sandbox\n/exit\n",
+        )
+        .expect("network commands");
+    let output = child.wait_with_output().expect("network output");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("请使用 `/sandbox network-on`"));
+    assert!(stdout.contains("sandbox.network-access=true"));
+    assert!(stdout.contains("Network boundary: allowed"));
+
+    let resumed = kernary()
+        .current_dir(network.path())
+        .arg("-c")
+        .output()
+        .expect("resume without network confirmation");
+    assert!(!resumed.status.success());
+    assert!(String::from_utf8_lossy(&resumed.stderr).contains("--sandbox-network-access"));
+}
+
+#[test]
 fn permission_rules_are_strict_persistent_listable_and_removable() {
     let temporary = tempdir().expect("tempdir");
     let mut child = kernary()
@@ -2128,9 +2210,10 @@ fn observability_trace_profile_why_inspect_and_runtime_doctor_are_real_and_read_
     assert!(stdout.contains("MCP servers=0"), "stdout={stdout}");
     assert!(stdout.contains("Plugins discovered="), "stdout={stdout}");
     assert!(
-        stdout.contains("Sandbox workspaceContainment=true"),
+        stdout.contains("Sandbox mode: workspace-write"),
         "stdout={stdout}"
     );
+    assert!(stdout.contains("Platform backend:"), "stdout={stdout}");
     assert!(stdout.contains("Vector semantic=Absent"), "stdout={stdout}");
     assert!(stdout.contains("Cache l1="), "stdout={stdout}");
     assert!(

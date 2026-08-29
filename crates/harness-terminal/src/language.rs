@@ -106,6 +106,7 @@ pub struct LanguagePack {
     pub new_session_title: &'static str,
     pub agent_md_action: &'static str,
     pub permission_label: &'static str,
+    pub sandbox_label: &'static str,
     pub permission_cycle_hint: &'static str,
 }
 
@@ -379,9 +380,9 @@ pub(crate) fn command_description(
             "チェックポイントから新しいコンテキスト系列へ復元します",
         ),
         "/sandbox" => (
-            "Show real sandbox capabilities and hard boundaries",
-            "顯示真實 Sandbox 能力與硬邊界",
-            "実際のサンドボックス機能と強制境界を表示します",
+            "Inspect or switch OS-enforced sandbox and network boundaries",
+            "檢視或切換作業系統強制的 Sandbox 與網路邊界",
+            "OS が強制するサンドボックスとネットワーク境界を確認・切替します",
         ),
         "/session" => (
             "Pick, create, switch, or rename a project-local session",
@@ -527,6 +528,7 @@ const EN: LanguagePack = LanguagePack {
     new_session_title: "New project-local session. Start with a focused task.",
     agent_md_action: "Inspect global/project private instructions",
     permission_label: "Permission",
+    sandbox_label: "Sandbox",
     permission_cycle_hint: "Shift+Tab permission",
 };
 
@@ -594,6 +596,7 @@ const ZH_CN: LanguagePack = LanguagePack {
     new_session_title: "新的项目本地会话；从一个明确任务开始。",
     agent_md_action: "查看全局/项目私有指令",
     permission_label: "权限",
+    sandbox_label: "沙箱",
     permission_cycle_hint: "Shift+Tab 切换权限",
 };
 
@@ -661,6 +664,7 @@ const ZH_TW: LanguagePack = LanguagePack {
     new_session_title: "新的專案本機會話；請從明確任務開始。",
     agent_md_action: "檢視全域/專案私有指令",
     permission_label: "權限",
+    sandbox_label: "沙箱",
     permission_cycle_hint: "Shift+Tab 切換權限",
 };
 
@@ -728,6 +732,7 @@ const JA: LanguagePack = LanguagePack {
     new_session_title: "新しいプロジェクト専用セッションです。明確なタスクから始めてください。",
     agent_md_action: "グローバル/プロジェクト専用の指示を確認",
     permission_label: "権限",
+    sandbox_label: "サンドボックス",
     permission_cycle_hint: "Shift+Tab 権限切替",
 };
 

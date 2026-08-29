@@ -117,6 +117,33 @@ TUI 中可用 `Shift+Tab` 在 `manual → edit → auto → full` 之间循环�
 
 任何等级都不能绕过 denied roots、项目边界和 Sandbox hard deny。
 
+## 系统级安全沙箱
+
+Kernary 默认使用 `workspace-write`，所有 `process.exec` 派生命令都继承同一边界；这不是只靠提示词或路径字符串检查：
+
+- Windows：受限 Primary Token、项目 capability SID、继承 ACL、私有 Desktop 和 Job Object；项目可写，但 `.git`、`.harness` 与项目外路径不可写；
+- Linux：系统 `bubblewrap` 的 mount/user/network namespace，根文件系统只读，只显式绑定项目写目录和隔离 `/tmp`；未安装 `bwrap` 时受限命令 fail closed；
+- `read-only`：项目只读，只保留隔离临时目录；
+- `danger-full-access`：关闭系统边界，必须输入确认短语或同时传入确认参数；
+- 网络默认关闭。Linux 是 network namespace 强制隔离；Windows unelevated 后端使用离线环境兼容层并在 `/sandbox` 中明确提示不是 WFP 防火墙级隔离。
+
+```text
+/sandbox
+/sandbox read-only
+/sandbox workspace-write
+/sandbox network-on        # 二次确认
+/sandbox network-off
+/sandbox danger-full-access # 二次确认
+
+kernary --sandbox read-only
+kernary --sandbox danger-full-access --confirm-dangerous-sandbox
+kernary --sandbox-network-access
+```
+
+Approval 只决定何时询问，Sandbox 决定操作系统实际允许什么；审批放行不会自动取消沙箱边界。
+
+Windows 首次运行受限命令时会给项目和隔离临时目录写入项目专属、幂等的 capability ACE；普通用户 Token 不含该 SID。若当前账户对项目没有 `WRITE_DAC`，命令会安全失败并显示错误，不会退回无沙箱执行。
+
 ## 私有 agent.md
 
 Kernary 使用本机辅助指令文件 `agent.md`：项目私有 `.harness/agent.md` 存在时覆盖全局 `~/.kernary/agent.md`，否则读取全局文件。它们不会叠加，避免冲突和 Context 膨胀。
@@ -167,7 +194,7 @@ Requirements 与 Explorer 首波并行，Architect 和 Planner 依赖其压缩�
 - 15 个最小权限内置 Agent、能力路由 Adaptive DAG 与独立 Evidence Gate；
 - Context Broker、结构化压缩、Checkpoint、Rollback 与 Prompt Canonicalization；
 - MCP stdio/HTTP/SSE/OAuth、Plugin、Skill、Browser、LSP 3.18；
-- Permission Rule、Sandbox hard deny、Tool Journal、Patch Preview 与安全 Undo；
+- Permission Rule、Windows restricted-token/Linux bubblewrap 系统沙箱、Tool Journal、Patch Preview 与安全 Undo；
 - 严格非交互 `kernary exec`，适合 CI 和自动化。
 
 ## Optional Vector 硬门

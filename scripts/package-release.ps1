@@ -62,6 +62,7 @@ if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
 Copy-Item -LiteralPath $binary -Destination (Join-Path $package "bin\kernary$extension")
 Copy-Item -LiteralPath $binary -Destination (Join-Path $package "bin\harness$extension")
 Copy-Item -LiteralPath (Join-Path $project 'LICENSE-APACHE') -Destination $package
+Copy-Item -LiteralPath (Join-Path $project 'NOTICE') -Destination $package
 Copy-Item -LiteralPath (Join-Path $project 'Cargo.lock') -Destination (Join-Path $package 'DEPENDENCIES.lock')
 Copy-Item -LiteralPath (Join-Path $project 'assets\kernary-kern.svg') -Destination (Join-Path $package 'assets')
 Copy-Item -LiteralPath (Join-Path $project 'kernary.providers.example.toml') -Destination (Join-Path $package 'examples\kernary.providers.toml')

@@ -18,6 +18,8 @@ Kernary includes 15 sleeping-by-default agents. `/team adaptive <1..4> <objectiv
 
 Running `kernary` creates a new project-local session. Use `kernary -c`, `kernary -r [id-or-title]`, or `/session` to resume/switch only within the current folder. The first user turn creates a local title and the immutable transcript survives context compaction. Permission levels are `manual`, `edit`, `auto`, `full`, and explicitly confirmed `bypass`. Project-private `.harness/agent.md` overrides global `~/.kernary/agent.md`; vector configuration and data live only under `.harness/` and are protected by local Git excludes.
 
+Spawned commands default to an OS-enforced `workspace-write` sandbox. Windows uses a restricted primary token, capability ACLs, a private desktop, and a Job Object; Linux uses bubblewrap namespaces and fails closed when no trusted `bwrap` is available. `/sandbox` reports the exact backend and network strength. `read-only`, explicitly confirmed network access, and explicitly confirmed `danger-full-access` are available without conflating sandbox boundaries with approval policy.
+
 The package installs a native binary selected by npm for Windows x64 or Linux x64 glibc. It does not download executables during `postinstall`.
 
 Source, documentation and checksums: https://github.com/zhaoxuya520/kernary-code

@@ -6,13 +6,14 @@ use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use harness_permission::PermissionAction;
+use harness_sandbox::ProcessSandbox;
 use harness_tool::{
     SandboxPort, ToolDescriptor, ToolEffectClass, ToolError, ToolExecutionInput,
     ToolInvocationJournal, ToolInvocationPatch, ToolInvocationStatus, ToolPromptLoading,
@@ -694,6 +695,7 @@ fn ensure_browser_tool_source(descriptor: &ToolDescriptor) -> Result<(), ToolErr
 pub fn register_process_tool(
     registry: &mut ToolRegistry,
     guard: WorkspacePathGuard,
+    process_sandbox: Arc<ProcessSandbox>,
     allowed_executables: Vec<PathBuf>,
     max_timeout: Duration,
     max_output_bytes: usize,
@@ -734,6 +736,7 @@ pub fn register_process_tool(
         },
         Arc::new(ProcessExecTool {
             guard,
+            process_sandbox,
             allowed_executables,
             max_timeout,
             max_output_bytes,
@@ -889,6 +892,7 @@ struct FileWriteTool {
 
 struct ProcessExecTool {
     guard: WorkspacePathGuard,
+    process_sandbox: Arc<ProcessSandbox>,
     allowed_executables: Vec<PathBuf>,
     max_timeout: Duration,
     max_output_bytes: usize,
@@ -1027,9 +1031,11 @@ impl ToolProvider for ProcessExecTool {
             .and_then(serde_json::Value::as_u64)
             .map(Duration::from_millis)
             .unwrap_or(self.max_timeout);
-        let mut command = Command::new(&executable);
+        let mut command = self
+            .process_sandbox
+            .command(&executable, &arguments, &cwd)
+            .map_err(|error| ToolError::new(error.code, error.message))?;
         command
-            .args(arguments)
             .current_dir(cwd)
             .env_clear()
             .stdin(Stdio::null())
@@ -1048,6 +1054,9 @@ impl ToolProvider for ProcessExecTool {
                 command.env(name, value);
             }
         }
+        self.process_sandbox
+            .apply_environment(&mut command)
+            .map_err(|error| ToolError::new(error.code, error.message))?;
         let mut wrapped = CommandWrap::from(command);
         #[cfg(windows)]
         wrapped.wrap(JobObject);
@@ -1354,6 +1363,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use harness_sandbox::SandboxMode;
 
     struct NoopBrowserProvider;
     impl ToolProvider for NoopBrowserProvider {
@@ -1522,6 +1532,10 @@ mod tests {
         register_process_tool(
             &mut registry,
             guard.clone(),
+            Arc::new(
+                ProcessSandbox::new(guard.root(), SandboxMode::DangerFullAccess, true)
+                    .expect("process sandbox"),
+            ),
             vec![executable.clone()],
             max_timeout,
             1024,

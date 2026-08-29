@@ -13,8 +13,14 @@ language = "zh-CN"
 mode = "auto"
 
 [settings.permissions]
-# safe | ask | auto | full | custom；任何模式都不能绕过 Sandbox hard deny。
+# manual | edit | auto | full | bypass；任何模式都不能绕过 Sandbox hard deny。
 mode = "manual"
+
+[settings.sandbox]
+# read-only | workspace-write | danger-full-access；危险模式每次启动都要显式确认。
+mode = "workspace-write"
+# 默认 false；开启联网必须通过 /sandbox network-on 或启动参数显式确认。
+network_access = false
 
 [settings.failover]
 # 默认关闭；开启时必须确认成本范围并使用精确 provider/model allowlist。
