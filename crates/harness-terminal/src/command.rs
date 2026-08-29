@@ -376,6 +376,9 @@ pub enum VectorCommand {
     Mode { mode: String },
     Setup,
     Clear,
+    Providers,
+    Provider { provider_id: Option<String> },
+    Model { model_id: Option<String> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -876,7 +879,7 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/vector",
-        synopsis: "/vector [status|setup|clear|on|off|auto|purge]",
+        synopsis: "/vector [status|setup|providers|provider [id]|model [id]|clear|on|off|auto|purge]",
         description: "配置并验证全局 Embedding Provider，或管理当前项目向量检索",
     },
     CommandSpec {
@@ -1455,6 +1458,9 @@ fn argument_suggestions(input: &str) -> Vec<InputSuggestion> {
         "/vector" => &[
             ("status", "显示向量硬门与后端状态"),
             ("setup", "配置全局 URL、Key、模型与自动/手动维度"),
+            ("providers", "列出全局向量 Provider Catalog"),
+            ("provider ", "切换 Provider，随后选择其模型"),
+            ("model ", "切换当前 Provider 内的向量模型"),
             ("clear", "确认后移除全局 Embedding Provider 配置"),
             ("on", "有 Embedding Model 时允许语义检索"),
             ("off", "强制 lexical 路径"),
@@ -1995,14 +2001,23 @@ fn parse_vector(value: &str) -> Result<VectorCommand, CommandParseError> {
     match value {
         "" | "status" => Ok(VectorCommand::Status),
         "setup" => Ok(VectorCommand::Setup),
+        "providers" => Ok(VectorCommand::Providers),
+        "provider" => Ok(VectorCommand::Provider { provider_id: None }),
+        "model" => Ok(VectorCommand::Model { model_id: None }),
         "clear" => Ok(VectorCommand::Clear),
         "purge" => Ok(VectorCommand::Purge),
         "on" | "off" | "auto" => Ok(VectorCommand::Mode {
             mode: value.to_owned(),
         }),
+        value if value.starts_with("provider ") => Ok(VectorCommand::Provider {
+            provider_id: Some(value[9..].trim().to_owned()),
+        }),
+        value if value.starts_with("model ") => Ok(VectorCommand::Model {
+            model_id: Some(value[6..].trim().to_owned()),
+        }),
         _ => Err(CommandParseError {
             code: "invalid-vector-command",
-            message: "用法：/vector [status|setup|clear|on|off|auto|purge]".to_owned(),
+            message: "用法：/vector [status|setup|providers|provider [id]|model [id]|clear|on|off|auto|purge]".to_owned(),
         }),
     }
 }
@@ -2701,6 +2716,26 @@ mod tests {
             registry.parse("/vector setup").expect("vector setup"),
             ParsedInput::Command(SlashCommand::Vector {
                 operation: VectorCommand::Setup
+            })
+        );
+        assert_eq!(
+            registry
+                .parse("/vector provider voyage")
+                .expect("vector provider"),
+            ParsedInput::Command(SlashCommand::Vector {
+                operation: VectorCommand::Provider {
+                    provider_id: Some("voyage".to_owned())
+                }
+            })
+        );
+        assert_eq!(
+            registry
+                .parse("/vector model voyage-4-lite")
+                .expect("vector model"),
+            ParsedInput::Command(SlashCommand::Vector {
+                operation: VectorCommand::Model {
+                    model_id: Some("voyage-4-lite".to_owned())
+                }
             })
         );
         assert_eq!(

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use harness_memory::VectorProviderConfig;
+use harness_memory::{VectorCatalogConfig, VectorProviderConfig};
 use rusqlite::OptionalExtension;
 use tempfile::tempdir;
 
@@ -376,10 +376,10 @@ fn doctor_json_reports_storage_and_terminal_capabilities() {
     assert!(value["providers"]["catalogCount"].as_u64().unwrap_or(0) >= 10);
     assert_eq!(value["providers"]["customConfigPresent"], false);
     assert_eq!(value["storageSchema"], 3);
-    assert_eq!(value["stage"], 22);
+    assert_eq!(value["stage"], 23);
     assert_eq!(
         value["stageTrack"],
-        "26-global-vector-health-and-setup-navigation"
+        "27-vector-provider-and-model-catalog"
     );
     assert_eq!(value["sandbox"]["mode"], "workspace-write");
     assert!(value["sandbox"]["available"].as_bool().is_some());
@@ -1124,7 +1124,7 @@ fn every_setup_wizard_accepts_cancel_and_returns_to_normal_chat() {
         .as_mut()
         .expect("stdin")
         .write_all(
-            b"keep this conversation visible\n/provider add\n/cancel\n/status\n/provider add\nhttps://example.com/v1\n/cancel\n/status\n/vector setup\n/cancel\n/status\n/vector setup\nhttp://127.0.0.1:9/v1\n/cancel\n/status\n/vector clear\n/cancel\n/status\n/permissions bypass\n/cancel\n/status\n/exit\n",
+            b"keep this conversation visible\n/provider add\n/cancel\n/status\n/provider add\nExample Relay\nhttps://example.com/v1\n/cancel\n/status\n/vector setup\n/cancel\n/status\n/vector setup\nvoyage\n/cancel\n/status\n/vector clear\n/cancel\n/status\n/permissions bypass\n/cancel\n/status\n/exit\n",
         )
         .expect("commands");
     let output = child.wait_with_output().expect("output");
@@ -1789,9 +1789,12 @@ fn legacy_project_vector_config_migrates_to_global_and_project_data_stays_local(
             .success()
     );
     assert_eq!(
-        VectorProviderConfig::load(&global_config)
+        VectorCatalogConfig::load(&global_config)
             .expect("load global")
+            .resolved_active()
+            .expect("resolve global")
             .expect("global config")
+            .1
             .model,
         "embed-private"
     );

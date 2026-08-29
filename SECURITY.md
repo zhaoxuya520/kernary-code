@@ -22,6 +22,7 @@
 - `danger-full-access`、Sandbox 内联网与权限 `bypass` 都需要独立显式确认；项目配置不能静默启用它们；
 - API Key/OAuth token 不进入日志、Context、npm 包或仓库；
 - 未配置 Embedding Model 时不会初始化 Vector capability；
-- Embedding Provider 配置是全局的，但 Memory、Repository 与向量投影数据库仍按项目保存在 `.harness/`；
+- Embedding Provider/模型目录与各 Provider 凭证是全局的，但 Memory、Repository 与向量投影数据库仍按项目保存在 `.harness/`；
+- 新增或切换 Embedding 模型时必须返回单个非空、有限数值向量；普通聊天模型不会被接受为向量模型；
 - 每次项目启动只用固定健康检查文本验证全局 Embedding Provider，不上传项目源码；真正的语义检索才会发送被选中的项目记忆/查询文本；
 - Workspace Patch 必须经过独立预览与二次审批。

@@ -8,6 +8,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::{EmbeddingProfile, EmbeddingProvider, EmbeddingProviderFactory, MemoryError};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EmbeddingDimensionField {
+    #[default]
+    Dimensions,
+    OutputDimension,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EmbeddingRequestDialect {
+    #[default]
+    OpenAi,
+    Voyage,
+    Jina,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HttpEmbeddingConfig {
@@ -16,6 +33,8 @@ pub struct HttpEmbeddingConfig {
     pub credential_id: Option<String>,
     /// 固定维度模型为 false；只有显式协商可变维度时才发送 dimensions。
     pub send_dimensions: bool,
+    pub dimension_field: EmbeddingDimensionField,
+    pub request_dialect: EmbeddingRequestDialect,
     pub allow_remote_project_private: bool,
     pub timeout_millis: Option<u64>,
 }
@@ -152,12 +171,27 @@ fn request_embedding(
         return Err(MemoryError::new("embedding-input-empty", "input"));
     }
     let mut body = serde_json::json!({
-        "input": input,
-        "model": model,
-        "encoding_format": "float"
+        "input": [input],
+        "model": model
     });
+    match config.request_dialect {
+        EmbeddingRequestDialect::OpenAi => {
+            body["encoding_format"] = serde_json::json!("float");
+        }
+        EmbeddingRequestDialect::Voyage => {
+            body["output_dtype"] = serde_json::json!("float");
+        }
+        EmbeddingRequestDialect::Jina => {
+            body["normalized"] = serde_json::json!(true);
+            body["embedding_type"] = serde_json::json!("float");
+        }
+    }
     if let Some(dimensions) = dimensions {
-        body["dimensions"] = serde_json::json!(dimensions);
+        let field = match config.dimension_field {
+            EmbeddingDimensionField::Dimensions => "dimensions",
+            EmbeddingDimensionField::OutputDimension => "output_dimension",
+        };
+        body[field] = serde_json::json!(dimensions);
     }
     let mut request = StreamingHttpRequest::json(
         config.endpoint.clone(),

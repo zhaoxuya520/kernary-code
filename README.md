@@ -34,7 +34,7 @@ Kernary 不会在未配置模型时用测试模型伪造结果。第一次进入
 /provider add
 ```
 
-向导依次要求 API Base URL、Secure Key，随后自动请求同源 `/models`，让用户选择默认模型，并原子保存到 `kernary.providers.toml`。切换分为两层：
+向导依次要求自定义 Provider 名称（后续切换使用）、API Base URL、Secure Key，随后自动请求同源 `/models`，让用户选择默认模型，并原子保存到 `kernary.providers.toml`。切换分为两层：
 
 ```text
 /provider switch       # 切换提供商并采用其默认模型
@@ -43,15 +43,24 @@ Kernary 不会在未配置模型时用测试模型伪造结果。第一次进入
 /provider remove <id>   # 删除项目级 Provider 与凭证引用
 ```
 
-全局唯一的向量模型提供商使用独立向导：
+向量模型使用独立的全局 Provider Catalog：
 
 ```text
 /vector setup
+/vector providers              # 查看已配置的向量 Provider
+/vector provider [provider-id] # 先切换 Provider，再选择它的模型
+/vector model [model-id]       # 切换当前 Provider 的向量模型
 ```
 
-依次输入 Embedding Base URL、Secure Key 和手写模型名。Kernary 不拉取向量模型目录：先发送不带 `dimensions` 的验证请求并从返回向量自动识别维度；如果 Provider 必须显式指定维度，则进入手动维度步骤并再次验证。固定维度模型后续不发送 `dimensions`，可变维度模型使用验证过的用户维度。
+`/vector setup` 按以下顺序提供三种选择：
 
-Provider 配置保存在全局 Kernary 配置目录的 `vector.toml`（Windows 默认 `%APPDATA%\Kernary\vector.toml`；Linux 默认 `$XDG_CONFIG_HOME/kernary/vector.toml` 或 `~/.config/kernary/vector.toml`），也可用 `KERNARY_HOME` 或 `KERNARY_GLOBAL_VECTOR_CONFIG` 指定。Key 只进入 OS Credential Store；所有项目复用这一份 Provider。每次进入项目都会发送固定、无项目内容的健康检查，并在 `/vector status` 显示结果。Memory、Repository 和向量投影仍只位于当前项目 `.harness/`，不会跨项目混存。`/vector clear` 需要二次确认，因为它会移除全局 Provider；当前项目投影会同时清除。
+1. Voyage AI：只输入 Key；内置 `voyage-4-lite`、`voyage-4`、`voyage-4-large`、`voyage-code-4`。
+2. Jina AI：只输入 Key；内置 Jina v5 文本、Jina Code 以及 v3/v4 模型 ID。
+3. Custom：输入自定义厂商名、OpenAI-compatible Base URL、Key，以及一个或多个逗号分隔的模型 ID。
+
+内置目录不依赖 `/models` 接口。Kernary 会对所选模型发送真实 Embedding 请求，只有返回单个非空、有限数值向量时才保存为可用模型；聊天模型或其他非向量模型无法通过。维度先从不带维度覆盖的响应自动识别；如果兼容端点要求显式维度，再进入手动维度步骤并验证返回长度。Voyage 使用其 `output_dimension` 协议，Jina 使用 `dimensions`，固定维度模型后续不发送覆盖字段。
+
+Provider/模型目录保存在全局 Kernary 配置目录的 `vector.toml`（Windows 默认 `%APPDATA%\Kernary\vector.toml`；Linux 默认 `$XDG_CONFIG_HOME/kernary/vector.toml` 或 `~/.config/kernary/vector.toml`），也可用 `KERNARY_HOME` 或 `KERNARY_GLOBAL_VECTOR_CONFIG` 指定。每家厂商的 Key 分别只进入 OS Credential Store；所有项目复用目录与凭证。每次进入项目都会用当前 Provider/模型发送固定、无项目内容的健康检查，并在 `/vector status` 显示结果。Memory、Repository 和向量投影仍只位于当前项目 `.harness/`，不会跨项目混存。旧版单 Provider 配置会自动迁移为名为 `custom-legacy` 的目录项。`/vector clear` 需要二次确认，因为它会移除全部全局向量 Provider 与凭证；当前项目投影会同时清除。
 
 界面语言支持高度定制的命令目录、快捷键提示和设置向导：
 
@@ -201,7 +210,7 @@ Requirements 与 Explorer 首波并行，Architect 和 Planner 依赖其压缩�
 
 ## Optional Vector 硬门
 
-未配置全局 `vector.toml`（或兼容环境变量 `KERNARY_EMBEDDING_MODEL`）时，Kernary 不构造 Embedding Provider/Vector Backend，不创建向量表、generation 或 job。全局 Provider 通过项目启动健康检查后进入 Ready；第一次 semantic/hybrid 请求才惰性激活当前项目投影。检查失败时项目仍可启动，并明确降级为 lexical-only。
+未配置全局 `vector.toml` 的有效 Provider/模型（或兼容环境变量 `KERNARY_EMBEDDING_MODEL`）时，Kernary 不构造 Embedding Provider/Vector Backend，不创建向量表、generation 或 job。当前全局 Provider/模型通过项目启动健康检查后进入 Ready；第一次 semantic/hybrid 请求才惰性激活当前项目投影。检查失败时项目仍可启动，并明确降级为 lexical-only。
 
 ## 从源码构建
 

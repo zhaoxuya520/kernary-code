@@ -48,9 +48,10 @@ use harness_mcp::{
     McpTransportConfig, load_config_file as load_mcp_config_file, save_config_file_atomic,
 };
 use harness_memory::{
-    DEFAULT_VECTOR_CREDENTIAL_ID, DEFAULT_VECTOR_PROVIDER, EmbeddingConfig, HttpEmbeddingConfig,
-    HttpEmbeddingFactory, MemoryKind, ProjectMemory, RepositoryIndex, RetrievalMode,
-    SemanticCapability, VectorDimensionMode, VectorProviderConfig,
+    DEFAULT_VECTOR_CREDENTIAL_ID, EmbeddingConfig, EmbeddingDimensionField,
+    EmbeddingRequestDialect, HttpEmbeddingConfig, HttpEmbeddingFactory, MemoryKind, ProjectMemory,
+    RepositoryIndex, RetrievalMode, SemanticCapability, VectorCatalogConfig, VectorDimensionMode,
+    VectorModelConfig, VectorProviderConfig, VectorProviderDefinition, VectorProviderKind,
 };
 #[cfg(debug_assertions)]
 use harness_model::FakeModelProvider;
@@ -366,40 +367,110 @@ fn normalize_openai_base_url(value: &str) -> Result<(String, String, String), St
     ))
 }
 
-fn provider_id_from_url(catalog: &ProviderCatalog, url: &str) -> Result<ProviderId, String> {
-    let parsed = Url::parse(url).map_err(|error| error.to_string())?;
-    let host = parsed.host_str().ok_or("URL 缺少 host")?;
-    let slug = host
-        .to_ascii_lowercase()
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character
-            } else {
-                '-'
+fn provider_slug(value: &str) -> Result<String, String> {
+    let mut slug = String::new();
+    for character in value.trim().chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character.to_ascii_lowercase());
+        } else if character.is_ascii() {
+            if !slug.ends_with('-') && !slug.is_empty() {
+                slug.push('-');
             }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .chars()
-        .take(56)
-        .collect::<String>();
-    if slug.is_empty() {
-        return Err("无法从 URL 生成 Provider ID".to_owned());
-    }
-    let base = format!("custom-{slug}");
-    for index in 1..=999 {
-        let candidate = if index == 1 {
-            base.clone()
         } else {
-            format!("{base}-{index}")
-        };
-        let id = ProviderId::from(candidate);
-        if catalog.get(&id).is_none() {
-            return Ok(id);
+            if !slug.ends_with('-') && !slug.is_empty() {
+                slug.push('-');
+            }
+            slug.push('u');
+            slug.push_str(&format!("{:x}", character as u32));
+            slug.push('-');
+        }
+        if slug.len() >= 52 {
+            break;
         }
     }
-    Err("同一 host 的自定义 Provider 数量过多".to_owned())
+    let slug = slug.trim_matches('-').to_owned();
+    if slug.is_empty() {
+        Err("Provider 名称必须包含字母、数字或可编码的 Unicode 字符".to_owned())
+    } else {
+        Ok(slug)
+    }
+}
+
+fn custom_text_provider_id(catalog: &ProviderCatalog, name: &str) -> Result<ProviderId, String> {
+    let provider_id = ProviderId::from(format!("custom-{}", provider_slug(name)?));
+    if catalog.get(&provider_id).is_some() {
+        return Err(format!("Provider 名称已存在：{provider_id}"));
+    }
+    Ok(provider_id)
+}
+
+fn custom_vector_provider_id(catalog: &VectorCatalogConfig, name: &str) -> Result<String, String> {
+    let provider_id = format!("custom-{}", provider_slug(name)?);
+    if catalog.provider(&provider_id).is_some() {
+        return Err(format!("Vector Provider 名称已存在：{provider_id}"));
+    }
+    Ok(provider_id)
+}
+
+fn builtin_vector_provider(id: &str) -> Option<VectorProviderDefinition> {
+    let (display_name, kind, endpoint, credential_id, models) = match id {
+        "voyage" => (
+            "Voyage AI",
+            VectorProviderKind::Voyage,
+            "https://api.voyageai.com/v1/embeddings",
+            "vector:voyage",
+            vec![
+                "voyage-4-lite",
+                "voyage-4",
+                "voyage-4-large",
+                "voyage-code-4",
+            ],
+        ),
+        "jina" => (
+            "Jina AI",
+            VectorProviderKind::Jina,
+            "https://api.jina.ai/v1/embeddings",
+            "vector:jina",
+            vec![
+                "jina-embeddings-v5-text-nano",
+                "jina-embeddings-v5-text-small",
+                "jina-code-embeddings-1.5b",
+                "jina-code-embeddings-0.5b",
+                "jina-embeddings-v3",
+                "jina-embeddings-v4",
+            ],
+        ),
+        _ => return None,
+    };
+    Some(VectorProviderDefinition {
+        id: id.to_owned(),
+        display_name: display_name.to_owned(),
+        kind,
+        endpoint: endpoint.to_owned(),
+        credential_id: credential_id.to_owned(),
+        models: models
+            .into_iter()
+            .map(VectorModelConfig::unverified)
+            .collect(),
+        active_model: None,
+    })
+}
+
+const fn vector_dimension_field(kind: VectorProviderKind) -> EmbeddingDimensionField {
+    match kind {
+        VectorProviderKind::Voyage => EmbeddingDimensionField::OutputDimension,
+        VectorProviderKind::Jina | VectorProviderKind::Custom | VectorProviderKind::Legacy => {
+            EmbeddingDimensionField::Dimensions
+        }
+    }
+}
+
+const fn vector_request_dialect(kind: VectorProviderKind) -> EmbeddingRequestDialect {
+    match kind {
+        VectorProviderKind::Voyage => EmbeddingRequestDialect::Voyage,
+        VectorProviderKind::Jina => EmbeddingRequestDialect::Jina,
+        VectorProviderKind::Custom | VectorProviderKind::Legacy => EmbeddingRequestDialect::OpenAi,
+    }
 }
 
 fn default_model_for_provider(
@@ -419,11 +490,15 @@ fn default_model_for_provider(
     models.into_iter().next()
 }
 
-fn restore_vector_credential(store: &dyn CredentialStore, previous: Option<SecretString>) {
+fn restore_vector_credential(
+    store: &dyn CredentialStore,
+    credential_id: &str,
+    previous: Option<SecretString>,
+) {
     if let Some(previous) = previous {
-        let _ = store.put(&CredentialId::new(DEFAULT_VECTOR_CREDENTIAL_ID), previous);
+        let _ = store.put(&CredentialId::new(credential_id), previous);
     } else {
-        let _ = store.delete(&CredentialId::new(DEFAULT_VECTOR_CREDENTIAL_ID));
+        let _ = store.delete(&CredentialId::new(credential_id));
     }
 }
 
@@ -432,6 +507,12 @@ fn is_setup_cancel_value(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "" | "/cancel" | "/back"
     )
+}
+
+fn supports_manual_dimension_retry(error: &str) -> bool {
+    error.starts_with("embedding-http-status: 400")
+        || error.starts_with("embedding-http-status: 422")
+        || error.starts_with("embedding-dimensions-")
 }
 
 struct AppBackend {
@@ -503,8 +584,22 @@ struct PendingCredential {
     credential_id: String,
 }
 
+enum VectorModelTarget {
+    Add {
+        provider: VectorProviderDefinition,
+        previous_secret: Option<SecretString>,
+    },
+    Switch {
+        provider_id: String,
+    },
+}
+
 enum SetupState {
-    ProviderUrl,
+    ProviderName,
+    ProviderUrl {
+        provider_id: ProviderId,
+        display_name: String,
+    },
     ProviderKey {
         definition: ProviderDefinition,
     },
@@ -513,20 +608,34 @@ enum SetupState {
         models: Vec<ModelId>,
     },
     ProviderSwitch,
-    VectorUrl,
-    VectorKey {
-        endpoint: String,
+    VectorSetupProvider,
+    VectorCustomName,
+    VectorCustomUrl {
+        provider_id: String,
+        display_name: String,
     },
-    VectorModel {
-        endpoint: String,
+    VectorKey {
+        provider: VectorProviderDefinition,
+    },
+    VectorCustomModels {
+        provider: VectorProviderDefinition,
         previous_secret: Option<SecretString>,
     },
-    VectorDimensions {
-        endpoint: String,
-        model: String,
+    VectorCustomDimensions {
+        provider: VectorProviderDefinition,
+        model_index: usize,
         previous_secret: Option<SecretString>,
         detection_error: String,
     },
+    VectorModelSelect {
+        target: VectorModelTarget,
+    },
+    VectorDimensions {
+        target: VectorModelTarget,
+        model: String,
+        detection_error: String,
+    },
+    VectorProviderSwitch,
     VectorClear {
         confirmation: String,
     },
@@ -714,6 +823,66 @@ impl AppBackend {
         if self.pending_setup.is_some() && !input.trim().is_empty() && is_setup_cancel_value(input)
         {
             return Vec::new();
+        }
+        if matches!(self.pending_setup, Some(SetupState::VectorSetupProvider)) {
+            let prefix = input.trim().to_ascii_lowercase();
+            return [
+                ("voyage", "Voyage AI", "built-in · recommended first"),
+                ("jina", "Jina AI", "built-in · multilingual/code models"),
+                ("custom", "Custom", "named URL + multiple model IDs"),
+            ]
+            .into_iter()
+            .filter(|(id, name, _)| {
+                id.starts_with(&prefix) || name.to_ascii_lowercase().contains(&prefix)
+            })
+            .map(|(id, name, description)| InputSuggestion::new(id, name, description))
+            .collect();
+        }
+        if matches!(self.pending_setup, Some(SetupState::VectorProviderSwitch)) {
+            let prefix = input.trim().to_ascii_lowercase();
+            return self
+                .load_vector_catalog()
+                .map(|catalog| {
+                    catalog
+                        .providers
+                        .into_iter()
+                        .filter(|provider| {
+                            provider.id.contains(&prefix)
+                                || provider.display_name.to_ascii_lowercase().contains(&prefix)
+                        })
+                        .map(|provider| {
+                            InputSuggestion::new(
+                                provider.id,
+                                provider.display_name,
+                                format!("{:?} · {} models", provider.kind, provider.models.len()),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+        if let Some(SetupState::VectorModelSelect { target }) = &self.pending_setup {
+            let prefix = input.trim().to_ascii_lowercase();
+            return self
+                .vector_target_provider(target)
+                .map(|provider| {
+                    provider
+                        .models
+                        .into_iter()
+                        .filter(|model| model.id.to_ascii_lowercase().contains(&prefix))
+                        .map(|model| {
+                            InputSuggestion::new(
+                                model.id.clone(),
+                                model.id,
+                                model.dimensions.map_or_else(
+                                    || "unverified embedding model".to_owned(),
+                                    |dimensions| format!("verified · {dimensions}d"),
+                                ),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
         }
         if matches!(self.pending_setup, Some(SetupState::SessionSwitch)) {
             let prefix = input.trim().to_lowercase();
@@ -937,14 +1106,14 @@ impl AppBackend {
             return Self::response_error("Agent Team 运行期间不能修改 Provider");
         }
         let pack = self.language().pack();
-        self.pending_setup = Some(SetupState::ProviderUrl);
+        self.pending_setup = Some(SetupState::ProviderName);
         BackendResponse {
             lines: vec![pack.provider_add_title.to_owned()],
             clear_view: true,
             input_prompt: Some(InputPrompt {
-                request_id: "provider-add-url".to_owned(),
-                prompt: pack.provider_url_prompt.to_owned(),
-                placeholder: Some("https://gateway.example/v1".to_owned()),
+                request_id: "provider-add-name".to_owned(),
+                prompt: pack.provider_name_prompt.to_owned(),
+                placeholder: Some("My Gateway".to_owned()),
             }),
             ..BackendResponse::default()
         }
@@ -1003,33 +1172,38 @@ impl AppBackend {
             return Self::response_error("Agent Team 运行期间不能修改向量模型");
         }
         let pack = self.language().pack();
-        self.pending_setup = Some(SetupState::VectorUrl);
+        self.pending_setup = Some(SetupState::VectorSetupProvider);
         BackendResponse {
             lines: vec![
                 pack.vector_setup_title.to_owned(),
                 pack.vector_setup_description.to_owned(),
+                "1. Voyage AI · built-in · https://api.voyageai.com/v1/embeddings".to_owned(),
+                "2. Jina AI · built-in · https://api.jina.ai/v1/embeddings".to_owned(),
+                "3. Custom · named provider · custom URL and multiple model IDs".to_owned(),
             ],
             clear_view: true,
             input_prompt: Some(InputPrompt {
-                request_id: "vector-url".to_owned(),
-                prompt: pack.vector_url_prompt.to_owned(),
-                placeholder: Some("https://gateway.example/v1".to_owned()),
+                request_id: "vector-setup-provider".to_owned(),
+                prompt: pack.vector_provider_prompt.to_owned(),
+                placeholder: Some("voyage | jina | custom".to_owned()),
             }),
             ..BackendResponse::default()
         }
     }
 
     fn embedding_factory(
-        endpoint: &str,
+        provider: &VectorProviderDefinition,
         store: Arc<dyn CredentialStore>,
         send_dimensions: bool,
     ) -> Result<HttpEmbeddingFactory, String> {
         HttpEmbeddingFactory::new(
             HttpEmbeddingConfig {
-                provider: DEFAULT_VECTOR_PROVIDER.to_owned(),
-                endpoint: endpoint.to_owned(),
-                credential_id: Some(DEFAULT_VECTOR_CREDENTIAL_ID.to_owned()),
+                provider: provider.id.clone(),
+                endpoint: provider.endpoint.clone(),
+                credential_id: Some(provider.credential_id.clone()),
                 send_dimensions,
+                dimension_field: vector_dimension_field(provider.kind),
+                request_dialect: vector_request_dialect(provider.kind),
                 allow_remote_project_private: true,
                 timeout_millis: Some(30_000),
             },
@@ -1039,34 +1213,222 @@ impl AppBackend {
         .map_err(|error| error.to_string())
     }
 
-    fn finish_vector_setup(
+    fn load_vector_catalog(&self) -> Result<VectorCatalogConfig, String> {
+        VectorCatalogConfig::load(&self.vector_config_path).map_err(|error| error.to_string())
+    }
+
+    fn save_vector_catalog(&self, catalog: &VectorCatalogConfig) -> Result<(), String> {
+        catalog
+            .save(&self.vector_config_path)
+            .map_err(|error| error.to_string())
+    }
+
+    fn vector_target_provider(
+        &self,
+        target: &VectorModelTarget,
+    ) -> Result<VectorProviderDefinition, String> {
+        match target {
+            VectorModelTarget::Add { provider, .. } => Ok(provider.clone()),
+            VectorModelTarget::Switch { provider_id } => self
+                .load_vector_catalog()?
+                .provider(provider_id)
+                .cloned()
+                .ok_or_else(|| format!("Vector Provider 不存在：{provider_id}")),
+        }
+    }
+
+    fn prompt_vector_model_selection(&mut self, target: VectorModelTarget) -> BackendResponse {
+        let provider = match self.vector_target_provider(&target) {
+            Ok(provider) => provider,
+            Err(error) => return Self::response_error(error),
+        };
+        let lines = std::iter::once(format!(
+            "Vector Provider · {} ({})",
+            provider.display_name, provider.id
+        ))
+        .chain(provider.models.iter().map(|model| {
+            format!(
+                "{}{} · {}",
+                if provider.active_model.as_deref() == Some(model.id.as_str()) {
+                    "* "
+                } else {
+                    "  "
+                },
+                model.id,
+                model.dimensions.map_or_else(
+                    || "unverified".to_owned(),
+                    |dimensions| format!("{dimensions}d · {:?}", model.dimension_mode)
+                )
+            )
+        }))
+        .collect();
+        self.pending_setup = Some(SetupState::VectorModelSelect { target });
+        BackendResponse {
+            lines,
+            input_prompt: Some(InputPrompt {
+                request_id: "vector-model-select".to_owned(),
+                prompt: self.language().pack().vector_model_select_prompt.to_owned(),
+                placeholder: Some("输入模型 ID".to_owned()),
+            }),
+            ..BackendResponse::default()
+        }
+    }
+
+    fn probe_vector_model(
+        provider: &VectorProviderDefinition,
+        model: &str,
+        dimensions: Option<usize>,
+    ) -> Result<VectorModelConfig, String> {
+        if provider.model(model).is_none() {
+            return Err(format!(
+                "模型不在 Provider Catalog 中：{}/{}",
+                provider.id, model
+            ));
+        }
+        let store: Arc<dyn CredentialStore> = Arc::new(
+            OsCredentialStore::new("dev.openai.harness").map_err(|error| error.to_string())?,
+        );
+        let factory = Self::embedding_factory(provider, store, dimensions.is_some())?;
+        let now = unix_millis().unwrap_or_default();
+        let (vector, mode) = match dimensions {
+            Some(dimensions) => (
+                factory
+                    .probe_with_dimensions(
+                        model,
+                        dimensions,
+                        "Kernary embedding model capability validation",
+                    )
+                    .map_err(|error| error.to_string())?,
+                VectorDimensionMode::Requested,
+            ),
+            None => (
+                factory
+                    .probe(model, "Kernary embedding model capability validation")
+                    .map_err(|error| error.to_string())?,
+                VectorDimensionMode::AutoDetected,
+            ),
+        };
+        Ok(VectorModelConfig::verified(model, vector.len(), mode, now))
+    }
+
+    fn select_vector_model(
         &mut self,
-        config: VectorProviderConfig,
-        store: &dyn CredentialStore,
-        previous_secret: Option<SecretString>,
+        target: VectorModelTarget,
+        model_id: String,
     ) -> BackendResponse {
-        if let Err(error) = config.save(&self.vector_config_path) {
-            restore_vector_credential(store, previous_secret);
+        let provider = match self.vector_target_provider(&target) {
+            Ok(provider) => provider,
+            Err(error) => return Self::response_error(error),
+        };
+        if provider.model(&model_id).is_none() {
+            return Self::response_error(format!(
+                "模型不在当前 Vector Provider Catalog 中：{model_id}"
+            ));
+        }
+        if let Some(verified) = provider
+            .model(&model_id)
+            .filter(|model| model.dimensions.is_some() && model.dimension_mode.is_some())
+            .cloned()
+        {
+            return self.commit_vector_model(target, verified);
+        }
+        match Self::probe_vector_model(&provider, &model_id, None) {
+            Ok(verified) => self.commit_vector_model(target, verified),
+            Err(error) if supports_manual_dimension_retry(&error) => {
+                self.pending_setup = Some(SetupState::VectorDimensions {
+                    target,
+                    model: model_id,
+                    detection_error: error.clone(),
+                });
+                BackendResponse {
+                    lines: vec![
+                        self.language().pack().vector_dimensions_fallback.to_owned(),
+                        format!("Detection: {error}"),
+                    ],
+                    input_prompt: Some(InputPrompt {
+                        request_id: "vector-dimensions".to_owned(),
+                        prompt: self.language().pack().vector_dimensions_prompt.to_owned(),
+                        placeholder: Some("1024".to_owned()),
+                    }),
+                    ..BackendResponse::default()
+                }
+            }
+            Err(error) => {
+                if let VectorModelTarget::Add {
+                    provider,
+                    previous_secret,
+                } = target
+                    && let Ok(store) = OsCredentialStore::new("dev.openai.harness")
+                {
+                    restore_vector_credential(&store, &provider.credential_id, previous_secret);
+                }
+                Self::response_error(format!("模型未返回有效 Embedding，未加入目录：{error}"))
+            }
+        }
+    }
+
+    fn commit_vector_model(
+        &mut self,
+        target: VectorModelTarget,
+        verified_model: VectorModelConfig,
+    ) -> BackendResponse {
+        let provider_id = match &target {
+            VectorModelTarget::Add { provider, .. } => provider.id.clone(),
+            VectorModelTarget::Switch { provider_id } => provider_id.clone(),
+        };
+        let commit = (|| -> Result<VectorCatalogConfig, String> {
+            let mut catalog = self.load_vector_catalog()?;
+            match &target {
+                VectorModelTarget::Add { provider, .. } => {
+                    let mut provider = provider.clone();
+                    let Some(model) = provider.model_mut(&verified_model.id) else {
+                        return Err("待添加 Provider 缺少所选模型".to_owned());
+                    };
+                    *model = verified_model.clone();
+                    provider.active_model = Some(verified_model.id.clone());
+                    catalog
+                        .upsert_provider(provider)
+                        .map_err(|error| error.to_string())?;
+                }
+                VectorModelTarget::Switch { .. } => {
+                    let provider = catalog
+                        .provider_mut(&provider_id)
+                        .ok_or_else(|| "Vector Provider 不存在".to_owned())?;
+                    let model = provider
+                        .model_mut(&verified_model.id)
+                        .ok_or_else(|| "Vector 模型不在 Provider Catalog 中".to_owned())?;
+                    *model = verified_model.clone();
+                }
+            }
+            catalog
+                .activate(&provider_id, &verified_model.id)
+                .map_err(|error| error.to_string())?;
+            self.save_vector_catalog(&catalog)?;
+            Ok(catalog)
+        })();
+        if let Err(error) = commit {
+            if let VectorModelTarget::Add {
+                provider,
+                previous_secret,
+            } = target
+                && let Ok(store) = OsCredentialStore::new("dev.openai.harness")
+            {
+                restore_vector_credential(&store, &provider.credential_id, previous_secret);
+            }
             return Self::response_error(error);
         }
         self.vector_health = VectorHealth::Healthy {
-            dimensions: config.dimensions,
-            dimension_mode: config.dimension_mode,
+            dimensions: verified_model.dimensions.unwrap_or_default(),
+            dimension_mode: verified_model.dimension_mode.unwrap_or_default(),
         };
         BackendResponse {
             lines: vec![
+                format!("Vector Provider: {provider_id}"),
                 format!(
-                    "{} · {}={}",
-                    self.language().pack().vector_verified,
-                    self.language().pack().model_label,
-                    config.model
-                ),
-                format!(
-                    "{} {} · mode={:?} · endpoint={}",
-                    self.language().pack().dimensions_label,
-                    config.dimensions,
-                    config.dimension_mode,
-                    config.endpoint
+                    "Vector Model: {} · {}d · {:?}",
+                    verified_model.id,
+                    verified_model.dimensions.unwrap_or_default(),
+                    verified_model.dimension_mode.unwrap_or_default()
                 ),
                 format!(
                     "Global · {} · {}",
@@ -1079,6 +1441,56 @@ impl AppBackend {
         }
     }
 
+    fn continue_custom_vector_validation(
+        &mut self,
+        mut provider: VectorProviderDefinition,
+        start_index: usize,
+        previous_secret: Option<SecretString>,
+    ) -> BackendResponse {
+        for index in start_index..provider.models.len() {
+            if provider.models[index].dimensions.is_some() {
+                continue;
+            }
+            let model_id = provider.models[index].id.clone();
+            match Self::probe_vector_model(&provider, &model_id, None) {
+                Ok(verified) => provider.models[index] = verified,
+                Err(error) if supports_manual_dimension_retry(&error) => {
+                    self.pending_setup = Some(SetupState::VectorCustomDimensions {
+                        provider,
+                        model_index: index,
+                        previous_secret,
+                        detection_error: error.clone(),
+                    });
+                    return BackendResponse {
+                        lines: vec![
+                            format!("Model: {model_id}"),
+                            self.language().pack().vector_dimensions_fallback.to_owned(),
+                            format!("Detection: {error}"),
+                        ],
+                        input_prompt: Some(InputPrompt {
+                            request_id: "vector-custom-dimensions".to_owned(),
+                            prompt: self.language().pack().vector_dimensions_prompt.to_owned(),
+                            placeholder: Some("1024".to_owned()),
+                        }),
+                        ..BackendResponse::default()
+                    };
+                }
+                Err(error) => {
+                    if let Ok(store) = OsCredentialStore::new("dev.openai.harness") {
+                        restore_vector_credential(&store, &provider.credential_id, previous_secret);
+                    }
+                    return Self::response_error(format!(
+                        "模型 {model_id} 未返回有效 Embedding，整个自定义 Provider 未保存：{error}"
+                    ));
+                }
+            }
+        }
+        self.prompt_vector_model_selection(VectorModelTarget::Add {
+            provider,
+            previous_secret,
+        })
+    }
+
     fn cancel_setup(&mut self, state: SetupState) -> BackendResponse {
         match state {
             SetupState::ProviderDefault { definition, .. } => {
@@ -1088,21 +1500,36 @@ impl AppBackend {
                     let _ = store.delete(&CredentialId::new(credential_id));
                 }
             }
-            SetupState::VectorModel {
-                previous_secret, ..
+            SetupState::VectorCustomModels {
+                provider,
+                previous_secret,
             }
-            | SetupState::VectorDimensions {
-                previous_secret, ..
+            | SetupState::VectorCustomDimensions {
+                provider,
+                previous_secret,
+                ..
             } => {
                 if let Ok(store) = OsCredentialStore::new("dev.openai.harness") {
-                    if let Some(previous_secret) = previous_secret {
-                        let _ = store.put(
-                            &CredentialId::new(DEFAULT_VECTOR_CREDENTIAL_ID),
-                            previous_secret,
-                        );
-                    } else {
-                        let _ = store.delete(&CredentialId::new(DEFAULT_VECTOR_CREDENTIAL_ID));
-                    }
+                    restore_vector_credential(&store, &provider.credential_id, previous_secret);
+                }
+            }
+            SetupState::VectorModelSelect {
+                target:
+                    VectorModelTarget::Add {
+                        provider,
+                        previous_secret,
+                    },
+            }
+            | SetupState::VectorDimensions {
+                target:
+                    VectorModelTarget::Add {
+                        provider,
+                        previous_secret,
+                    },
+                ..
+            } => {
+                if let Ok(store) = OsCredentialStore::new("dev.openai.harness") {
+                    restore_vector_credential(&store, &provider.credential_id, previous_secret);
                 }
             }
             _ => {}
@@ -1138,13 +1565,62 @@ impl AppBackend {
             return self.cancel_setup(state);
         }
         match (state, request_id) {
-            (SetupState::ProviderUrl, "provider-add-url") => {
+            (SetupState::ProviderName, "provider-add-name") => {
+                if value.chars().count() > 64 {
+                    return self.retry_setup_input(
+                        SetupState::ProviderName,
+                        "provider-add-name",
+                        self.language().pack().provider_name_prompt,
+                        Some("My Gateway".to_owned()),
+                        "Provider 名称不能超过 64 个字符",
+                    );
+                }
+                let catalog = match load_provider_catalog(Path::new(&self.project_root)) {
+                    Ok(catalog) => catalog,
+                    Err(error) => return Self::response_error(error),
+                };
+                let provider_id = match custom_text_provider_id(&catalog, &value) {
+                    Ok(provider_id) => provider_id,
+                    Err(error) => {
+                        return self.retry_setup_input(
+                            SetupState::ProviderName,
+                            "provider-add-name",
+                            self.language().pack().provider_name_prompt,
+                            Some("My Gateway".to_owned()),
+                            error,
+                        );
+                    }
+                };
+                self.pending_setup = Some(SetupState::ProviderUrl {
+                    provider_id: provider_id.clone(),
+                    display_name: value.clone(),
+                });
+                BackendResponse {
+                    lines: vec![format!("Provider ID: {provider_id}")],
+                    input_prompt: Some(InputPrompt {
+                        request_id: "provider-add-url".to_owned(),
+                        prompt: self.language().pack().provider_url_prompt.to_owned(),
+                        placeholder: Some("https://gateway.example/v1".to_owned()),
+                    }),
+                    ..BackendResponse::default()
+                }
+            }
+            (
+                SetupState::ProviderUrl {
+                    provider_id,
+                    display_name,
+                },
+                "provider-add-url",
+            ) => {
                 let (base, route_endpoint, discovery_endpoint) =
                     match normalize_openai_base_url(&value) {
                         Ok(endpoints) => endpoints,
                         Err(error) => {
                             return self.retry_setup_input(
-                                SetupState::ProviderUrl,
+                                SetupState::ProviderUrl {
+                                    provider_id,
+                                    display_name,
+                                },
                                 "provider-add-url",
                                 self.language().pack().provider_url_prompt,
                                 Some("https://gateway.example/v1".to_owned()),
@@ -1156,14 +1632,6 @@ impl AppBackend {
                     Ok(catalog) => catalog,
                     Err(error) => return Self::response_error(error),
                 };
-                let provider_id = match provider_id_from_url(&catalog, &base) {
-                    Ok(provider_id) => provider_id,
-                    Err(error) => return Self::response_error(error),
-                };
-                let display_name = Url::parse(&base)
-                    .ok()
-                    .and_then(|url| url.host_str().map(str::to_owned))
-                    .map_or_else(|| provider_id.to_string(), |host| format!("Custom {host}"));
                 let definition = ProviderDefinition {
                     id: provider_id.clone(),
                     display_name,
@@ -1344,94 +1812,206 @@ impl AppBackend {
                     Err(error) => Self::response_error(error),
                 }
             }
-            (SetupState::VectorUrl, "vector-url") => {
+            (SetupState::VectorSetupProvider, "vector-setup-provider") => {
+                let selection = value.to_ascii_lowercase();
+                match selection.as_str() {
+                    "1" | "voyage" | "voyage-ai" => {
+                        let provider = builtin_vector_provider("voyage")
+                            .expect("Voyage built-in provider must exist");
+                        self.pending_setup = Some(SetupState::VectorKey {
+                            provider: provider.clone(),
+                        });
+                        BackendResponse {
+                            lines: vec![format!(
+                                "{} · {}",
+                                provider.display_name, provider.endpoint
+                            )],
+                            secret_prompt: Some(SecretPrompt {
+                                request_id: format!("vector-key:{}", provider.id),
+                                prompt: format!(
+                                    "{} · {}",
+                                    provider.display_name,
+                                    self.language().pack().secure_key_prompt
+                                ),
+                            }),
+                            ..BackendResponse::default()
+                        }
+                    }
+                    "2" | "jina" | "jina-ai" => {
+                        let provider = builtin_vector_provider("jina")
+                            .expect("Jina built-in provider must exist");
+                        self.pending_setup = Some(SetupState::VectorKey {
+                            provider: provider.clone(),
+                        });
+                        BackendResponse {
+                            lines: vec![format!(
+                                "{} · {}",
+                                provider.display_name, provider.endpoint
+                            )],
+                            secret_prompt: Some(SecretPrompt {
+                                request_id: format!("vector-key:{}", provider.id),
+                                prompt: format!(
+                                    "{} · {}",
+                                    provider.display_name,
+                                    self.language().pack().secure_key_prompt
+                                ),
+                            }),
+                            ..BackendResponse::default()
+                        }
+                    }
+                    "3" | "custom" => {
+                        self.pending_setup = Some(SetupState::VectorCustomName);
+                        BackendResponse {
+                            lines: vec!["Custom Vector Provider".to_owned()],
+                            input_prompt: Some(InputPrompt {
+                                request_id: "vector-custom-name".to_owned(),
+                                prompt: self.language().pack().vector_custom_name_prompt.to_owned(),
+                                placeholder: Some("My Embedding Gateway".to_owned()),
+                            }),
+                            ..BackendResponse::default()
+                        }
+                    }
+                    _ => self.retry_setup_input(
+                        SetupState::VectorSetupProvider,
+                        "vector-setup-provider",
+                        self.language().pack().vector_provider_prompt,
+                        Some("voyage | jina | custom".to_owned()),
+                        "仅支持 voyage、jina、custom",
+                    ),
+                }
+            }
+            (SetupState::VectorCustomName, "vector-custom-name") => {
+                if value.chars().count() > 64 {
+                    return self.retry_setup_input(
+                        SetupState::VectorCustomName,
+                        "vector-custom-name",
+                        self.language().pack().vector_custom_name_prompt,
+                        Some("My Embedding Gateway".to_owned()),
+                        "名称不能超过 64 个字符",
+                    );
+                }
+                let catalog = match self.load_vector_catalog() {
+                    Ok(catalog) => catalog,
+                    Err(error) => return Self::response_error(error),
+                };
+                let provider_id = match custom_vector_provider_id(&catalog, &value) {
+                    Ok(provider_id) => provider_id,
+                    Err(error) => {
+                        return self.retry_setup_input(
+                            SetupState::VectorCustomName,
+                            "vector-custom-name",
+                            self.language().pack().vector_custom_name_prompt,
+                            Some("My Embedding Gateway".to_owned()),
+                            error,
+                        );
+                    }
+                };
+                self.pending_setup = Some(SetupState::VectorCustomUrl {
+                    provider_id: provider_id.clone(),
+                    display_name: value,
+                });
+                BackendResponse {
+                    lines: vec![format!("Vector Provider ID: {provider_id}")],
+                    input_prompt: Some(InputPrompt {
+                        request_id: "vector-custom-url".to_owned(),
+                        prompt: self.language().pack().vector_url_prompt.to_owned(),
+                        placeholder: Some("https://gateway.example/v1".to_owned()),
+                    }),
+                    ..BackendResponse::default()
+                }
+            }
+            (
+                SetupState::VectorCustomUrl {
+                    provider_id,
+                    display_name,
+                },
+                "vector-custom-url",
+            ) => {
                 let (base, _, _) = match normalize_openai_base_url(&value) {
                     Ok(endpoints) => endpoints,
                     Err(error) => {
                         return self.retry_setup_input(
-                            SetupState::VectorUrl,
-                            "vector-url",
+                            SetupState::VectorCustomUrl {
+                                provider_id,
+                                display_name,
+                            },
+                            "vector-custom-url",
                             self.language().pack().vector_url_prompt,
                             Some("https://gateway.example/v1".to_owned()),
                             error,
                         );
                     }
                 };
-                let endpoint = format!("{base}/embeddings");
+                let provider = VectorProviderDefinition {
+                    credential_id: format!("vector:{provider_id}"),
+                    id: provider_id,
+                    display_name,
+                    kind: VectorProviderKind::Custom,
+                    endpoint: format!("{base}/embeddings"),
+                    models: Vec::new(),
+                    active_model: None,
+                };
                 self.pending_setup = Some(SetupState::VectorKey {
-                    endpoint: endpoint.clone(),
+                    provider: provider.clone(),
                 });
                 BackendResponse {
-                    lines: vec![format!("Embedding endpoint: {endpoint}")],
+                    lines: vec![format!("Embedding endpoint: {}", provider.endpoint)],
                     secret_prompt: Some(SecretPrompt {
-                        request_id: "vector-key".to_owned(),
-                        prompt: format!("Embedding · {}", self.language().pack().secure_key_prompt),
+                        request_id: format!("vector-key:{}", provider.id),
+                        prompt: format!(
+                            "{} · {}",
+                            provider.display_name,
+                            self.language().pack().secure_key_prompt
+                        ),
                     }),
                     ..BackendResponse::default()
                 }
             }
             (
-                SetupState::VectorModel {
-                    endpoint,
+                SetupState::VectorCustomModels {
+                    mut provider,
                     previous_secret,
                 },
-                "vector-model",
+                "vector-custom-models",
             ) => {
-                let store = match OsCredentialStore::new("dev.openai.harness") {
-                    Ok(store) => Arc::new(store),
-                    Err(error) => return Self::response_error(error),
-                };
-                let factory = match Self::embedding_factory(&endpoint, store.clone(), false) {
-                    Ok(factory) => factory,
-                    Err(error) => {
-                        restore_vector_credential(store.as_ref(), previous_secret);
-                        return Self::response_error(error);
-                    }
-                };
-                match factory.probe(&value, "Kernary embedding dimension detection") {
-                    Ok(vector) => {
-                        let config = match VectorProviderConfig::new(
-                            endpoint,
-                            value,
-                            vector.len(),
-                            unix_millis().unwrap_or_default(),
-                        ) {
-                            Ok(config) => config,
-                            Err(error) => {
-                                restore_vector_credential(store.as_ref(), previous_secret);
-                                return Self::response_error(error);
-                            }
-                        };
-                        self.finish_vector_setup(config, store.as_ref(), previous_secret)
-                    }
-                    Err(error) => {
-                        let detection_error = error.to_string();
-                        self.pending_setup = Some(SetupState::VectorDimensions {
-                            endpoint,
-                            model: value,
+                let mut model_ids = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                model_ids.sort();
+                model_ids.dedup();
+                if model_ids.is_empty()
+                    || model_ids.len() > 16
+                    || model_ids
+                        .iter()
+                        .any(|model| model.len() > 256 || model.chars().any(char::is_whitespace))
+                {
+                    return self.retry_setup_input(
+                        SetupState::VectorCustomModels {
+                            provider,
                             previous_secret,
-                            detection_error: detection_error.clone(),
-                        });
-                        BackendResponse {
-                            lines: vec![
-                                self.language().pack().vector_dimensions_fallback.to_owned(),
-                                format!("Detection: {detection_error}"),
-                            ],
-                            input_prompt: Some(InputPrompt {
-                                request_id: "vector-dimensions".to_owned(),
-                                prompt: self.language().pack().vector_dimensions_prompt.to_owned(),
-                                placeholder: Some("1024".to_owned()),
-                            }),
-                            ..BackendResponse::default()
-                        }
-                    }
+                        },
+                        "vector-custom-models",
+                        self.language().pack().vector_models_prompt,
+                        Some("embed-model-a, embed-model-b".to_owned()),
+                        "需要 1..16 个无空格模型 ID",
+                    );
                 }
+                provider.models = model_ids
+                    .into_iter()
+                    .map(VectorModelConfig::unverified)
+                    .collect();
+                self.continue_custom_vector_validation(provider, 0, previous_secret)
+            }
+            (SetupState::VectorModelSelect { target }, "vector-model-select") => {
+                self.select_vector_model(target, value)
             }
             (
                 SetupState::VectorDimensions {
-                    endpoint,
+                    target,
                     model,
-                    previous_secret,
                     detection_error,
                 },
                 "vector-dimensions",
@@ -1441,9 +2021,8 @@ impl AppBackend {
                     _ => {
                         return self.retry_setup_input(
                             SetupState::VectorDimensions {
-                                endpoint,
+                                target,
                                 model,
-                                previous_secret,
                                 detection_error,
                             },
                             "vector-dimensions",
@@ -1453,48 +2032,96 @@ impl AppBackend {
                         );
                     }
                 };
-                let store = match OsCredentialStore::new("dev.openai.harness") {
-                    Ok(store) => Arc::new(store),
+                let provider = match self.vector_target_provider(&target) {
+                    Ok(provider) => provider,
                     Err(error) => return Self::response_error(error),
                 };
-                let factory = match Self::embedding_factory(&endpoint, store.clone(), true) {
-                    Ok(factory) => factory,
-                    Err(error) => {
-                        restore_vector_credential(store.as_ref(), previous_secret);
-                        return Self::response_error(error);
-                    }
-                };
-                if let Err(error) = factory.probe_with_dimensions(
-                    &model,
-                    dimensions,
-                    "Kernary explicit embedding dimension validation",
-                ) {
-                    return self.retry_setup_input(
+                match Self::probe_vector_model(&provider, &model, Some(dimensions)) {
+                    Ok(verified) => self.commit_vector_model(target, verified),
+                    Err(error) => self.retry_setup_input(
                         SetupState::VectorDimensions {
-                            endpoint,
+                            target,
                             model,
-                            previous_secret,
                             detection_error,
                         },
                         "vector-dimensions",
                         self.language().pack().vector_dimensions_prompt,
                         Some(dimensions.to_string()),
-                        format!("显式维度验证失败：{error}"),
-                    );
+                        format!("不是可用的向量模型或维度不匹配：{error}"),
+                    ),
                 }
-                let config = match VectorProviderConfig::new_requested(
-                    endpoint,
-                    model,
-                    dimensions,
-                    unix_millis().unwrap_or_default(),
-                ) {
-                    Ok(config) => config,
-                    Err(error) => {
-                        restore_vector_credential(store.as_ref(), previous_secret);
-                        return Self::response_error(error);
+            }
+            (
+                SetupState::VectorCustomDimensions {
+                    mut provider,
+                    model_index,
+                    previous_secret,
+                    detection_error,
+                },
+                "vector-custom-dimensions",
+            ) => {
+                let dimensions = match value.parse::<usize>() {
+                    Ok(dimensions) if (1..=65_536).contains(&dimensions) => dimensions,
+                    _ => {
+                        return self.retry_setup_input(
+                            SetupState::VectorCustomDimensions {
+                                provider,
+                                model_index,
+                                previous_secret,
+                                detection_error,
+                            },
+                            "vector-custom-dimensions",
+                            self.language().pack().vector_dimensions_prompt,
+                            Some("1024".to_owned()),
+                            "维度必须是 1..65536 的整数",
+                        );
                     }
                 };
-                self.finish_vector_setup(config, store.as_ref(), previous_secret)
+                let Some(model_id) = provider
+                    .models
+                    .get(model_index)
+                    .map(|model| model.id.clone())
+                else {
+                    return Self::response_error("Custom Vector 模型索引失效");
+                };
+                match Self::probe_vector_model(&provider, &model_id, Some(dimensions)) {
+                    Ok(verified) => {
+                        provider.models[model_index] = verified;
+                        self.continue_custom_vector_validation(
+                            provider,
+                            model_index + 1,
+                            previous_secret,
+                        )
+                    }
+                    Err(error) => self.retry_setup_input(
+                        SetupState::VectorCustomDimensions {
+                            provider,
+                            model_index,
+                            previous_secret,
+                            detection_error,
+                        },
+                        "vector-custom-dimensions",
+                        self.language().pack().vector_dimensions_prompt,
+                        Some(dimensions.to_string()),
+                        format!("模型不是可用的向量模型或维度不匹配：{error}"),
+                    ),
+                }
+            }
+            (SetupState::VectorProviderSwitch, "vector-provider-switch") => {
+                let catalog = match self.load_vector_catalog() {
+                    Ok(catalog) => catalog,
+                    Err(error) => return Self::response_error(error),
+                };
+                if catalog.provider(&value).is_none() {
+                    return self.retry_setup_input(
+                        SetupState::VectorProviderSwitch,
+                        "vector-provider-switch",
+                        self.language().pack().vector_provider_prompt,
+                        Some("输入 Provider ID".to_owned()),
+                        "Vector Provider 不存在",
+                    );
+                }
+                self.prompt_vector_model_selection(VectorModelTarget::Switch { provider_id: value })
             }
             (SetupState::VectorClear { confirmation }, "vector-clear") => {
                 if value != confirmation {
@@ -1644,38 +2271,60 @@ impl AppBackend {
                     ..BackendResponse::default()
                 })
             }
-            (SetupState::VectorKey { endpoint }, "vector-key") => {
+            (SetupState::VectorKey { mut provider }, request)
+                if request == format!("vector-key:{}", provider.id) =>
+            {
                 if is_setup_cancel_value(&secret) {
-                    return Some(self.cancel_setup(SetupState::VectorKey { endpoint }));
+                    return Some(self.cancel_setup(SetupState::VectorKey { provider }));
                 }
                 let store = match OsCredentialStore::new("dev.openai.harness") {
                     Ok(store) => store,
                     Err(error) => return Some(Self::response_error(error)),
                 };
-                let previous_secret =
-                    match store.get(&CredentialId::new(DEFAULT_VECTOR_CREDENTIAL_ID)) {
-                        Ok(secret) => secret,
-                        Err(error) => return Some(Self::response_error(error)),
-                    };
+                let previous_secret = match store.get(&CredentialId::new(&provider.credential_id)) {
+                    Ok(secret) => secret,
+                    Err(error) => return Some(Self::response_error(error)),
+                };
                 if let Err(error) = store.put(
-                    &CredentialId::new(DEFAULT_VECTOR_CREDENTIAL_ID),
+                    &CredentialId::new(&provider.credential_id),
                     SecretString::new(secret),
                 ) {
                     return Some(Self::response_error(error));
                 }
-                self.pending_setup = Some(SetupState::VectorModel {
-                    endpoint,
+                if provider.kind == VectorProviderKind::Custom {
+                    self.pending_setup = Some(SetupState::VectorCustomModels {
+                        provider,
+                        previous_secret,
+                    });
+                    return Some(BackendResponse {
+                        lines: vec![self.language().pack().vector_key_saved.to_owned()],
+                        input_prompt: Some(InputPrompt {
+                            request_id: "vector-custom-models".to_owned(),
+                            prompt: self.language().pack().vector_models_prompt.to_owned(),
+                            placeholder: Some("embed-model-a, embed-model-b".to_owned()),
+                        }),
+                        ..BackendResponse::default()
+                    });
+                }
+                let Some(first_model) = provider.models.first().map(|model| model.id.clone())
+                else {
+                    restore_vector_credential(&store, &provider.credential_id, previous_secret);
+                    return Some(Self::response_error("内置 Vector Provider 没有模型"));
+                };
+                let verified = match Self::probe_vector_model(&provider, &first_model, None) {
+                    Ok(verified) => verified,
+                    Err(error) => {
+                        restore_vector_credential(&store, &provider.credential_id, previous_secret);
+                        return Some(Self::response_error(format!(
+                            "Vector API Key 或默认模型验证失败：{error}"
+                        )));
+                    }
+                };
+                provider.models[0] = verified;
+                Some(self.prompt_vector_model_selection(VectorModelTarget::Add {
+                    provider,
                     previous_secret,
-                });
-                Some(BackendResponse {
-                    lines: vec![self.language().pack().vector_key_saved.to_owned()],
-                    input_prompt: Some(InputPrompt {
-                        request_id: "vector-model".to_owned(),
-                        prompt: self.language().pack().vector_model_prompt.to_owned(),
-                        placeholder: Some("text-embedding-3-small".to_owned()),
-                    }),
-                    ..BackendResponse::default()
-                })
+                }))
             }
             (state, _) => {
                 self.pending_setup = Some(state);
@@ -1685,6 +2334,16 @@ impl AppBackend {
     }
 
     fn clear_vector_provider(&mut self) -> BackendResponse {
+        let credential_ids = self
+            .load_vector_catalog()
+            .map(|catalog| {
+                catalog
+                    .providers
+                    .into_iter()
+                    .map(|provider| provider.credential_id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|_| vec![DEFAULT_VECTOR_CREDENTIAL_ID.to_owned()]);
         if self.vector_config_path.exists() {
             let metadata = match fs::symlink_metadata(&self.vector_config_path) {
                 Ok(metadata) => metadata,
@@ -1698,7 +2357,9 @@ impl AppBackend {
             }
         }
         if let Ok(store) = OsCredentialStore::new("dev.openai.harness") {
-            let _ = store.delete(&CredentialId::new(DEFAULT_VECTOR_CREDENTIAL_ID));
+            for credential_id in credential_ids {
+                let _ = store.delete(&CredentialId::new(credential_id));
+            }
         }
         let _ = self.application.purge_vectors();
         self.vector_health = VectorHealth::Missing;
@@ -2365,6 +3026,31 @@ impl AppBackend {
         let repository = self.application.repository_view()?;
         let mut lines = Self::config_lines(&self.application.config(), Some("vector"), false);
         lines.push(format!("Vector {:?}", memory.semantic));
+        match self.load_vector_catalog() {
+            Ok(catalog) => {
+                lines.push(format!(
+                    "Provider Catalog  {} · active={}",
+                    catalog.providers.len(),
+                    catalog.active_provider.as_deref().unwrap_or("<none>")
+                ));
+                lines.extend(catalog.providers.iter().map(|provider| {
+                    format!(
+                        "  {}{} · {} · {:?} · models={} · active-model={}",
+                        if catalog.active_provider.as_deref() == Some(provider.id.as_str()) {
+                            "* "
+                        } else {
+                            ""
+                        },
+                        provider.id,
+                        provider.display_name,
+                        provider.kind,
+                        provider.models.len(),
+                        provider.active_model.as_deref().unwrap_or("<none>")
+                    )
+                }));
+            }
+            Err(error) => lines.push(format!("Provider Catalog  invalid · {error}")),
+        }
         let (embedding_model, backend, hybrid, reranking) = match &memory.semantic {
             SemanticCapability::Absent { reason } => (
                 format!("<none> ({reason})"),
@@ -5271,6 +5957,105 @@ impl TerminalBackend for AppBackend {
                         Err(error) => Self::response_error(error),
                     },
                     VectorCommand::Setup => self.start_vector_setup(),
+                    VectorCommand::Providers => match self.load_vector_catalog() {
+                        Ok(catalog) => BackendResponse {
+                            lines: if catalog.providers.is_empty() {
+                                vec!["No global Vector Providers · use /vector setup".to_owned()]
+                            } else {
+                                std::iter::once(format!(
+                                    "Vector Providers · {} · active={}",
+                                    catalog.providers.len(),
+                                    catalog.active_provider.as_deref().unwrap_or("<none>")
+                                ))
+                                .chain(catalog.providers.into_iter().map(|provider| {
+                                    format!(
+                                        "{}{} · {} · {:?} · models={} · active-model={}",
+                                        if catalog.active_provider.as_deref()
+                                            == Some(provider.id.as_str())
+                                        {
+                                            "* "
+                                        } else {
+                                            "  "
+                                        },
+                                        provider.id,
+                                        provider.display_name,
+                                        provider.kind,
+                                        provider.models.len(),
+                                        provider.active_model.as_deref().unwrap_or("<none>")
+                                    )
+                                }))
+                                .collect()
+                            },
+                            ..BackendResponse::default()
+                        },
+                        Err(error) => Self::response_error(error),
+                    },
+                    VectorCommand::Provider { provider_id } => {
+                        let catalog = match self.load_vector_catalog() {
+                            Ok(catalog) => catalog,
+                            Err(error) => return Self::response_error(error),
+                        };
+                        if catalog.providers.is_empty() {
+                            return Self::response_error(
+                                "没有 Vector Provider；先使用 /vector setup",
+                            );
+                        }
+                        if let Some(provider_id) = provider_id {
+                            if catalog.provider(&provider_id).is_none() {
+                                return Self::response_error(format!(
+                                    "Vector Provider 不存在：{provider_id}"
+                                ));
+                            }
+                            self.prompt_vector_model_selection(VectorModelTarget::Switch {
+                                provider_id,
+                            })
+                        } else {
+                            let lines = catalog
+                                .providers
+                                .iter()
+                                .map(|provider| {
+                                    format!(
+                                        "{} · {} · {:?} · {} models",
+                                        provider.id,
+                                        provider.display_name,
+                                        provider.kind,
+                                        provider.models.len()
+                                    )
+                                })
+                                .collect();
+                            self.pending_setup = Some(SetupState::VectorProviderSwitch);
+                            BackendResponse {
+                                lines,
+                                input_prompt: Some(InputPrompt {
+                                    request_id: "vector-provider-switch".to_owned(),
+                                    prompt: self
+                                        .language()
+                                        .pack()
+                                        .vector_provider_prompt
+                                        .to_owned(),
+                                    placeholder: Some("输入 Provider ID".to_owned()),
+                                }),
+                                ..BackendResponse::default()
+                            }
+                        }
+                    }
+                    VectorCommand::Model { model_id } => {
+                        let catalog = match self.load_vector_catalog() {
+                            Ok(catalog) => catalog,
+                            Err(error) => return Self::response_error(error),
+                        };
+                        let Some(provider_id) = catalog.active_provider.clone() else {
+                            return Self::response_error(
+                                "尚未选择 Vector Provider；先使用 /vector provider",
+                            );
+                        };
+                        let target = VectorModelTarget::Switch { provider_id };
+                        if let Some(model_id) = model_id {
+                            self.select_vector_model(target, model_id)
+                        } else {
+                            self.prompt_vector_model_selection(target)
+                        }
+                    }
                     VectorCommand::Clear => {
                         let confirmation = "I UNDERSTAND GLOBAL VECTOR CLEAR".to_owned();
                         self.pending_setup = Some(SetupState::VectorClear {
@@ -5458,7 +6243,7 @@ impl TerminalBackend for AppBackend {
     }
 
     fn submit_secret(&mut self, request_id: &str, secret: String) -> BackendResponse {
-        if request_id.starts_with("provider-add-key:") || request_id == "vector-key" {
+        if request_id.starts_with("provider-add-key:") || request_id.starts_with("vector-key:") {
             return self
                 .submit_setup_secret(request_id, secret)
                 .unwrap_or_else(|| Self::response_error("设置向导 secret request 不匹配"));
@@ -6551,41 +7336,62 @@ fn build_backend(
     )?);
     let recovery_time = harness_types::Clock::now_unix_millis(&clock);
     let reconciled_patches = patch_store.reconcile_prepared(recovery_time)?;
-    let (mut vector_file, mut vector_health) = match VectorProviderConfig::load(&vector_config_path)
-    {
-        Ok(Some(config)) => (
-            Some(config),
-            VectorHealth::Unhealthy {
-                reason: "尚未执行本项目启动检查".to_owned(),
-            },
-        ),
-        Ok(None) => (None, VectorHealth::Missing),
-        Err(error) => {
-            eprintln!(
-                "[WARN] Vector config isolated · {} · {error}",
-                vector_config_path.display()
-            );
-            (
-                None,
+    let catalog_was_legacy = fs::read_to_string(&vector_config_path)
+        .ok()
+        .is_some_and(|source| {
+            source
+                .lines()
+                .any(|line| line.trim() == "schema_version = 1")
+        });
+    let (mut vector_catalog, mut vector_health) =
+        match VectorCatalogConfig::load(&vector_config_path) {
+            Ok(catalog) if catalog.providers.is_empty() => (catalog, VectorHealth::Missing),
+            Ok(catalog) => (
+                catalog,
                 VectorHealth::Unhealthy {
-                    reason: error.to_string(),
+                    reason: "尚未执行本项目启动检查".to_owned(),
                 },
-            )
-        }
-    };
+            ),
+            Err(error) => {
+                eprintln!(
+                    "[WARN] Vector catalog isolated · {} · {error}",
+                    vector_config_path.display()
+                );
+                (
+                    VectorCatalogConfig::default(),
+                    VectorHealth::Unhealthy {
+                        reason: error.to_string(),
+                    },
+                )
+            }
+        };
+    if catalog_was_legacy {
+        vector_catalog.save(&vector_config_path)?;
+        eprintln!(
+            "[WARN] 已把全局单 Provider Vector 配置升级为多 Provider Catalog：{}",
+            vector_config_path.display()
+        );
+    }
+    let mut active_vector = vector_catalog.resolved_active()?;
     let embedding_model_raw = compat_env_var("HARNESS_EMBEDDING_MODEL")
         .ok()
         .filter(|value| !value.trim().is_empty());
     let mut verified_global_factory: Option<Arc<HttpEmbeddingFactory>> = None;
     if embedding_model_raw.is_none()
-        && let Some(global_config) = vector_file.as_mut()
+        && let Some((provider_id, global_config)) = active_vector.as_mut()
     {
+        let provider_kind = vector_catalog
+            .provider(provider_id)
+            .map(|provider| provider.kind)
+            .ok_or("Active Vector Provider missing from catalog")?;
         match HttpEmbeddingFactory::new(
             HttpEmbeddingConfig {
-                provider: DEFAULT_VECTOR_PROVIDER.to_owned(),
+                provider: provider_id.clone(),
                 endpoint: global_config.endpoint.clone(),
                 credential_id: Some(global_config.credential_id.clone()),
                 send_dimensions: global_config.sends_dimensions(),
+                dimension_field: vector_dimension_field(provider_kind),
+                request_dialect: vector_request_dialect(provider_kind),
                 allow_remote_project_private: true,
                 timeout_millis: Some(30_000),
             },
@@ -6610,10 +7416,33 @@ fn build_backend(
                         if !global_config.sends_dimensions()
                             && vector.len() != global_config.dimensions
                         {
-                            if let Err(error) = global_config
+                            let update = global_config
                                 .refresh_detected_dimensions(vector.len(), recovery_time)
-                                .and_then(|()| global_config.save(&vector_config_path))
-                            {
+                                .and_then(|()| {
+                                    let provider = vector_catalog
+                                        .provider_mut(provider_id)
+                                        .ok_or_else(|| {
+                                            harness_memory::MemoryError::new(
+                                                "vector-provider-missing",
+                                                provider_id.clone(),
+                                            )
+                                        })?;
+                                    let model = provider
+                                        .model_mut(&global_config.model)
+                                        .ok_or_else(|| {
+                                            harness_memory::MemoryError::new(
+                                                "vector-model-missing",
+                                                global_config.model.clone(),
+                                            )
+                                        })?;
+                                    model.mark_verified(
+                                        vector.len(),
+                                        VectorDimensionMode::AutoDetected,
+                                        recovery_time,
+                                    )?;
+                                    vector_catalog.save(&vector_config_path)
+                                });
+                            if let Err(error) = update {
                                 vector_health = VectorHealth::Unhealthy {
                                     reason: format!("维度更新失败：{error}"),
                                 };
@@ -6646,7 +7475,7 @@ fn build_backend(
             }
         }
     }
-    if vector_file.is_some() {
+    if !vector_catalog.providers.is_empty() {
         eprintln!(
             "[INFO] Global Vector startup health · {}",
             vector_health.summary()
@@ -6655,13 +7484,15 @@ fn build_backend(
     let (embedding_provider, embedding_model, embedding_dimensions) =
         embedding_model_raw.as_deref().map_or_else(
             || {
-                vector_file.as_ref().map_or((None, None, None), |config| {
-                    (
-                        Some(DEFAULT_VECTOR_PROVIDER.to_owned()),
-                        Some(config.model.clone()),
-                        Some(config.dimensions),
-                    )
-                })
+                active_vector
+                    .as_ref()
+                    .map_or((None, None, None), |(provider, config)| {
+                        (
+                            Some(provider.clone()),
+                            Some(config.model.clone()),
+                            Some(config.dimensions),
+                        )
+                    })
             },
             |value| {
                 let (provider, model) = value.split_once('/').map_or_else(
@@ -6715,6 +7546,8 @@ fn build_backend(
                 endpoint,
                 credential_id,
                 send_dimensions: embedding_dimensions.is_some(),
+                dimension_field: EmbeddingDimensionField::Dimensions,
+                request_dialect: EmbeddingRequestDialect::OpenAi,
                 allow_remote_project_private: compat_env_var("HARNESS_EMBEDDING_ALLOW_REMOTE")
                     .ok()
                     .as_deref()
@@ -7799,9 +8632,11 @@ fn doctor(
     let embedding_model_configured = compat_env_var("HARNESS_EMBEDDING_MODEL")
         .ok()
         .is_some_and(|value| !value.trim().is_empty())
-        || global_vector_config
-            .as_ref()
-            .is_some_and(|path| VectorProviderConfig::load(path).ok().flatten().is_some());
+        || global_vector_config.as_ref().is_some_and(|path| {
+            VectorCatalogConfig::load(path)
+                .ok()
+                .is_some_and(|catalog| !catalog.providers.is_empty())
+        });
     let browser_configured = compat_env_var_os("HARNESS_BROWSER_PYTHON").is_some()
         && compat_env_var_os("HARNESS_BROWSER_EXECUTABLE").is_some()
         && compat_env_var("HARNESS_BROWSER_ALLOWED_ORIGINS")
@@ -7910,8 +8745,8 @@ fn doctor(
             "repositoryFusion": "file-hash-bound-symbols-diagnostics-evidence",
             "patchPreview": "rename-codeaction-preview-second-approval-recoverable-set"
         },
-        "stage": 22,
-        "stageTrack": "26-global-vector-health-and-setup-navigation",
+        "stage": 23,
+        "stageTrack": "27-vector-provider-and-model-catalog",
     });
     if json {
         println!("{report}");

@@ -25,9 +25,9 @@ bin/harness --version
 /model
 ```
 
-自定义文本模型提供商使用 `/provider add`，向导完成 URL、Key、自动模型发现与默认模型选择。`/provider switch` 切换提供商，`/model` 只切换当前提供商内的模型。
+自定义文本模型提供商使用 `/provider add`，向导完成厂商命名、URL、Key、自动模型发现与默认模型选择。`/provider switch` 切换提供商，`/model` 只切换当前提供商内的模型。
 
-向量模型使用 `/vector setup` 单独配置：全局只允许一个 Provider，模型名手写且不做目录发现。维度先从不带 `dimensions` 的真实响应自动识别；检测失败才要求手动输入并再次验证。Provider/Key 全局复用，每个项目启动时自动健康检查；Memory 和向量投影仍按项目隔离。`/vector clear` 二次确认后删除全局配置与凭证，并清除当前项目投影。
+向量模型使用 `/vector setup` 单独配置全局 Provider Catalog。Voyage AI 与 Jina AI 为前两个内置选项，只需输入 Key，模型 ID 已预填；Custom 要求厂商名、URL、Key，并支持一次录入多个模型 ID。所选模型必须返回合法数值向量，聊天模型等非向量模型不会保存。维度先从真实响应自动识别，兼容端点要求显式维度时才手动输入并再次验证。使用 `/vector providers` 查看目录，`/vector provider [id]` 先选厂商再选模型，`/vector model [id]` 切换当前厂商模型。Provider/Key 全局复用，每个项目启动时自动健康检查；Memory 和向量投影仍按项目隔离。`/vector clear` 二次确认后删除全部全局向量配置与凭证，并清除当前项目投影。
 
 `/language en|zh-CN|zh-TW|ja` 可切换并持久化英语、简体中文、繁体中文和日语语言包。
 
@@ -90,7 +90,7 @@ kernary models --refresh ollama
 
 `kernary` 每次创建新 Session；`kernary -c` 继续当前项目最近会话，`kernary -r [id-or-title]` 从当前项目选择恢复。会话内使用 `/session`、`/session new`、`/session switch` 和 `/session rename`。标题由第一条有效对话本地生成，完整 Transcript 不随 Context 压缩删除。
 
-项目私有指令位于 `.harness/agent.md`，不存在时才读取全局 `~/.kernary/agent.md`；使用 `/agentmd` 管理。全局向量 Provider 位于 Kernary 用户配置目录的 `vector.toml`，Memory/Repository/Vector SQLite 则全部位于各项目 `.harness/`。旧项目向量配置会在全局配置缺失时自动迁移；Kernary 继续写入 `.git/info/exclude`，项目辅助数据默认不会进入 Git。
+项目私有指令位于 `.harness/agent.md`，不存在时才读取全局 `~/.kernary/agent.md`；使用 `/agentmd` 管理。全局向量 Provider/模型目录位于 Kernary 用户配置目录的 `vector.toml`，Key 按 Provider 分别保存在 OS Credential Store，Memory/Repository/Vector SQLite 则全部位于各项目 `.harness/`。旧项目向量配置会在全局配置缺失时自动迁移，旧版单 Provider 全局配置会升级为 `custom-legacy` 目录项；Kernary 继续写入 `.git/info/exclude`，项目辅助数据默认不会进入 Git。
 
 细粒度规则可从 `examples/kernary.permissions.toml` 开始，也可使用：
 
