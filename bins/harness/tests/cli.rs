@@ -72,7 +72,7 @@ fn published_default_has_no_fake_model_and_refuses_unconfigured_work() {
     let plain = child.wait_with_output().expect("plain output");
     assert!(plain.status.success());
     let stdout = String::from_utf8(plain.stdout).expect("plain stdout");
-    assert!(stdout.contains("Model      未配置"), "stdout={stdout}");
+    assert!(stdout.contains("模型      未配置"), "stdout={stdout}");
     assert!(stdout.contains("MODEL_NOT_CONFIGURED"), "stdout={stdout}");
     assert!(!stdout.contains("fake/deterministic"), "stdout={stdout}");
     assert!(
@@ -121,7 +121,7 @@ fn legacy_persisted_fake_selection_migrates_to_unconfigured_without_data_loss() 
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout");
     assert!(stdout.contains("Goal: preserve-me"), "stdout={stdout}");
-    assert!(stdout.contains("Model    未配置"), "stdout={stdout}");
+    assert!(stdout.contains("模型  未配置"), "stdout={stdout}");
     assert!(!stdout.contains("fake/deterministic"), "stdout={stdout}");
 }
 
@@ -525,7 +525,7 @@ fn kernary_is_primary_harness_is_alias_and_both_share_durable_session() {
         stdout.contains("Goal: shared-brand-session"),
         "stdout={stdout}"
     );
-    assert!(stdout.contains("reasoning high"), "stdout={stdout}");
+    assert!(stdout.contains("推理 high"), "stdout={stdout}");
     assert!(temporary.path().join(".harness/kernel.sqlite").is_file());
     assert!(!temporary.path().join(".kernary").exists());
 }
@@ -1031,10 +1031,10 @@ fn plain_mode_accepts_slash_commands_from_stdin() {
     let output = child.wait_with_output().expect("wait plain harness");
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
-    assert!(stdout.contains("Session  session:default"));
-    assert!(stdout.contains("Model      未配置"));
+    assert!(stdout.contains("会话  session:default"));
+    assert!(stdout.contains("模型      未配置"));
     assert!(
-        stdout.contains("Model    未配置 | reasoning max"),
+        stdout.contains("模型  未配置 | 推理 max"),
         "stdout={stdout}"
     );
     assert!(stdout.contains("Provider: 未配置"));
@@ -1139,11 +1139,11 @@ models = ["model-a", "model-b"]
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout");
     assert!(
-        stdout.contains("Provider switched: custom-local/model-b"),
+        stdout.contains("已切换提供商: custom-local/model-b"),
         "stdout={stdout}"
     );
     assert!(
-        stdout.contains("Model    custom-local/model-a"),
+        stdout.contains("模型  custom-local/model-a"),
         "stdout={stdout}"
     );
 }
@@ -1233,7 +1233,7 @@ fn model_and_reasoning_selection_resume_from_session_events() {
     let output = second.wait_with_output().expect("wait second");
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("stdout");
-    assert!(stdout.contains("reasoning max"), "stdout={stdout}");
+    assert!(stdout.contains("推理 max"), "stdout={stdout}");
 }
 
 #[test]
@@ -1256,7 +1256,7 @@ fn configured_remote_or_local_provider_is_lazy_until_user_text() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("stdout");
     assert!(stdout.contains("ollama/local-model"));
-    assert!(stdout.contains("Model      ollama/local-model"));
+    assert!(stdout.contains("模型      ollama/local-model"));
     assert!(!stdout.contains("http-transport"));
 }
 
@@ -1936,7 +1936,7 @@ fn session_goal_reset_and_forget_control_plane_is_durable_and_recoverable() {
         "stdout={stdout}"
     );
     assert!(stdout.contains("session:child-control"), "stdout={stdout}");
-    assert!(stdout.contains("Goal     <empty>"), "stdout={stdout}");
+    assert!(stdout.contains("目标  <empty>"), "stdout={stdout}");
     assert!(
         stdout.contains("Goal history | 2 revision(s)"),
         "stdout={stdout}"

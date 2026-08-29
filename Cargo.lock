@@ -917,7 +917,7 @@ dependencies = [
 
 [[package]]
 name = "harness-agent"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-kernel",
  "harness-model",
@@ -931,7 +931,7 @@ dependencies = [
 
 [[package]]
 name = "harness-application"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-agent",
  "harness-auth",
@@ -961,7 +961,7 @@ dependencies = [
 
 [[package]]
 name = "harness-auth"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-types",
  "keyring",
@@ -971,7 +971,7 @@ dependencies = [
 
 [[package]]
 name = "harness-browser"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-permission",
  "harness-tool",
@@ -987,7 +987,7 @@ dependencies = [
 
 [[package]]
 name = "harness-builtin-tools"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-permission",
  "harness-tool",
@@ -1001,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "harness-cache"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-types",
  "serde",
@@ -1012,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "harness-cli"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "clap",
  "clap_complete",
@@ -1054,11 +1054,11 @@ dependencies = [
 
 [[package]]
 name = "harness-codex"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "harness-config"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "serde",
  "tempfile",
@@ -1067,7 +1067,7 @@ dependencies = [
 
 [[package]]
 name = "harness-context"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-types",
  "proptest",
@@ -1079,7 +1079,7 @@ dependencies = [
 
 [[package]]
 name = "harness-event"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-types",
  "serde",
@@ -1087,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "harness-http"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-auth",
  "serde_json",
@@ -1096,7 +1096,7 @@ dependencies = [
 
 [[package]]
 name = "harness-kernel"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-testkit",
  "harness-types",
@@ -1107,7 +1107,7 @@ dependencies = [
 
 [[package]]
 name = "harness-lsp"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-builtin-tools",
  "harness-permission",
@@ -1124,7 +1124,7 @@ dependencies = [
 
 [[package]]
 name = "harness-lsp-patch"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-agent",
  "harness-builtin-tools",
@@ -1140,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "harness-mcp"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "getrandom 0.3.4",
  "harness-auth",
@@ -1160,7 +1160,7 @@ dependencies = [
 
 [[package]]
 name = "harness-memory"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-auth",
  "harness-http",
@@ -1174,7 +1174,7 @@ dependencies = [
 
 [[package]]
 name = "harness-model"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-types",
  "serde",
@@ -1183,7 +1183,7 @@ dependencies = [
 
 [[package]]
 name = "harness-permission"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-types",
  "serde",
@@ -1194,7 +1194,7 @@ dependencies = [
 
 [[package]]
 name = "harness-plugin"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-builtin-tools",
  "harness-permission",
@@ -1211,7 +1211,7 @@ dependencies = [
 
 [[package]]
 name = "harness-provider-anthropic"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-auth",
  "harness-http",
@@ -1223,7 +1223,7 @@ dependencies = [
 
 [[package]]
 name = "harness-provider-catalog"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-types",
  "serde",
@@ -1236,7 +1236,7 @@ dependencies = [
 
 [[package]]
 name = "harness-provider-compatible"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-auth",
  "harness-http",
@@ -1247,7 +1247,7 @@ dependencies = [
 
 [[package]]
 name = "harness-provider-openai"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-auth",
  "harness-http",
@@ -1260,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "harness-provider-runtime"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-auth",
  "harness-http",
@@ -1278,7 +1278,7 @@ dependencies = [
 
 [[package]]
 name = "harness-skill"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-permission",
  "harness-tool",
@@ -1292,7 +1292,7 @@ dependencies = [
 
 [[package]]
 name = "harness-storage"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-context",
  "harness-kernel",
@@ -1310,7 +1310,7 @@ dependencies = [
 
 [[package]]
 name = "harness-terminal"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "crossterm",
  "harness-event",
@@ -1324,7 +1324,7 @@ dependencies = [
 
 [[package]]
 name = "harness-testkit"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-types",
  "serde",
@@ -1334,7 +1334,7 @@ dependencies = [
 
 [[package]]
 name = "harness-tool"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "harness-permission",
  "harness-types",
@@ -1345,7 +1345,7 @@ dependencies = [
 
 [[package]]
 name = "harness-types"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "serde",
  "serde_json",

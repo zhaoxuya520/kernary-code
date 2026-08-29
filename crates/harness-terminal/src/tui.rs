@@ -502,11 +502,16 @@ pub fn run_tui<B: TerminalBackend>(
                     Span::raw(format!("   {}", snapshot.project)),
                 ]),
                 Line::from(format!(
-                    "Model {}  ·  Mode {}  ·  Reasoning {}  ·  Context {}%  ·  Agents {}",
+                    "{} {}  ·  {} {}  ·  {} {}  ·  {} {}%  ·  {} {}",
+                    pack.model_label,
                     snapshot.model,
+                    pack.mode_label,
                     snapshot.mode,
+                    pack.reasoning_label,
                     snapshot.reasoning,
+                    pack.context_label,
                     snapshot.context_percent,
+                    pack.agents_label,
                     snapshot.agents
                 )),
             ];
@@ -628,17 +633,22 @@ pub fn run_tui<B: TerminalBackend>(
             );
             let separator = if options.ascii { " | " } else { " │ " };
             let status = format!(
-                "{}{}{}{}ctx {}%{}cache {}{}agents {}{}",
+                "{} {}{}{} {}{}{} {}%{}{} {}{}{} {}{}",
+                pack.model_label,
                 snapshot.model,
                 separator,
+                pack.reasoning_label,
                 snapshot.reasoning,
                 separator,
+                pack.context_label,
                 snapshot.context_percent,
                 separator,
+                pack.cache_label,
                 snapshot
                     .cache_percent
                     .map_or_else(|| "n/a".to_owned(), |value| format!("{value}%")),
                 separator,
+                pack.agents_label,
                 snapshot.agents,
                 snapshot
                     .branch

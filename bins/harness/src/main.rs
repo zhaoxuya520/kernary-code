@@ -518,7 +518,7 @@ impl AppBackend {
             Ok(model) => {
                 self.model_ready = true;
                 BackendResponse {
-                    lines: Self::model_lines(&model),
+                    lines: self.model_lines(&model),
                     ..BackendResponse::default()
                 }
             }
@@ -976,13 +976,17 @@ impl AppBackend {
                 ) {
                     Ok(view) => {
                         self.model_ready = true;
+                        let pack = self.language().pack();
                         BackendResponse {
                             lines: vec![
-                                format!("Provider {} 已验证并保存", definition.id),
-                                format!("Default model {}/{}", definition.id, model),
+                                format!("{}: {}", pack.provider_verified, definition.id),
+                                format!(
+                                    "{}: {}/{}",
+                                    pack.default_model_label, definition.id, model
+                                ),
                             ]
                             .into_iter()
-                            .chain(Self::model_lines(&view))
+                            .chain(self.model_lines(&view))
                             .collect(),
                             clear_view: true,
                             ..BackendResponse::default()
@@ -1027,11 +1031,15 @@ impl AppBackend {
                 {
                     Ok(view) => {
                         self.model_ready = true;
+                        let pack = self.language().pack();
                         BackendResponse {
-                            lines: vec![format!("Provider switched: {provider_id}/{model}")]
-                                .into_iter()
-                                .chain(Self::model_lines(&view))
-                                .collect(),
+                            lines: vec![format!(
+                                "{}: {provider_id}/{model}",
+                                pack.provider_switched
+                            )]
+                            .into_iter()
+                            .chain(self.model_lines(&view))
+                            .collect(),
                             ..BackendResponse::default()
                         }
                     }
@@ -1117,14 +1125,22 @@ impl AppBackend {
                 }
                 BackendResponse {
                     lines: vec![
-                        format!("Vector provider verified · model={}", config.model),
                         format!(
-                            "Dimensions {} · endpoint={}",
-                            config.dimensions, config.endpoint
+                            "{} · {}={}",
+                            self.language().pack().vector_verified,
+                            self.language().pack().model_label,
+                            config.model
                         ),
                         format!(
-                            "Saved {} · 重启后进入 Ready，首次语义检索再惰性激活",
-                            self.vector_config_path.display()
+                            "{} {} · endpoint={}",
+                            self.language().pack().dimensions_label,
+                            config.dimensions,
+                            config.endpoint
+                        ),
+                        format!(
+                            "{} · {}",
+                            self.vector_config_path.display(),
+                            self.language().pack().vector_saved_restart
                         ),
                     ],
                     clear_view: true,
@@ -1186,7 +1202,11 @@ impl AppBackend {
                     models: models.clone(),
                 });
                 Some(BackendResponse {
-                    lines: vec![format!("已获取 {} 个模型；请选择默认模型。", models.len())],
+                    lines: vec![format!(
+                        "{} {}",
+                        models.len(),
+                        self.language().pack().models_fetched
+                    )],
                     input_prompt: Some(InputPrompt {
                         request_id: "provider-default".to_owned(),
                         prompt: self.language().pack().provider_default_prompt.to_owned(),
@@ -1219,9 +1239,7 @@ impl AppBackend {
                     previous_secret,
                 });
                 Some(BackendResponse {
-                    lines: vec![
-                        "Key 已进入 OS Credential Store；不会拉取向量模型目录。".to_owned(),
-                    ],
+                    lines: vec![self.language().pack().vector_key_saved.to_owned()],
                     input_prompt: Some(InputPrompt {
                         request_id: "vector-model".to_owned(),
                         prompt: self.language().pack().vector_model_prompt.to_owned(),
@@ -1560,26 +1578,31 @@ impl AppBackend {
             .collect())
     }
 
-    fn status_lines(status: &StatusView) -> Vec<String> {
+    fn status_lines(&self, status: &StatusView) -> Vec<String> {
+        let pack = self.language().pack();
         let model = if is_hidden_internal_model_name(&status.model) {
-            "未配置".to_owned()
+            pack.model_unconfigured.to_owned()
         } else {
             status.model.clone()
         };
         vec![
             format!(
-                "Session  {} · {:?}",
-                status.session_id, status.session_status
+                "{}  {} · {:?}",
+                pack.session_label, status.session_id, status.session_status
             ),
             format!(
-                "Goal     {}{}",
+                "{}  {}{}",
+                pack.goal_label,
                 status.goal.as_deref().unwrap_or("<empty>"),
                 if status.goal_locked { " [locked]" } else { "" }
             ),
-            format!("Model    {model} · reasoning {}", status.reasoning),
             format!(
-                "Mode     {} · session version {}",
-                status.mode, status.session_version
+                "{}  {model} · {} {}",
+                pack.model_label, pack.reasoning_label, status.reasoning
+            ),
+            format!(
+                "{}  {} · session version {}",
+                pack.mode_label, status.mode, status.session_version
             ),
         ]
     }
@@ -1701,7 +1724,7 @@ impl AppBackend {
     fn settings_show(&self, key: Option<&str>) -> BackendResponse {
         let category = key.unwrap_or("");
         let result: Result<Vec<String>, ApplicationError> = match category {
-            "model" => self.application.model().map(|view| Self::model_lines(&view)),
+            "model" => self.application.model().map(|view| self.model_lines(&view)),
             "reasoning" => self.application.model().map(|view| {
                 vec![format!(
                     "Reasoning requested={:?} effective={} mapping={:?}",
@@ -1989,7 +2012,7 @@ impl AppBackend {
     fn debug_lines(&self) -> Vec<String> {
         let mut lines = vec!["Debug snapshot · read-only".to_owned()];
         match self.application.status() {
-            Ok(status) => lines.extend(Self::status_lines(&status)),
+            Ok(status) => lines.extend(self.status_lines(&status)),
             Err(error) => lines.push(format!("Session unavailable · {error}")),
         }
         if let Ok(context) = self.application.context() {
@@ -2156,7 +2179,7 @@ impl AppBackend {
 
     fn inspect(&self, target: &str) -> BackendResponse {
         let result = match target {
-            "session" => self.application.status().map(|view| Self::status_lines(&view)),
+            "session" => self.application.status().map(|view| self.status_lines(&view)),
             "config" => Ok(Self::config_lines(&self.application.config(), None, true)),
             "context" => self
                 .application
@@ -2533,17 +2556,22 @@ impl AppBackend {
         lines
     }
 
-    fn model_lines(model: &ModelView) -> Vec<String> {
+    fn model_lines(&self, model: &ModelView) -> Vec<String> {
+        let pack = self.language().pack();
         if is_hidden_internal_model(&model.provider_id, &model.model_id) {
             return vec![
-                "Model      未配置".to_owned(),
-                "下一步     /connect 选择 Provider，然后 /model 选择真实模型".to_owned(),
+                format!("{}      {}", pack.model_label, pack.model_unconfigured),
+                pack.onboarding_step_provider.to_owned(),
             ];
         }
         vec![
-            format!("Model      {}/{}", model.provider_id, model.model_id),
             format!(
-                "Reasoning  {:?} → {} ({:?})",
+                "{}      {}/{}",
+                pack.model_label, model.provider_id, model.model_id
+            ),
+            format!(
+                "{}  {:?} → {} ({:?})",
+                pack.reasoning_label,
                 model.reasoning_requested,
                 model
                     .reasoning_effective
@@ -2551,12 +2579,12 @@ impl AppBackend {
                 model.reasoning_mapping
             ),
             format!(
-                "Limits     context={} output={}",
-                model.context_window_tokens, model.max_output_tokens
+                "{}     context={} output={}",
+                pack.limits_label, model.context_window_tokens, model.max_output_tokens
             ),
             format!(
-                "Capability tools={} structured={}",
-                model.tool_calling, model.structured_output
+                "{} tools={} structured={}",
+                pack.capability_label, model.tool_calling, model.structured_output
             ),
         ]
     }
@@ -3609,7 +3637,7 @@ impl TerminalBackend for AppBackend {
                 },
                 SlashCommand::ModelShow => match self.application.model() {
                     Ok(model) => BackendResponse {
-                        lines: Self::model_lines(&model),
+                        lines: self.model_lines(&model),
                         ..BackendResponse::default()
                     },
                     Err(error) => Self::response_error(error),
@@ -3717,14 +3745,14 @@ impl TerminalBackend for AppBackend {
                 },
                 SlashCommand::GoalSet { text } => match self.application.set_goal(&text) {
                     Ok(status) => BackendResponse {
-                        lines: Self::status_lines(&status),
+                        lines: self.status_lines(&status),
                         ..BackendResponse::default()
                     },
                     Err(error) => Self::response_error(error),
                 },
                 SlashCommand::GoalClear => match self.application.clear_goal() {
                     Ok(status) => BackendResponse {
-                        lines: Self::status_lines(&status),
+                        lines: self.status_lines(&status),
                         ..BackendResponse::default()
                     },
                     Err(error) => Self::response_error(error),
@@ -3738,7 +3766,7 @@ impl TerminalBackend for AppBackend {
                 },
                 SlashCommand::GoalLock { locked } => match self.application.set_goal_lock(locked) {
                     Ok(status) => BackendResponse {
-                        lines: Self::status_lines(&status),
+                        lines: self.status_lines(&status),
                         ..BackendResponse::default()
                     },
                     Err(error) => Self::response_error(error),
@@ -4000,7 +4028,7 @@ impl TerminalBackend for AppBackend {
                 }
                 SlashCommand::Reasoning { level } => match self.application.set_reasoning(level) {
                     Ok(model) => BackendResponse {
-                        lines: Self::model_lines(&model),
+                        lines: self.model_lines(&model),
                         ..BackendResponse::default()
                     },
                     Err(error) => Self::response_error(error),
@@ -4196,7 +4224,7 @@ impl TerminalBackend for AppBackend {
                 },
                 SlashCommand::Status | SlashCommand::Session => match self.application.status() {
                     Ok(status) => BackendResponse {
-                        lines: Self::status_lines(&status),
+                        lines: self.status_lines(&status),
                         ..BackendResponse::default()
                     },
                     Err(error) => Self::response_error(error),
