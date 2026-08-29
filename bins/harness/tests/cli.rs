@@ -284,7 +284,7 @@ fn headless_run_persists_isolated_agent_session_lifecycle() {
     let endpoint_count: usize = connection
         .query_row("SELECT COUNT(*) FROM agent_endpoints", [], |row| row.get(0))
         .expect("endpoint count");
-    assert_eq!(endpoint_count, 9);
+    assert_eq!(endpoint_count, 15);
     let result_json: String = connection
         .query_row("SELECT result_json FROM agent_results LIMIT 1", [], |row| {
             row.get(0)
@@ -1994,12 +1994,25 @@ fn agent_control_plane_is_sleeping_inspectable_and_project_local() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout");
-    assert!(stdout.contains("Team 9 | sleeping 9"), "stdout={stdout}");
+    assert!(stdout.contains("Team 15 | sleeping 15"), "stdout={stdout}");
     assert!(
         stdout.contains("messages=true | leases=true"),
         "stdout={stdout}"
     );
     assert!(stdout.contains("agent:coordinator"), "stdout={stdout}");
+    for specialist in [
+        "agent:requirements",
+        "agent:explorer",
+        "agent:architect",
+        "agent:security",
+        "agent:performance",
+        "agent:release",
+    ] {
+        assert!(
+            stdout.contains(specialist),
+            "missing {specialist}: {stdout}"
+        );
+    }
     assert!(
         stdout.contains("control-plane / 禁止编码"),
         "stdout={stdout}"
@@ -2516,6 +2529,77 @@ fn role_workflow_runs_planner_parallel_coders_reviewer_and_tester_with_evidence(
         )
         .expect("budgets");
     assert_eq!(completed_budgets, 5);
+}
+
+#[test]
+fn adaptive_workflow_routes_specialists_and_persists_all_evidence_gates() {
+    let temporary = tempdir().expect("tempdir");
+    let mut child = harness()
+        .current_dir(temporary.path())
+        .args(["--ui", "plain", "--ascii"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"/team adaptive 2 release secure auth service with performance benchmark\n")
+        .expect("adaptive workflow");
+    let output = child.wait_with_output().expect("wait");
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("adaptive-workers=2"), "stdout={stdout}");
+    assert!(stdout.contains("next-wave=true"), "stdout={stdout}");
+    assert!(stdout.contains("11 accepted"), "stdout={stdout}");
+
+    let connection = rusqlite::Connection::open(temporary.path().join(".harness/agents.sqlite"))
+        .expect("agent db");
+    for (role, expected) in [
+        ("requirements-analyst", 1),
+        ("explorer", 1),
+        ("architect", 1),
+        ("planner", 1),
+        ("coder", 2),
+        ("reviewer", 1),
+        ("security-auditor", 1),
+        ("performance-engineer", 1),
+        ("tester", 1),
+        ("release-manager", 1),
+    ] {
+        let actual: usize = connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_sessions WHERE status='completed' AND json_extract(state_json,'$.role')=?1",
+                [role],
+                |row| row.get(0),
+            )
+            .expect("role count");
+        assert_eq!(actual, expected, "role={role}");
+    }
+    for evidence_kind in [
+        "requirements",
+        "exploration",
+        "architecture",
+        "review",
+        "security",
+        "performance",
+        "test",
+        "release",
+    ] {
+        let actual: usize = connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_results WHERE EXISTS (SELECT 1 FROM json_each(agent_results.result_json, '$.evidence') WHERE json_extract(value, '$.kind')=?1)",
+                [evidence_kind],
+                |row| row.get(0),
+            )
+            .expect("evidence count");
+        assert!(actual >= 1, "missing evidence={evidence_kind}");
+    }
 }
 
 #[test]

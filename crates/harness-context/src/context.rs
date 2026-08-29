@@ -251,10 +251,16 @@ impl Error for BudgetError {}
 #[serde(rename_all = "kebab-case")]
 pub enum Role {
     Supervisor,
+    Requirements,
+    Explorer,
+    Architect,
     Planner,
     Staffing,
     Coder,
     Reviewer,
+    Security,
+    Performance,
+    Release,
     Coordinator,
     Tester,
 }
@@ -319,6 +325,41 @@ fn role_allows(role: Role, kind: ContextKind) -> bool {
         return true;
     }
     match role {
+        Role::Requirements => matches!(
+            kind,
+            ContextKind::System
+                | ContextKind::Goal
+                | ContextKind::Task
+                | ContextKind::Conversation
+                | ContextKind::Memory
+                | ContextKind::Pinned
+                | ContextKind::Constraint
+                | ContextKind::Decision
+                | ContextKind::Error
+        ),
+        Role::Explorer => matches!(
+            kind,
+            ContextKind::System
+                | ContextKind::Goal
+                | ContextKind::Task
+                | ContextKind::Repository
+                | ContextKind::Pinned
+                | ContextKind::Constraint
+                | ContextKind::Decision
+                | ContextKind::Error
+        ),
+        Role::Architect => matches!(
+            kind,
+            ContextKind::System
+                | ContextKind::Goal
+                | ContextKind::Task
+                | ContextKind::Repository
+                | ContextKind::Memory
+                | ContextKind::Pinned
+                | ContextKind::Constraint
+                | ContextKind::Decision
+                | ContextKind::Error
+        ),
         Role::Planner => matches!(
             kind,
             ContextKind::System
@@ -343,6 +384,10 @@ fn role_allows(role: Role, kind: ContextKind) -> bool {
         ),
         Role::Coder => !matches!(kind, ContextKind::Agent),
         Role::Reviewer | Role::Tester => !matches!(
+            kind,
+            ContextKind::Conversation | ContextKind::Agent | ContextKind::Temporary
+        ),
+        Role::Security | Role::Performance | Role::Release => !matches!(
             kind,
             ContextKind::Conversation | ContextKind::Agent | ContextKind::Temporary
         ),

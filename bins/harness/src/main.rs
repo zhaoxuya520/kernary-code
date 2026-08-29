@@ -300,7 +300,9 @@ fn slash_requires_ready_model(command: &SlashCommand) -> bool {
             | SlashCommand::Review { .. }
             | SlashCommand::Resume
             | SlashCommand::Team {
-                operation: TeamCommand::Create { .. } | TeamCommand::Workflow { .. }
+                operation: TeamCommand::Create { .. }
+                    | TeamCommand::Workflow { .. }
+                    | TeamCommand::Adaptive { .. }
             }
     )
 }
@@ -3075,6 +3077,30 @@ impl TerminalBackend for AppBackend {
                                 Ok(prepared) => self.launch_background_team(
                                     prepared,
                                     format!("workflow-workers={workers}"),
+                                ),
+                                Err(error) => Self::response_error(error),
+                            }
+                        }
+                    }
+                    TeamCommand::Adaptive { workers, objective } => {
+                        let objective = objective.or_else(|| {
+                            self.application.status().ok().and_then(|status| status.goal)
+                        });
+                        let Some(objective) = objective else {
+                            return Self::response_error(
+                                "Adaptive objective 为空；请提供 objective 或先设置 /goal",
+                            );
+                        };
+                        if self.background_team.is_some() {
+                            Self::response_error("已有 Agent Team 正在运行")
+                        } else {
+                            match self
+                                .application
+                                .prepare_adaptive_agent_team(&objective, workers)
+                            {
+                                Ok(prepared) => self.launch_background_team(
+                                    prepared,
+                                    format!("adaptive-workers={workers}"),
                                 ),
                                 Err(error) => Self::response_error(error),
                             }

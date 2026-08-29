@@ -78,6 +78,25 @@ kernary --model openai/gpt-5.6-sol exec --json "运行测试并总结结果"
 
 未配置可用模型时，普通输入与 Headless/Exec 会明确返回 `MODEL_NOT_CONFIGURED`，不会创建 Agent Mission 或模拟 Usage。
 
+## 内置 Agent 与 Adaptive 工作流
+
+Kernary 内置 15 个按职责、上下文、工具权限和证据责任划分的 Agent；空闲时全部 Sleeping。除原有 Staffing Router、Coordinator、Planner、Coder、Reviewer、Tester、Debugger、Researcher、Merge Agent 外，还包含：
+
+- Requirements Analyst：范围、非目标、歧义和确定性验收标准；
+- Explorer：隔离主会话的只读代码库入口、符号、依赖和数据流探索；
+- Architect：边界、契约、失败模式、迁移兼容和 ADR；
+- Security Auditor：独立威胁模型、漏洞和供应链证据门；
+- Performance Engineer：基线、负载、瓶颈与回归阈值证据门；
+- Release Manager：版本、产物、校验和与回滚就绪证据门。
+
+高保障任务使用能力路由工作流：
+
+```text
+/team adaptive 2 <objective>
+```
+
+Requirements 与 Explorer 首波并行，Architect 和 Planner 依赖其压缩结果；Coder 完成后 Reviewer 与命中的 Security/Performance 审计并行，Tester 汇总全部证据，发布类任务最后再经过 Release Manager。Security、Performance 和 Release 由目标关键词确定性激活，不会为无关任务凑数。Staffing Router 只读取结构化 capability/capacity/cost 元数据，不把完整 Agent 说明注入主会话。
+
 ## 终端输入
 
 - `←` / `→`：按 Unicode 字符移动光标；`Ctrl+←` / `Ctrl+→`：按单词移动；
@@ -93,7 +112,7 @@ kernary --model openai/gpt-5.6-sol exec --json "运行测试并总结结果"
 - OpenAI Responses / OpenAI Chat / Anthropic Messages 协议与自定义中转站；
 - OpenCode Go、DeepSeek、OpenRouter、Ollama 等 Provider Catalog；
 - Lite / Balanced / Full / Custom 真实资源模式；
-- Supervisor、Planner、Coder、Reviewer、Tester、Coordinator 等多 Agent DAG；
+- 15 个最小权限内置 Agent、能力路由 Adaptive DAG 与独立 Evidence Gate；
 - Context Broker、结构化压缩、Checkpoint、Rollback 与 Prompt Canonicalization；
 - MCP stdio/HTTP/SSE/OAuth、Plugin、Skill、Browser、LSP 3.18；
 - Permission Rule、Sandbox hard deny、Tool Journal、Patch Preview 与安全 Undo；

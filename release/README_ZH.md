@@ -37,6 +37,16 @@ bin/harness --version
 
 `doctor`、`--help`、completion 和 man 生成不会创建项目 `.harness` 状态。
 
+## Adaptive Agent Team
+
+`/agents compact|verbose|tree` 可查看 15 个内置 Agent；它们默认 Sleeping。高保障任务可运行：
+
+```text
+/team adaptive 2 release secure auth service with performance benchmark
+```
+
+固定骨架为 Requirements + Explorer → Architect → Planner → Coder workers → Reviewer → Tester；目标命中安全、性能、发布类别时，分别增加 Security Auditor、Performance Engineer、Release Manager 证据门。所有 Agent 使用独立工作 Context、最小 Tool 视图和有界预算，Staffing Router 只读取结构化能力元数据。
+
 ## 模型目录
 
 普通模型列表只读取内置快照与已有缓存，不访问网络：

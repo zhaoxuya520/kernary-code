@@ -401,9 +401,9 @@ pub(crate) fn command_description(
             "実行中のスーパーバイザーへ指示を送ります",
         ),
         "/team" => (
-            "Inspect or start a multi-agent team",
-            "檢視或啟動多 Agent 團隊",
-            "マルチエージェントチームを確認・開始します",
+            "Inspect or start research, compact, or capability-routed adaptive evidence teams",
+            "檢視或啟動研究、精簡或能力路由 Adaptive Evidence 團隊",
+            "研究・簡潔・能力ルーティング型 Adaptive Evidence チームを確認・開始します",
         ),
         "/test" => (
             "Run the configured test executable",

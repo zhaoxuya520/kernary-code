@@ -19,7 +19,7 @@ use harness_agent::{
     AgentToolCall, AgentWorkingContext, BoundedAgentExecutor, BudgetEscrowStatus, Coordinator,
     Evidence, FileLease, FileLeaseManager, ModelAgentHandler, PlanningBudget, RunCancellationTree,
     SharedSteeringBuffer, StaffingAssignment, StaffingRouter, StaffingTask, SteeringAgentHandler,
-    validate_acceptance,
+    validate_required_evidence,
 };
 use harness_auth::{CredentialId, CredentialStore, OPENAI_API_KEY_CREDENTIAL_ID};
 use harness_browser::{
@@ -310,6 +310,82 @@ pub struct AgentQueueItemView {
 pub struct AgentQueueView {
     pub mission_id: Option<MissionId>,
     pub items: Vec<AgentQueueItemView>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AdaptiveTeamProfile {
+    security: bool,
+    performance: bool,
+    release: bool,
+}
+
+impl AdaptiveTeamProfile {
+    fn classify(objective: &str) -> Self {
+        let objective = objective.to_lowercase();
+        let contains_any =
+            |keywords: &[&str]| keywords.iter().any(|keyword| objective.contains(keyword));
+        Self {
+            security: contains_any(&[
+                "security",
+                "secure",
+                "auth",
+                "permission",
+                "secret",
+                "credential",
+                "crypto",
+                "injection",
+                "supply chain",
+                "安全",
+                "鉴权",
+                "认证",
+                "授权",
+                "权限",
+                "密钥",
+                "注入",
+                "供应链",
+            ]),
+            performance: contains_any(&[
+                "performance",
+                "latency",
+                "throughput",
+                "benchmark",
+                "profil",
+                "memory leak",
+                "optimize",
+                "slow",
+                "性能",
+                "延迟",
+                "吞吐",
+                "基准",
+                "内存泄漏",
+                "优化",
+                "卡顿",
+            ]),
+            release: contains_any(&[
+                "release",
+                "publish",
+                "deploy",
+                "package",
+                "shipping",
+                "version bump",
+                "发布",
+                "上线",
+                "部署",
+                "打包",
+                "发版",
+                "版本",
+            ]),
+        }
+    }
+}
+
+struct AdaptiveNodeBlueprint {
+    id: TaskId,
+    title: String,
+    kind: NodeKind,
+    depends_on: Vec<TaskId>,
+    required_capability: &'static str,
+    preferred_role: AgentRole,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -3796,7 +3872,198 @@ where
         })
     }
 
-    /// 创建 Planner → Coder workers → Reviewer → Tester 的完整 Evidence DAG。
+    /// 创建 Requirements + Explorer → Architect → Planner → Coder workers →
+    /// 独立审查门 → Tester → 可选 Release 的能力路由 Evidence DAG。
+    pub fn prepare_adaptive_agent_team(
+        &mut self,
+        prompt: &str,
+        worker_count: usize,
+    ) -> Result<PreparedAgentTeam, ApplicationError> {
+        if !(1..=4).contains(&worker_count) {
+            return Err(ApplicationError::new(
+                "adaptive-workflow-worker-count-invalid",
+                "Adaptive workflow 当前支持 1..=4 个 Coder worker",
+            ));
+        }
+        if self.model_runtime.is_none() {
+            return Err(ApplicationError::new(
+                "model-runtime-missing",
+                "Adaptive workflow 需要 Model Runtime",
+            ));
+        }
+        let profile = AdaptiveTeamProfile::classify(prompt);
+        let requirements_id = TaskId::from("task:requirements");
+        let explorer_id = TaskId::from("task:explorer");
+        let architect_id = TaskId::from("task:architect");
+        let planner_id = TaskId::from("task:planner");
+        let worker_ids = (0..worker_count)
+            .map(|index| TaskId::from(format!("task:coder:{index:02}")))
+            .collect::<Vec<_>>();
+        let reviewer_id = TaskId::from("task:reviewer");
+        let security_id = TaskId::from("task:security");
+        let performance_id = TaskId::from("task:performance");
+        let tester_id = TaskId::from("task:tester");
+        let release_id = TaskId::from("task:release");
+
+        let mut blueprints = vec![
+            AdaptiveNodeBlueprint {
+                id: requirements_id.clone(),
+                title: format!("澄清范围、非目标与可验证验收标准：{prompt}"),
+                kind: NodeKind::Task,
+                depends_on: vec![],
+                required_capability: "requirements-analysis",
+                preferred_role: AgentRole::RequirementsAnalyst,
+            },
+            AdaptiveNodeBlueprint {
+                id: explorer_id.clone(),
+                title: format!("只读定位入口、依赖、符号与数据流：{prompt}"),
+                kind: NodeKind::Task,
+                depends_on: vec![],
+                required_capability: "codebase-exploration",
+                preferred_role: AgentRole::Explorer,
+            },
+            AdaptiveNodeBlueprint {
+                id: architect_id.clone(),
+                title: format!("定义边界、契约、失败模式与架构决策：{prompt}"),
+                kind: NodeKind::Task,
+                depends_on: vec![requirements_id.clone(), explorer_id.clone()],
+                required_capability: "system-design",
+                preferred_role: AgentRole::Architect,
+            },
+            AdaptiveNodeBlueprint {
+                id: planner_id.clone(),
+                title: format!("把需求与架构转成可并行 Evidence DAG：{prompt}"),
+                kind: NodeKind::Task,
+                depends_on: vec![architect_id.clone()],
+                required_capability: "task-decomposition",
+                preferred_role: AgentRole::Planner,
+            },
+        ];
+        blueprints.extend(worker_ids.iter().enumerate().map(|(index, task_id)| {
+            AdaptiveNodeBlueprint {
+                id: task_id.clone(),
+                title: format!("实现受控编码分片 {}：{prompt}", index + 1),
+                kind: NodeKind::Task,
+                depends_on: vec![planner_id.clone()],
+                required_capability: "code-edit",
+                preferred_role: AgentRole::Coder,
+            }
+        }));
+        blueprints.push(AdaptiveNodeBlueprint {
+            id: reviewer_id.clone(),
+            title: format!("独立审查正确性、契约与回归风险：{prompt}"),
+            kind: NodeKind::Review,
+            depends_on: worker_ids.clone(),
+            required_capability: "code-review",
+            preferred_role: AgentRole::Reviewer,
+        });
+        let mut verification_dependencies = vec![reviewer_id.clone()];
+        if profile.security {
+            blueprints.push(AdaptiveNodeBlueprint {
+                id: security_id.clone(),
+                title: format!("独立安全审计与威胁模型：{prompt}"),
+                kind: NodeKind::Review,
+                depends_on: worker_ids.clone(),
+                required_capability: "security-audit",
+                preferred_role: AgentRole::SecurityAuditor,
+            });
+            verification_dependencies.push(security_id);
+        }
+        if profile.performance {
+            blueprints.push(AdaptiveNodeBlueprint {
+                id: performance_id.clone(),
+                title: format!("测量基线、瓶颈与性能回归阈值：{prompt}"),
+                kind: NodeKind::Review,
+                depends_on: worker_ids.clone(),
+                required_capability: "performance-analysis",
+                preferred_role: AgentRole::PerformanceEngineer,
+            });
+            verification_dependencies.push(performance_id);
+        }
+        blueprints.push(AdaptiveNodeBlueprint {
+            id: tester_id.clone(),
+            title: format!("按验收标准验证所有实现与独立审查结论：{prompt}"),
+            kind: NodeKind::Task,
+            depends_on: verification_dependencies,
+            required_capability: "test-execution",
+            preferred_role: AgentRole::Tester,
+        });
+        if profile.release {
+            blueprints.push(AdaptiveNodeBlueprint {
+                id: release_id,
+                title: format!("验证版本、产物、校验和与回滚方案：{prompt}"),
+                kind: NodeKind::Review,
+                depends_on: vec![tester_id],
+                required_capability: "release-readiness",
+                preferred_role: AgentRole::ReleaseManager,
+            });
+        }
+
+        let catalog = self.agent_catalog.as_ref().ok_or_else(|| {
+            ApplicationError::new("agent-catalog-missing", "Agent Catalog 尚未注入")
+        })?;
+        let staffing_tasks = blueprints
+            .iter()
+            .map(|node| StaffingTask {
+                task_id: node.id.clone(),
+                required_capabilities: [node.required_capability.to_owned()].into_iter().collect(),
+                preferred_roles: [node.preferred_role].into_iter().collect(),
+                forbidden_agents: BTreeSet::new(),
+            })
+            .collect::<Vec<_>>();
+        let assignments = StaffingRouter::assign(&staffing_tasks, catalog).map_err(agent_error)?;
+        let assignments = assignments
+            .into_iter()
+            .map(|assignment| (assignment.task_id, assignment.agent_id))
+            .collect::<BTreeMap<_, _>>();
+        let nodes = blueprints
+            .into_iter()
+            .map(|node| {
+                let agent_definition_id = assignments.get(&node.id).cloned().ok_or_else(|| {
+                    ApplicationError::new(
+                        "adaptive-staffing-assignment-missing",
+                        node.id.to_string(),
+                    )
+                })?;
+                Ok(WorkflowNodeDefinition {
+                    id: node.id,
+                    title: node.title,
+                    kind: node.kind,
+                    depends_on: node.depends_on,
+                    agent_definition_id,
+                    requires_approval: None,
+                })
+            })
+            .collect::<Result<Vec<_>, ApplicationError>>()?;
+
+        if self.status()?.goal.is_none() {
+            self.set_goal(prompt)?;
+        }
+        self.replace_context_source(
+            "task:active",
+            Some(self.new_context_item(
+                ContextKind::Task,
+                Priority::Critical,
+                "task:active",
+                prompt,
+                true,
+            )),
+        )?;
+        let mission_id = MissionId::from(self.ids.next_id("mission"));
+        self.active_mission_id = Some(mission_id.clone());
+        self.apply_mission_command(
+            &mission_id,
+            MissionCommand::CreateMission {
+                mission_id: mission_id.clone(),
+                project_id: self.project_id.clone(),
+                goal: prompt.to_owned(),
+            },
+        )?;
+        self.apply_mission_command(&mission_id, MissionCommand::InstallPlan { nodes })?;
+        self.prepare_next_agent_wave(&mission_id)
+    }
+
+    /// 创建 Planner → Coder workers → Reviewer → Tester 的精简 Evidence DAG。
     pub fn prepare_role_evidence_team(
         &mut self,
         prompt: &str,
@@ -4062,7 +4329,7 @@ where
                 .get(&run_id)
                 .map(|run| run.endpoint_id.clone())
                 .ok_or_else(|| ApplicationError::new("agent-run-missing", run_id.to_string()))?;
-            let model_tools = self.agent_model_tools(role, &node.title)?;
+            let model_tools = self.agent_model_tools(&agent_id, role, &node.title)?;
             let request = AgentExecutionRequest {
                 session_id: agent_session_id(&run_id),
                 contract: AgentTaskContract {
@@ -4074,12 +4341,8 @@ where
                     agent_definition_id: agent_id,
                     role,
                     objective: format!("{}\n当前节点：{}", mission.goal, node.title),
-                    acceptance_criteria: match role {
-                        AgentRole::Reviewer => vec!["提供 review evidence".to_owned()],
-                        AgentRole::Tester => vec!["提供 test evidence".to_owned()],
-                        _ => vec!["返回非空可验证结果".to_owned()],
-                    },
-                    max_turns: if role == AgentRole::Planner { 2 } else { 4 },
+                    acceptance_criteria: role_acceptance_criteria(role),
+                    max_turns: role_max_turns(role),
                     deadline_millis: now.saturating_add(120_000),
                     planning_budget: (role == AgentRole::Planner)
                         .then(PlanningBudget::bounded_default),
@@ -4226,6 +4489,7 @@ where
                 self.mission_scope(&mission_id),
                 EventPriority::Normal,
             )?;
+            let model_tools = self.agent_model_tools(&agent_id, role, &node.title)?;
             let request = AgentExecutionRequest {
                 session_id: session.id,
                 contract: AgentTaskContract {
@@ -4237,15 +4501,15 @@ where
                     agent_definition_id: agent_id,
                     role,
                     objective: format!("{}\n恢复任务 {}：{}", prompt, session.task_id, node.title),
-                    acceptance_criteria: vec!["返回非空结论".to_owned()],
-                    max_turns: if role == AgentRole::Planner { 2 } else { 4 },
+                    acceptance_criteria: role_acceptance_criteria(role),
+                    max_turns: role_max_turns(role),
                     deadline_millis: now.saturating_add(120_000),
                     planning_budget: (role == AgentRole::Planner)
                         .then(PlanningBudget::bounded_default),
                 },
                 context,
                 steering_messages: steering_messages.clone(),
-                model_tools: self.agent_model_tools(role, &node.title)?,
+                model_tools,
                 model_continuation: None,
             };
             dispatches.push(AgentDispatch {
@@ -4514,32 +4778,28 @@ where
                     .and_then(|catalog| catalog.definition(&outcome.agent_definition_id))
                     .and_then(|definition| definition.roles.iter().next().copied())
                     .unwrap_or(AgentRole::Coder);
-                match role {
-                    AgentRole::Reviewer => result.evidence.push(Evidence {
-                        kind: "review".to_owned(),
+                if let Some(kind) = role_evidence_kind(role) {
+                    result.evidence.push(Evidence {
+                        kind: kind.to_owned(),
                         reference: outcome.run_id.to_string(),
                         summary: result.summary.clone(),
-                    }),
-                    AgentRole::Tester => result.evidence.push(Evidence {
-                        kind: "test".to_owned(),
-                        reference: outcome.run_id.to_string(),
-                        summary: result.summary.clone(),
-                    }),
-                    _ => {}
+                    });
                 }
-                if matches!(role, AgentRole::Reviewer | AgentRole::Tester)
-                    && let Some(repository) = self.repository.as_ref()
+                if matches!(
+                    role,
+                    AgentRole::Reviewer
+                        | AgentRole::SecurityAuditor
+                        | AgentRole::PerformanceEngineer
+                        | AgentRole::Tester
+                        | AgentRole::ReleaseManager
+                ) && let Some(repository) = self.repository.as_ref()
                 {
                     result
                         .evidence
                         .extend(lsp_run_evidence(repository, outcome.run_id.as_str())?);
                 }
-                validate_acceptance(
-                    &result,
-                    role == AgentRole::Tester,
-                    role == AgentRole::Reviewer,
-                )
-                .map_err(agent_error)?;
+                let required_evidence = role_evidence_kind(role).into_iter().collect::<Vec<_>>();
+                validate_required_evidence(&result, &required_evidence).map_err(agent_error)?;
                 self.charge_agent_budget(
                     Some(&outcome.run_id),
                     result
@@ -5306,24 +5566,79 @@ where
 
     fn agent_model_tools(
         &self,
+        agent_id: &AgentDefinitionId,
         role: AgentRole,
         query: &str,
     ) -> Result<Vec<ToolDefinition>, ApplicationError> {
-        if !matches!(role, AgentRole::Coder | AgentRole::MergeAgent) {
+        let allowed_tools = self
+            .agent_catalog
+            .as_ref()
+            .and_then(|catalog| catalog.definition(agent_id))
+            .map(|definition| &definition.allowed_tools)
+            .ok_or_else(|| ApplicationError::new("agent-not-found", agent_id.to_string()))?;
+        if allowed_tools.is_empty() {
             return Ok(Vec::new());
         }
         let Some(runtime) = self.tool_runtime.as_ref() else {
             return Ok(Vec::new());
         };
+        let role_terms = match role {
+            AgentRole::Explorer => "files read search symbols references",
+            AgentRole::RequirementsAnalyst => "files read search requirements",
+            AgentRole::Architect => "files read search architecture dependencies",
+            AgentRole::Reviewer => "files read diff diagnostics",
+            AgentRole::SecurityAuditor => "files read search diff security secrets dependencies",
+            AgentRole::PerformanceEngineer => "files read process benchmark profile performance",
+            AgentRole::Tester => "files read process test diagnostics",
+            AgentRole::ReleaseManager => "files read process git diff package version checksum",
+            AgentRole::Debugger => "files read process diagnostics reproduce",
+            AgentRole::Researcher => "files read search browser documentation",
+            _ => "code file read write test",
+        };
         runtime
             .model_tools(
-                &format!("{query} code file read write test"),
+                &format!("{query} {role_terms}"),
                 self.mode_profile().max_on_demand_tools,
             )
             .map_err(tool_error)
             .map(|tools| {
                 tools
                     .into_iter()
+                    .filter(|tool| {
+                        let name = tool.canonical_name.as_str();
+                        if name == "process.run" {
+                            return allowed_tools.contains("process.run");
+                        }
+                        if name.contains("write")
+                            || name.contains("apply")
+                            || name.contains("patch")
+                        {
+                            return allowed_tools.contains("file.write");
+                        }
+                        if name.contains("diff") {
+                            return allowed_tools.contains("diff.read")
+                                || allowed_tools.contains("repository.read");
+                        }
+                        if name.contains("browser")
+                            || name.contains("network")
+                            || name.contains("http")
+                        {
+                            return allowed_tools.contains("network.read");
+                        }
+                        if name.contains("lsp") {
+                            return allowed_tools.contains("lsp.read")
+                                || allowed_tools.contains("repository.read");
+                        }
+                        let repository_read = name.contains("read")
+                            || name.contains("search")
+                            || name.contains("status")
+                            || name.contains("symbol")
+                            || name.contains("definition")
+                            || name.contains("reference")
+                            || name.contains("diagnostic")
+                            || name.contains("snapshot");
+                        repository_read && allowed_tools.contains("repository.read")
+                    })
                     .map(|tool| ToolDefinition {
                         name: tool.canonical_name,
                         description: tool.description,
@@ -7187,13 +7502,68 @@ fn append_parallel_tool_result(
 
 const fn context_role(role: AgentRole) -> Role {
     match role {
+        AgentRole::RequirementsAnalyst => Role::Requirements,
+        AgentRole::Explorer => Role::Explorer,
+        AgentRole::Architect => Role::Architect,
         AgentRole::Planner | AgentRole::Researcher => Role::Planner,
         AgentRole::StaffingRouter => Role::Staffing,
         AgentRole::Coder | AgentRole::Debugger | AgentRole::MergeAgent => Role::Coder,
         AgentRole::Reviewer => Role::Reviewer,
+        AgentRole::SecurityAuditor => Role::Security,
+        AgentRole::PerformanceEngineer => Role::Performance,
         AgentRole::Tester => Role::Tester,
+        AgentRole::ReleaseManager => Role::Release,
         AgentRole::Coordinator => Role::Coordinator,
         AgentRole::Supervisor => Role::Supervisor,
+    }
+}
+
+const fn role_evidence_kind(role: AgentRole) -> Option<&'static str> {
+    match role {
+        AgentRole::RequirementsAnalyst => Some("requirements"),
+        AgentRole::Explorer => Some("exploration"),
+        AgentRole::Architect => Some("architecture"),
+        AgentRole::Reviewer => Some("review"),
+        AgentRole::SecurityAuditor => Some("security"),
+        AgentRole::PerformanceEngineer => Some("performance"),
+        AgentRole::Tester => Some("test"),
+        AgentRole::ReleaseManager => Some("release"),
+        _ => None,
+    }
+}
+
+fn role_acceptance_criteria(role: AgentRole) -> Vec<String> {
+    let criterion = match role {
+        AgentRole::RequirementsAnalyst => "提供范围、非目标、歧义和可确定验证的验收标准",
+        AgentRole::Explorer => "提供带文件/符号引用的入口、依赖和数据流地图",
+        AgentRole::Architect => "提供边界、契约、失败模式、权衡和 ADR",
+        AgentRole::Planner => "提供无环依赖、文件所有权、验收证据和回滚点",
+        AgentRole::Coder => "提交最小实现并报告真实工具/验证结果",
+        AgentRole::Reviewer => "提供带证据位置、影响和复现条件的 review evidence",
+        AgentRole::SecurityAuditor => {
+            "提供严重度、证据位置、攻击前提和修复验收条件的 security evidence"
+        }
+        AgentRole::PerformanceEngineer => {
+            "提供基线、负载、指标、瓶颈和回归阈值的 performance evidence"
+        }
+        AgentRole::Tester => "提供命令、环境、实际结果和覆盖映射的 test evidence",
+        AgentRole::ReleaseManager => "提供版本、测试、产物、校验和与回滚核对的 release evidence",
+        AgentRole::Debugger => "提供稳定复现、互斥假设、最小实验和根因链",
+        AgentRole::Researcher => "提供带来源和版本日期的事实/推断分离结论",
+        AgentRole::MergeAgent => "提供不丢失契约和会议决定的冲突解决结果",
+        AgentRole::Coordinator => "提供冲突、会议记录和可追踪决定",
+        AgentRole::StaffingRouter => "提供结构化能力、容量和成本分配理由",
+        AgentRole::Supervisor => "提供目标、预算、权限、依赖和证据门状态",
+    };
+    vec![criterion.to_owned()]
+}
+
+const fn role_max_turns(role: AgentRole) -> u8 {
+    match role {
+        AgentRole::RequirementsAnalyst | AgentRole::Explorer | AgentRole::Planner => 2,
+        AgentRole::Architect | AgentRole::Reviewer | AgentRole::SecurityAuditor => 3,
+        AgentRole::PerformanceEngineer | AgentRole::Tester | AgentRole::ReleaseManager => 4,
+        _ => 4,
     }
 }
 
@@ -7768,8 +8138,8 @@ mod tests {
         let mut application =
             application.with_agent_catalog(builtin_agent_catalog().expect("catalog"));
         let team = application.agents().expect("team");
-        assert_eq!(team.total, 9);
-        assert_eq!(team.sleeping, 9);
+        assert_eq!(team.total, 15);
+        assert_eq!(team.sleeping, 15);
         assert_eq!(team.running, 0);
         assert!(
             application
@@ -7782,6 +8152,117 @@ mod tests {
         let queue = application.agent_queue().expect("queue");
         assert!(queue.mission_id.is_some());
         assert_eq!(queue.items.len(), 1);
+    }
+
+    #[test]
+    fn adaptive_team_routes_elite_specialists_and_builds_conditional_evidence_gates() {
+        let temporary = tempdir().expect("tempdir");
+        let agent_path = temporary.path().join("adaptive-agents.sqlite");
+        let (application, _subscription) =
+            application(&temporary.path().join("adaptive-kernel.sqlite"));
+        let mut application = application
+            .with_model_runtime(fake_model_runtime())
+            .with_agent_catalog(builtin_agent_catalog().expect("catalog"))
+            .with_agent_control_plane(
+                AgentMessageBus::open(&agent_path).expect("messages"),
+                FileLeaseManager::open(
+                    temporary.path(),
+                    temporary.path().join("adaptive-leases.sqlite"),
+                )
+                .expect("leases"),
+                AgentStateStore::open(&agent_path).expect("state"),
+                AgentBudgetManager::open(&agent_path).expect("budgets"),
+            );
+        application.boot().expect("boot");
+        let prepared = application
+            .prepare_adaptive_agent_team(
+                "release secure auth service with performance benchmark",
+                2,
+            )
+            .expect("adaptive team");
+        assert_eq!(prepared.job.dispatches.len(), 2);
+        let first_wave = prepared
+            .job
+            .dispatches
+            .iter()
+            .map(|dispatch| dispatch.request.contract.agent_definition_id.to_string())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            first_wave,
+            ["agent:explorer".to_owned(), "agent:requirements".to_owned()]
+                .into_iter()
+                .collect()
+        );
+        let mission = application
+            .recover_mission(prepared.continuation.mission_id())
+            .expect("mission");
+        assert_eq!(mission.nodes.len(), 11);
+        for (task, agent) in [
+            ("task:requirements", "agent:requirements"),
+            ("task:explorer", "agent:explorer"),
+            ("task:architect", "agent:architect"),
+            ("task:security", "agent:security"),
+            ("task:performance", "agent:performance"),
+            ("task:release", "agent:release"),
+        ] {
+            assert_eq!(
+                mission.nodes[&TaskId::from(task)].agent_definition_id,
+                AgentDefinitionId::from(agent)
+            );
+        }
+        let tester = &mission.nodes[&TaskId::from("task:tester")];
+        assert!(tester.depends_on.contains(&TaskId::from("task:reviewer")));
+        assert!(tester.depends_on.contains(&TaskId::from("task:security")));
+        assert!(
+            tester
+                .depends_on
+                .contains(&TaskId::from("task:performance"))
+        );
+        assert_eq!(
+            mission.nodes[&TaskId::from("task:release")].depends_on,
+            vec![TaskId::from("task:tester")]
+        );
+
+        let lean = AdaptiveTeamProfile::classify("fix a typo in one message");
+        assert_eq!(lean, AdaptiveTeamProfile::default());
+    }
+
+    #[test]
+    fn specialist_tool_views_enforce_read_execute_and_write_boundaries() {
+        let temporary = tempdir().expect("tempdir");
+        let guard = WorkspacePathGuard::new(temporary.path()).expect("guard");
+        let mut tools = ToolRegistry::new();
+        register_file_tools(&mut tools, guard.clone(), 1024).expect("file tools");
+        let tool_runtime = Arc::new(ToolRuntime::new(
+            tools,
+            PermissionEngine::new(
+                workspace_write_profile(guard.root().to_path_buf()),
+                ApprovalPolicy::NeverWithinSandbox,
+            ),
+            Arc::new(MemoryToolJournal::new()),
+            Arc::new(WorkspaceSandbox::new(guard)),
+        ));
+        let (application, _) = application(&temporary.path().join("tool-boundaries.sqlite"));
+        let application = application
+            .with_tool_runtime(tool_runtime)
+            .with_agent_catalog(builtin_agent_catalog().expect("catalog"));
+        let security = application
+            .agent_model_tools(
+                &AgentDefinitionId::from("agent:security"),
+                AgentRole::SecurityAuditor,
+                "audit files",
+            )
+            .expect("security tools");
+        assert!(security.iter().any(|tool| tool.name == "files.read"));
+        assert!(security.iter().all(|tool| tool.name != "files.write"));
+        let coder = application
+            .agent_model_tools(
+                &AgentDefinitionId::from("agent:coder"),
+                AgentRole::Coder,
+                "edit files",
+            )
+            .expect("coder tools");
+        assert!(coder.iter().any(|tool| tool.name == "files.write"));
     }
 
     #[test]
@@ -7833,6 +8314,23 @@ mod tests {
         assert!(coder.dynamic_context.contains("无关的主会话私有历史"));
         assert!(!coder.dynamic_context.contains("完整能力正文"));
         assert!(!coder.fingerprint.is_empty());
+
+        let explorer = application
+            .agent_working_context(AgentRole::Explorer)
+            .expect("explorer context");
+        assert!(explorer.dynamic_context.contains("只审查 auth.rs"));
+        assert!(!explorer.dynamic_context.contains("无关的主会话私有历史"));
+        assert!(!explorer.dynamic_context.contains("完整能力正文"));
+
+        let requirements = application
+            .agent_working_context(AgentRole::RequirementsAnalyst)
+            .expect("requirements context");
+        assert!(
+            requirements
+                .dynamic_context
+                .contains("无关的主会话私有历史")
+        );
+        assert!(!requirements.dynamic_context.contains("完整能力正文"));
     }
 
     #[test]

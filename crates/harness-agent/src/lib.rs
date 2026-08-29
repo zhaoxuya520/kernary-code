@@ -54,10 +54,16 @@ impl Error for AgentError {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AgentRole {
+    RequirementsAnalyst,
+    Explorer,
+    Architect,
     Planner,
     Coder,
     Reviewer,
+    SecurityAuditor,
+    PerformanceEngineer,
     Tester,
+    ReleaseManager,
     Debugger,
     Researcher,
     MergeAgent,
@@ -213,6 +219,48 @@ pub fn builtin_agent_catalog() -> Result<AgentCatalog, AgentError> {
             2,
         ),
         builtin_definition(
+            "agent:requirements",
+            "需求分析师",
+            AgentRole::RequirementsAnalyst,
+            &[
+                "requirements-analysis",
+                "acceptance-criteria",
+                "ambiguity-detection",
+                "scope-control",
+            ],
+            &["memory.read", "repository.read"],
+            2,
+            2,
+        ),
+        builtin_definition(
+            "agent:explorer",
+            "代码库探索员",
+            AgentRole::Explorer,
+            &[
+                "codebase-exploration",
+                "dependency-tracing",
+                "repository-map",
+                "symbol-discovery",
+            ],
+            &["repository.read", "lsp.read"],
+            8,
+            1,
+        ),
+        builtin_definition(
+            "agent:architect",
+            "架构师",
+            AgentRole::Architect,
+            &[
+                "system-design",
+                "boundary-analysis",
+                "architecture-decision",
+                "risk-analysis",
+            ],
+            &["repository.read", "memory.read", "memory.write"],
+            2,
+            4,
+        ),
+        builtin_definition(
             "agent:planner",
             "规划员",
             AgentRole::Planner,
@@ -240,12 +288,54 @@ pub fn builtin_agent_catalog() -> Result<AgentCatalog, AgentError> {
             3,
         ),
         builtin_definition(
+            "agent:security",
+            "安全审计员",
+            AgentRole::SecurityAuditor,
+            &[
+                "security-audit",
+                "threat-model",
+                "vulnerability-analysis",
+                "supply-chain-review",
+            ],
+            &["repository.read", "diff.read", "network.read"],
+            2,
+            4,
+        ),
+        builtin_definition(
+            "agent:performance",
+            "性能工程师",
+            AgentRole::PerformanceEngineer,
+            &[
+                "performance-analysis",
+                "benchmark",
+                "profiling",
+                "regression-analysis",
+            ],
+            &["repository.read", "process.run"],
+            2,
+            4,
+        ),
+        builtin_definition(
             "agent:tester",
             "测试员",
             AgentRole::Tester,
             &["test-execution", "evidence"],
             &["repository.read", "process.run"],
             2,
+            3,
+        ),
+        builtin_definition(
+            "agent:release",
+            "发布经理",
+            AgentRole::ReleaseManager,
+            &[
+                "release-readiness",
+                "artifact-verification",
+                "version-policy",
+                "rollback-planning",
+            ],
+            &["repository.read", "diff.read", "process.run"],
+            1,
             3,
         ),
         builtin_definition(
@@ -1007,17 +1097,37 @@ pub fn validate_acceptance(
     requires_test: bool,
     requires_review: bool,
 ) -> Result<(), AgentError> {
+    let mut required = Vec::new();
+    if requires_test {
+        required.push("test");
+    }
+    if requires_review {
+        required.push("review");
+    }
+    validate_required_evidence(result, &required)
+}
+
+pub fn validate_required_evidence(
+    result: &AgentResult,
+    required_evidence: &[&str],
+) -> Result<(), AgentError> {
     if result.status != "completed" || result.summary.trim().is_empty() {
         return Err(AgentError::new("agent-result-incomplete", "status/summary"));
     }
     if !(0.0..=1.0).contains(&result.confidence) || !result.confidence.is_finite() {
         return Err(AgentError::new("agent-result-confidence", "range"));
     }
-    if requires_test && !result.evidence.iter().any(|e| e.kind == "test") {
-        return Err(AgentError::new("test-evidence-required", "test"));
-    }
-    if requires_review && !result.evidence.iter().any(|e| e.kind == "review") {
-        return Err(AgentError::new("review-evidence-required", "review"));
+    for required in required_evidence {
+        if !result
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind == *required)
+        {
+            return Err(AgentError::new(
+                "agent-evidence-required",
+                (*required).to_owned(),
+            ));
+        }
     }
     if result.evidence.iter().any(|evidence| {
         evidence.kind.trim().is_empty()
@@ -1029,7 +1139,7 @@ pub fn validate_acceptance(
             "kind/reference/summary",
         ));
     }
-    if (requires_test || requires_review) && result.metrics.turns == 0 {
+    if !required_evidence.is_empty() && result.metrics.turns == 0 {
         return Err(AgentError::new("agent-evidence-metrics-missing", "turns=0"));
     }
     Ok(())

@@ -471,6 +471,10 @@ pub enum TeamCommand {
         workers: usize,
         objective: Option<String>,
     },
+    Adaptive {
+        workers: usize,
+        objective: Option<String>,
+    },
 }
 
 /// 普通文本或 Slash Command。
@@ -812,8 +816,8 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/team",
-        synopsis: "/team [create <2..8>|workflow <1..4> [objective]]",
-        description: "显示团队状态，或启动并行研究/完整角色 Evidence DAG",
+        synopsis: "/team [create <2..8>|workflow|adaptive <1..4> [objective]]",
+        description: "显示团队状态，或启动研究、精简工作流与能力路由 Adaptive Evidence DAG",
     },
     CommandSpec {
         name: "/skills",
@@ -1962,10 +1966,10 @@ fn parse_team(value: &str) -> Result<TeamCommand, CommandParseError> {
     }
     let mut parts = value.splitn(3, char::is_whitespace);
     let operation = parts.next();
-    if !matches!(operation, Some("create" | "workflow")) {
+    if !matches!(operation, Some("create" | "workflow" | "adaptive")) {
         return Err(CommandParseError {
             code: "invalid-team-command",
-            message: "用法：/team [create <2..8>|workflow <1..4> [objective]]".to_owned(),
+            message: "用法：/team [create <2..8>|workflow|adaptive <1..4> [objective]]".to_owned(),
         });
     }
     let count = parts
@@ -1973,12 +1977,12 @@ fn parse_team(value: &str) -> Result<TeamCommand, CommandParseError> {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|count| match operation {
             Some("create") => (2..=8).contains(count),
-            Some("workflow") => (1..=4).contains(count),
+            Some("workflow" | "adaptive") => (1..=4).contains(count),
             _ => false,
         })
         .ok_or_else(|| CommandParseError {
             code: "invalid-team-size",
-            message: "create size 必须是 2..8；workflow workers 必须是 1..4".to_owned(),
+            message: "create size 必须是 2..8；workflow/adaptive workers 必须是 1..4".to_owned(),
         })?;
     let objective = parts
         .next()
@@ -1986,6 +1990,10 @@ fn parse_team(value: &str) -> Result<TeamCommand, CommandParseError> {
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
     Ok(match operation {
+        Some("adaptive") => TeamCommand::Adaptive {
+            workers: count,
+            objective,
+        },
         Some("workflow") => TeamCommand::Workflow {
             workers: count,
             objective,
@@ -2268,6 +2276,17 @@ mod tests {
                 operation: TeamCommand::Workflow {
                     workers: 2,
                     objective: Some("implement auth".to_owned())
+                }
+            })
+        );
+        assert_eq!(
+            registry
+                .parse("/team adaptive 3 release auth service")
+                .expect("adaptive workflow"),
+            ParsedInput::Command(SlashCommand::Team {
+                operation: TeamCommand::Adaptive {
+                    workers: 3,
+                    objective: Some("release auth service".to_owned())
                 }
             })
         );

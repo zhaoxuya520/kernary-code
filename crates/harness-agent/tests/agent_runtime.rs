@@ -29,6 +29,73 @@ fn agent(id: &str, role: AgentRole, capability: &str, cost: u32) -> AgentDefinit
 }
 
 #[test]
+fn builtin_catalog_has_fifteen_nonduplicative_roles_and_routes_specialists() {
+    let catalog = builtin_agent_catalog().expect("builtin catalog");
+    let definitions = catalog.list();
+    assert_eq!(definitions.len(), 15);
+    let ids = definitions
+        .iter()
+        .map(|definition| definition.id.to_string())
+        .collect::<BTreeSet<_>>();
+    for expected in [
+        "agent:requirements",
+        "agent:explorer",
+        "agent:architect",
+        "agent:security",
+        "agent:performance",
+        "agent:release",
+    ] {
+        assert!(ids.contains(expected), "missing {expected}");
+    }
+    for definition in &definitions {
+        let control_plane = definition.roles.contains(&AgentRole::Coordinator)
+            || definition.roles.contains(&AgentRole::StaffingRouter);
+        assert!(!control_plane || !definition.roles.contains(&AgentRole::Coder));
+        if definition.roles.iter().any(|role| {
+            matches!(
+                role,
+                AgentRole::RequirementsAnalyst
+                    | AgentRole::Explorer
+                    | AgentRole::Architect
+                    | AgentRole::Reviewer
+                    | AgentRole::SecurityAuditor
+                    | AgentRole::PerformanceEngineer
+                    | AgentRole::ReleaseManager
+            )
+        }) {
+            assert!(!definition.allowed_tools.contains("file.write"));
+        }
+    }
+
+    let tasks = [
+        ("requirements-analysis", AgentRole::RequirementsAnalyst),
+        ("codebase-exploration", AgentRole::Explorer),
+        ("system-design", AgentRole::Architect),
+        ("security-audit", AgentRole::SecurityAuditor),
+        ("performance-analysis", AgentRole::PerformanceEngineer),
+        ("release-readiness", AgentRole::ReleaseManager),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (capability, role))| StaffingTask {
+        task_id: TaskId::from(format!("task:specialist:{index}")),
+        required_capabilities: [capability.to_owned()].into_iter().collect(),
+        preferred_roles: [role].into_iter().collect(),
+        forbidden_agents: BTreeSet::new(),
+    })
+    .collect::<Vec<_>>();
+    let assignments = StaffingRouter::assign(&tasks, &catalog).expect("specialist routing");
+    assert_eq!(assignments.len(), tasks.len());
+    for (assignment, task) in assignments.iter().zip(tasks) {
+        let expected = task.preferred_roles.iter().next().expect("role");
+        let actual = catalog
+            .definition(&assignment.agent_id)
+            .expect("assigned definition");
+        assert!(actual.roles.contains(expected));
+    }
+}
+
+#[test]
 fn staffing_is_deterministic_for_two_four_and_eight_tasks_without_kernel_catalog_pollution() {
     let mut catalog = AgentCatalog::default();
     catalog
@@ -404,6 +471,14 @@ fn coordinator_records_meeting_and_acceptance_requires_review_and_test_evidence(
         summary: "passed".to_owned(),
     });
     validate_acceptance(&result, true, true).expect("accepted");
+    assert!(validate_required_evidence(&result, &["security"]).is_err());
+    result.evidence.push(Evidence {
+        kind: "security".to_owned(),
+        reference: "security:1".to_owned(),
+        summary: "threat model passed".to_owned(),
+    });
+    validate_required_evidence(&result, &["review", "test", "security"])
+        .expect("all specialist evidence accepted");
 }
 
 #[test]
@@ -866,12 +941,12 @@ fn model_agent_handler_executes_isolated_request_through_real_model_runtime() {
         total_tokens: 5,
         ..ModelUsage::default()
     };
+    let provider = Arc::new(FakeModelProvider::standard(vec![FakeScenario::text(
+        &["review ", "complete"],
+        usage,
+    )]));
     let mut registry = ModelRegistry::new();
-    registry
-        .register(Arc::new(FakeModelProvider::standard(vec![
-            FakeScenario::text(&["review ", "complete"], usage),
-        ])))
-        .expect("provider");
+    registry.register(provider.clone()).expect("provider");
     let runtime = Arc::new(
         ModelRuntime::new(
             registry,
@@ -927,6 +1002,10 @@ fn model_agent_handler_executes_isolated_request_through_real_model_runtime() {
     assert_eq!(result.metrics.input_tokens, 3);
     assert_eq!(result.metrics.cached_input_tokens, 1);
     assert_eq!(result.metrics.output_tokens, 2);
+    let requests = provider.requests().expect("requests");
+    assert!(requests[0].instructions.contains("<role-contract>"));
+    assert!(requests[0].instructions.contains("独立代码审查员"));
+    assert!(requests[0].instructions.contains("review only"));
 }
 
 #[test]
