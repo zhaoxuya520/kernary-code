@@ -1,4 +1,5 @@
 use std::io::{self, Stdout};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -8,30 +9,211 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use harness_event::EventSubscription;
-use ratatui::Terminal;
+use harness_event::{EventEnvelope, EventSubscription, HarnessEvent};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border::{self, Set as BorderSet};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
+};
+use ratatui::{Frame, Terminal};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    CommandRegistry, InputSuggestion, PlainRenderer, RenderStyle, UiLanguage, compact_mark,
+    ActivityIcon, CommandRegistry, InputSuggestion, LanguagePack, PRODUCT_SHORT_NAME,
+    PlainRenderer, RenderStyle, TAGLINE, UiLanguage, compact_mark,
 };
 
 const ASCII_BORDER: BorderSet = BorderSet {
-    top_left: "+",
-    top_right: "+",
-    bottom_left: "+",
-    bottom_right: "+",
-    vertical_left: "|",
-    vertical_right: "|",
+    top_left: " ",
+    top_right: " ",
+    bottom_left: " ",
+    bottom_right: " ",
+    vertical_left: " ",
+    vertical_right: " ",
     horizontal_top: "-",
     horizontal_bottom: "-",
 };
+
+#[derive(Clone, Copy, Debug)]
+struct ProductTheme {
+    accent: Style,
+    secondary: Style,
+    success: Style,
+    warning: Style,
+    danger: Style,
+    muted: Style,
+    border: Style,
+}
+
+impl ProductTheme {
+    fn new(color: bool) -> Self {
+        if color {
+            Self {
+                accent: Style::default().fg(Color::Cyan),
+                secondary: Style::default().fg(Color::Blue),
+                success: Style::default().fg(Color::Green),
+                warning: Style::default().fg(Color::Yellow),
+                danger: Style::default().fg(Color::Red),
+                muted: Style::default().fg(Color::DarkGray),
+                border: Style::default().fg(Color::DarkGray),
+            }
+        } else {
+            let default = Style::default();
+            Self {
+                accent: default,
+                secondary: default,
+                success: default,
+                warning: default,
+                danger: default,
+                muted: default.add_modifier(Modifier::DIM),
+                border: default.add_modifier(Modifier::DIM),
+            }
+        }
+    }
+}
+
+fn middle_truncate(value: &str, max_characters: usize) -> String {
+    let characters = value.chars().collect::<Vec<_>>();
+    if characters.len() <= max_characters {
+        return value.to_owned();
+    }
+    if max_characters <= 3 {
+        return characters.into_iter().take(max_characters).collect();
+    }
+    let left = (max_characters - 1) / 2;
+    let right = max_characters - left - 1;
+    characters[..left]
+        .iter()
+        .copied()
+        .chain(std::iter::once('…'))
+        .chain(characters[characters.len() - right..].iter().copied())
+        .collect()
+}
+
+fn project_label(project: &str) -> String {
+    Path::new(project)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(project)
+        .to_owned()
+}
+
+fn progress_bar(percent: u8, width: usize, ascii: bool) -> String {
+    let percent = usize::from(percent.min(100));
+    let filled = (percent * width).div_ceil(100);
+    let (on, off) = if ascii { ('#', '-') } else { ('━', '─') };
+    std::iter::repeat_n(on, filled.min(width))
+        .chain(std::iter::repeat_n(off, width.saturating_sub(filled)))
+        .collect()
+}
+
+fn spinner_frame(elapsed: Duration, ascii: bool) -> &'static str {
+    let frame = usize::try_from(elapsed.as_millis() / 120).unwrap_or(0) % 4;
+    if ascii {
+        ["-", "\\", "|", "/"][frame]
+    } else {
+        ["◒", "◐", "◓", "◑"][frame]
+    }
+}
+
+fn activity_lines(
+    history: &[String],
+    theme: ProductTheme,
+    pack: &LanguagePack,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::with_capacity(history.len());
+    for entry in history {
+        if let Some(text) = entry.strip_prefix("You: ") {
+            if !lines.is_empty() {
+                lines.push(Line::default());
+            }
+            lines.push(Line::from(vec![
+                Span::styled(
+                    pack.you_label.to_owned(),
+                    theme.accent.add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::raw(text.to_owned()),
+            ]));
+            continue;
+        }
+        if let Some(text) = entry.strip_prefix("Kernary: ") {
+            lines.push(Line::from(vec![
+                Span::styled("KERNARY", theme.accent.add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::raw(text.to_owned()),
+            ]));
+            continue;
+        }
+        let style = if entry.starts_with("[DONE]") || entry.starts_with('✓') {
+            theme.success
+        } else if entry.starts_with("[FAIL]") || entry.starts_with('✕') || entry.starts_with("! ")
+        {
+            theme.danger
+        } else if entry.starts_with("[WARN]") {
+            theme.warning
+        } else if entry.starts_with("[THINK]")
+            || entry.starts_with('◇')
+            || entry.starts_with("[RUN]")
+            || entry.starts_with('◆')
+        {
+            theme.secondary
+        } else if entry.starts_with("Context ")
+            || entry.starts_with("Usage ")
+            || entry.starts_with("Model ")
+        {
+            theme.muted
+        } else {
+            Style::default()
+        };
+        lines.push(Line::styled(format!("  {entry}"), style));
+    }
+    lines
+}
+
+fn onboarding_lines(pack: &LanguagePack, theme: ProductTheme, ascii: bool) -> Vec<Line<'static>> {
+    vec![
+        Line::default(),
+        Line::from(Span::styled(
+            compact_mark(ascii).to_owned(),
+            theme.accent.add_modifier(Modifier::BOLD),
+        )),
+        Line::styled(TAGLINE.to_owned(), theme.muted),
+        Line::default(),
+        Line::from(Span::styled(
+            pack.onboarding_title.to_owned(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::default(),
+        Line::from(vec![
+            Span::styled("/provider add", theme.accent.add_modifier(Modifier::BOLD)),
+            Span::styled("   ", theme.muted),
+            Span::raw(pack.add_provider_action.to_owned()),
+        ]),
+        Line::from(vec![
+            Span::styled("/connect", theme.accent.add_modifier(Modifier::BOLD)),
+            Span::styled("        ", theme.muted),
+            Span::raw(pack.connect_provider_action.to_owned()),
+        ]),
+        Line::from(vec![
+            Span::styled("/", theme.accent.add_modifier(Modifier::BOLD)),
+            Span::styled("               ", theme.muted),
+            Span::raw(pack.browse_commands_action.to_owned()),
+        ]),
+    ]
+}
+
+fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
+    let width = usize::from(width.max(1));
+    lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(width))
+        .sum()
+}
 
 /// TUI 顶部/状态栏需要的只读快照。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -312,6 +494,12 @@ fn reset_edit_navigation(
 }
 
 fn push_activity(history: &mut Vec<String>, line: String) {
+    if line.contains('\r') || line.contains('\n') {
+        for part in line.replace("\r\n", "\n").replace('\r', "\n").lines() {
+            push_activity(history, part.to_owned());
+        }
+        return;
+    }
     if history.last() == Some(&line) {
         return;
     }
@@ -329,6 +517,68 @@ fn push_activity(history: &mut Vec<String>, line: String) {
         return;
     }
     history.push(line);
+}
+
+fn event_is_transcript_worthy(event: &HarnessEvent) -> bool {
+    matches!(
+        event,
+        HarnessEvent::GoalChanged { .. }
+            | HarnessEvent::AgentStatus { .. }
+            | HarnessEvent::ReasoningSummary { .. }
+            | HarnessEvent::TextOutput { .. }
+            | HarnessEvent::ToolStatus { .. }
+            | HarnessEvent::BrowserStatus { .. }
+            | HarnessEvent::McpStatus { .. }
+            | HarnessEvent::PluginStatus { .. }
+            | HarnessEvent::SkillStatus { .. }
+            | HarnessEvent::PermissionRequested { .. }
+            | HarnessEvent::Error { .. }
+    )
+}
+
+fn render_transcript_event(
+    envelope: &EventEnvelope,
+    renderer: PlainRenderer,
+    ascii: bool,
+) -> String {
+    let icon = |kind: ActivityIcon| kind.render(ascii);
+    let rendered = match &envelope.event {
+        HarnessEvent::AgentStatus {
+            role,
+            status,
+            detail,
+            ..
+        } => {
+            let kind = if status.contains("fail") || status.contains("block") {
+                ActivityIcon::Failed
+            } else if status.contains("complete") || status.contains("sleep") {
+                ActivityIcon::Done
+            } else {
+                ActivityIcon::Running
+            };
+            format!("{} {role} · {detail}", icon(kind))
+        }
+        HarnessEvent::ReasoningSummary { summary, .. } => {
+            format!("{} {summary}", icon(ActivityIcon::Thinking))
+        }
+        HarnessEvent::TextOutput { text } => format!("{PRODUCT_SHORT_NAME}: {text}"),
+        HarnessEvent::ToolStatus {
+            tool,
+            status,
+            summary,
+        } => {
+            let kind = if status.contains("fail") {
+                ActivityIcon::Failed
+            } else if status.contains("complete") || status.contains("success") {
+                ActivityIcon::Done
+            } else {
+                ActivityIcon::Tool
+            };
+            format!("{} {tool} · {summary}", icon(kind))
+        }
+        _ => renderer.render_event(envelope),
+    };
+    renderer.sanitize(&rendered)
 }
 
 /// Ctrl+C 的纯状态机结果。
@@ -380,6 +630,351 @@ pub struct TuiOptions {
     pub color: bool,
 }
 
+struct TuiView<'a> {
+    snapshot: &'a TerminalSnapshot,
+    pack: &'a LanguagePack,
+    history: &'a [String],
+    input: &'a LineEditor,
+    secret_prompt: Option<&'a SecretPrompt>,
+    secret_input: &'a LineEditor,
+    input_prompt: Option<&'a InputPrompt>,
+    suggestions: &'a [InputSuggestion],
+    suggestion_cursor: usize,
+    transcript_scroll: usize,
+    show_onboarding: bool,
+    elapsed: Duration,
+    options: TuiOptions,
+}
+
+fn render_product_tui(frame: &mut Frame<'_>, view: TuiView<'_>) -> usize {
+    let area = frame.area();
+    let theme = ProductTheme::new(view.options.color);
+    let border_set = if view.options.ascii {
+        ASCII_BORDER
+    } else {
+        border::ROUNDED
+    };
+    let status_height = u16::from(view.snapshot.statusbar_visible && area.height >= 9);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(3),
+            Constraint::Length(status_height),
+        ])
+        .split(area);
+
+    let project = middle_truncate(&project_label(&view.snapshot.project), 32);
+    let mut identity = vec![
+        Span::styled(
+            compact_mark(view.options.ascii).to_owned(),
+            theme.accent.add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(project, Style::default().add_modifier(Modifier::BOLD)),
+    ];
+    if let Some(branch) = &view.snapshot.branch {
+        identity.extend([
+            Span::styled("  /  ", theme.muted),
+            Span::styled(middle_truncate(branch, 24), theme.muted),
+        ]);
+    }
+
+    let is_working = view.snapshot.agents > 0;
+    let status_mark = if is_working {
+        spinner_frame(view.elapsed, view.options.ascii)
+    } else if view.options.ascii {
+        "*"
+    } else {
+        "●"
+    };
+    let status_style = if is_working {
+        theme.accent
+    } else {
+        theme.success
+    };
+    let model_width = if area.width >= 110 {
+        48
+    } else if area.width >= 78 {
+        34
+    } else {
+        22
+    };
+    let mut runtime = vec![
+        Span::styled(format!("{status_mark} "), status_style),
+        Span::styled(
+            if is_working {
+                view.pack.working_label
+            } else {
+                view.pack.ready_label
+            },
+            status_style.add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ·  ", theme.muted),
+        Span::styled(format!("{} ", view.pack.model_label), theme.muted),
+        Span::raw(middle_truncate(&view.snapshot.model, model_width)),
+    ];
+    if area.width >= 78 {
+        runtime.extend([
+            Span::styled("  ·  ", theme.muted),
+            Span::styled(format!("{} ", view.pack.mode_label), theme.muted),
+            Span::raw(view.snapshot.mode.clone()),
+        ]);
+    }
+    if area.width >= 108 {
+        runtime.extend([
+            Span::styled("  ·  ", theme.muted),
+            Span::styled(format!("{} ", view.pack.reasoning_label), theme.muted),
+            Span::raw(view.snapshot.reasoning.clone()),
+        ]);
+    }
+    let bar_width = if area.width >= 90 { 10 } else { 6 };
+    runtime.extend([
+        Span::styled("  ·  ", theme.muted),
+        Span::styled(format!("{} ", view.pack.context_label), theme.muted),
+        Span::styled(
+            progress_bar(view.snapshot.context_percent, bar_width, view.options.ascii),
+            if view.snapshot.context_percent >= 85 {
+                theme.warning
+            } else {
+                theme.accent
+            },
+        ),
+        Span::styled(
+            format!(" {:>3}%", view.snapshot.context_percent),
+            theme.muted,
+        ),
+    ]);
+    if is_working && area.width >= 72 {
+        runtime.extend([
+            Span::styled("  ·  ", theme.muted),
+            Span::styled(
+                format!("{} {}", view.pack.agents_label, view.snapshot.agents),
+                theme.secondary,
+            ),
+        ]);
+    }
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(identity), Line::from(runtime)]).block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_set(border_set)
+                .border_style(theme.border)
+                .padding(Padding::horizontal(1)),
+        ),
+        chunks[0],
+    );
+
+    let transcript_lines = if view.show_onboarding && !view.snapshot.model_configured {
+        onboarding_lines(view.pack, theme, view.options.ascii)
+    } else {
+        activity_lines(view.history, theme, view.pack)
+    };
+    let transcript_padding: u16 = if area.width >= 72 { 3 } else { 1 };
+    let text_width = chunks[1]
+        .width
+        .saturating_sub(transcript_padding.saturating_mul(2));
+    let total_height = wrapped_line_count(&transcript_lines, text_width);
+    let transcript = Paragraph::new(Text::from(transcript_lines))
+        .wrap(Wrap { trim: false })
+        .block(Block::default().padding(Padding::new(
+            transcript_padding,
+            transcript_padding,
+            1,
+            0,
+        )));
+    let visible_height = usize::from(chunks[1].height.saturating_sub(1));
+    let max_scroll = total_height.saturating_sub(visible_height);
+    let transcript_scroll = view.transcript_scroll.min(max_scroll);
+    let top = max_scroll.saturating_sub(transcript_scroll);
+    frame.render_widget(
+        transcript.scroll((u16::try_from(top).unwrap_or(u16::MAX), 0)),
+        chunks[1],
+    );
+    if transcript_scroll > 0 && chunks[1].width >= 24 {
+        let indicator = format!("↑ {transcript_scroll} · {}", view.pack.scroll_hint);
+        let indicator_area = Rect::new(
+            chunks[1].x,
+            chunks[1].y,
+            chunks[1].width.saturating_sub(1),
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(indicator)
+                .alignment(Alignment::Right)
+                .style(theme.muted),
+            indicator_area,
+        );
+    }
+
+    let prefix = if view.options.ascii { "> " } else { "❯ " };
+    let prefix_width = UnicodeWidthStr::width(prefix);
+    let available_width =
+        usize::from(chunks[2].width.saturating_sub(2)).saturating_sub(prefix_width);
+    let (visible_input, cursor_column, input_title, placeholder, composer_style) =
+        view.secret_prompt.map_or_else(
+            || {
+                let (visible, cursor) = view.input.visible_window(available_width, false);
+                if let Some(prompt) = view.input_prompt {
+                    (
+                        visible,
+                        cursor,
+                        format!("{} · {}", view.pack.setup, prompt.prompt),
+                        prompt.placeholder.clone(),
+                        theme.secondary,
+                    )
+                } else {
+                    (
+                        visible,
+                        cursor,
+                        view.pack.input.to_owned(),
+                        Some(view.pack.composer_placeholder.to_owned()),
+                        theme.accent,
+                    )
+                }
+            },
+            |prompt| {
+                let (visible, cursor) = view.secret_input.visible_window(available_width, true);
+                (
+                    visible,
+                    cursor,
+                    format!("{} · {}", view.pack.secure_label, prompt.prompt),
+                    None,
+                    theme.warning,
+                )
+            },
+        );
+    let title_width = usize::from(chunks[2].width.saturating_sub(8));
+    let input_is_empty = visible_input.is_empty();
+    let mut composer_spans = vec![Span::styled(
+        prefix,
+        composer_style.add_modifier(Modifier::BOLD),
+    )];
+    if input_is_empty {
+        if let Some(placeholder) = placeholder {
+            composer_spans.push(Span::styled(
+                middle_truncate(&placeholder, available_width),
+                theme.muted,
+            ));
+        }
+    } else {
+        composer_spans.push(Span::raw(visible_input));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(composer_spans))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_set(border_set)
+                    .border_style(composer_style)
+                    .title(Line::from(Span::styled(
+                        middle_truncate(&input_title, title_width),
+                        composer_style.add_modifier(Modifier::BOLD),
+                    ))),
+            )
+            .wrap(Wrap { trim: false }),
+        chunks[2],
+    );
+
+    if status_height > 0 {
+        let separator = if view.options.ascii { " | " } else { "  ·  " };
+        let mut footer = view.pack.send_hint.to_owned();
+        if area.width >= 92 {
+            footer.push_str(separator);
+            footer.push_str(view.pack.scroll_hint);
+            if let Some(cache) = view.snapshot.cache_percent {
+                footer.push_str(separator);
+                footer.push_str(view.pack.cache_label);
+                footer.push(' ');
+                footer.push_str(&format!("{cache}%"));
+            }
+        }
+        frame.render_widget(
+            Paragraph::new(footer)
+                .style(theme.muted)
+                .block(Block::default().padding(Padding::horizontal(1))),
+            chunks[3],
+        );
+    }
+
+    let suggestion_capacity = view
+        .suggestions
+        .len()
+        .min(if area.height >= 22 { 8 } else { 5 });
+    if suggestion_capacity > 0 {
+        let popup_height = u16::try_from(suggestion_capacity + 2).unwrap_or(10);
+        let margin = u16::from(area.width >= 44) * 2;
+        let popup_y = chunks[2].y.saturating_sub(popup_height).max(chunks[1].y);
+        let popup = Rect::new(
+            area.x.saturating_add(margin),
+            popup_y,
+            area.width.saturating_sub(margin.saturating_mul(2)),
+            popup_height.min(chunks[2].y.saturating_sub(chunks[1].y)),
+        );
+        if popup.height >= 3 {
+            let (window_start, window_end) = suggestion_window(
+                view.suggestions.len(),
+                view.suggestion_cursor,
+                usize::from(popup.height.saturating_sub(2)),
+            );
+            let items = view.suggestions[window_start..window_end]
+                .iter()
+                .enumerate()
+                .map(|(offset, suggestion)| {
+                    let selected = window_start + offset == view.suggestion_cursor;
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            suggestion.label.clone(),
+                            if selected {
+                                theme.accent.add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().add_modifier(Modifier::BOLD)
+                            },
+                        ),
+                        Span::styled(format!("  {}", suggestion.description), theme.muted),
+                    ]))
+                })
+                .collect::<Vec<_>>();
+            let mut state = ListState::default();
+            state.select(Some(view.suggestion_cursor.saturating_sub(window_start)));
+            let title = format!(
+                "{}  {}/{}  ·  {}",
+                view.pack.command_palette,
+                view.suggestion_cursor + 1,
+                view.suggestions.len(),
+                view.pack.command_hint,
+            );
+            frame.render_widget(Clear, popup);
+            frame.render_stateful_widget(
+                List::new(items)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_set(border_set)
+                            .border_style(theme.secondary)
+                            .title(Line::from(Span::styled(
+                                middle_truncate(&title, usize::from(popup.width.saturating_sub(4))),
+                                theme.secondary.add_modifier(Modifier::BOLD),
+                            ))),
+                    )
+                    .highlight_symbol(if view.options.ascii { "> " } else { "› " }),
+                popup,
+                &mut state,
+            );
+        }
+    }
+
+    let cursor_x = chunks[2]
+        .x
+        .saturating_add(1)
+        .saturating_add(u16::try_from(prefix_width).unwrap_or(u16::MAX))
+        .saturating_add(u16::try_from(cursor_column).unwrap_or(u16::MAX))
+        .min(chunks[2].right().saturating_sub(2));
+    frame.set_cursor_position((cursor_x, chunks[2].y.saturating_add(1)));
+    transcript_scroll
+}
+
 /// Ratatui 交互循环：Unicode 行编辑、历史、Bracketed Paste 与可滚动 Slash 面板。
 pub fn run_tui<B: TerminalBackend>(
     backend: &mut B,
@@ -407,18 +1002,17 @@ pub fn run_tui<B: TerminalBackend>(
     let mut input_prompt: Option<InputPrompt> = None;
 
     let initial_snapshot = backend.snapshot();
-    if !initial_snapshot.model_configured {
-        let pack = initial_snapshot.language.pack();
-        history.extend([
-            pack.onboarding_title.to_owned(),
-            pack.onboarding_step_provider.to_owned(),
-            pack.onboarding_step_commands.to_owned(),
-        ]);
-    }
+    let mut show_onboarding = !initial_snapshot.model_configured;
+    let mut transcript_scroll = 0usize;
 
     loop {
         while let Ok(envelope) = subscription.try_recv() {
-            push_activity(&mut history, renderer.render_event(&envelope));
+            if event_is_transcript_worthy(&envelope.event) {
+                push_activity(
+                    &mut history,
+                    render_transcript_event(&envelope, renderer, options.ascii),
+                );
+            }
         }
         let background = backend.poll();
         if let Some(prompt) = background.secret_prompt.clone() {
@@ -431,10 +1025,9 @@ pub fn run_tui<B: TerminalBackend>(
         }
         if background.clear_view {
             history.clear();
-        } else {
-            for line in background.lines {
-                push_activity(&mut history, renderer.sanitize(&line));
-            }
+        }
+        for line in background.lines {
+            push_activity(&mut history, renderer.sanitize(&line));
         }
         if background.should_exit {
             break;
@@ -465,207 +1058,28 @@ pub fn run_tui<B: TerminalBackend>(
         } else {
             suggestion_cursor = suggestion_cursor.min(suggestions.len() - 1);
         }
+        let mut rendered_scroll = transcript_scroll;
         terminal.draw(|frame| {
-            let suggestion_capacity = suggestions.len().min(8);
-            let suggestion_height = if suggestion_capacity == 0 {
-                0
-            } else {
-                u16::try_from(suggestion_capacity + 2).unwrap_or(10)
-            };
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(4),
-                    Constraint::Min(5),
-                    Constraint::Length(suggestion_height),
-                    Constraint::Length(3),
-                    Constraint::Length(u16::from(snapshot.statusbar_visible)),
-                ])
-                .split(frame.area());
-
-            let border_style = if options.color {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                Style::default()
-            };
-            let border_set = if options.ascii {
-                ASCII_BORDER
-            } else {
-                border::PLAIN
-            };
-            let header = vec![
-                Line::from(vec![
-                    Span::styled(
-                        compact_mark(options.ascii),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(format!("   {}", snapshot.project)),
-                ]),
-                Line::from(format!(
-                    "{} {}  ·  {} {}  ·  {} {}  ·  {} {}%  ·  {} {}",
-                    pack.model_label,
-                    snapshot.model,
-                    pack.mode_label,
-                    snapshot.mode,
-                    pack.reasoning_label,
-                    snapshot.reasoning,
-                    pack.context_label,
-                    snapshot.context_percent,
-                    pack.agents_label,
-                    snapshot.agents
-                )),
-            ];
-            frame.render_widget(
-                Paragraph::new(header).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_set(border_set)
-                        .border_style(border_style),
-                ),
-                chunks[0],
-            );
-
-            let visible_height = usize::from(chunks[1].height.saturating_sub(2));
-            let start = history.len().saturating_sub(visible_height);
-            let items = history[start..]
-                .iter()
-                .map(|line| ListItem::new(line.clone()))
-                .collect::<Vec<_>>();
-            frame.render_widget(
-                List::new(items).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_set(border_set)
-                        .title(pack.activity),
-                ),
-                chunks[1],
-            );
-
-            if suggestion_capacity > 0 {
-                let (window_start, window_end) =
-                    suggestion_window(suggestions.len(), suggestion_cursor, suggestion_capacity);
-                let items = suggestions[window_start..window_end]
-                    .iter()
-                    .map(|suggestion| {
-                        ListItem::new(Line::from(vec![
-                            Span::styled(
-                                suggestion.label.clone(),
-                                Style::default().add_modifier(Modifier::BOLD),
-                            ),
-                            Span::raw(format!("  {}", suggestion.description)),
-                        ]))
-                    })
-                    .collect::<Vec<_>>();
-                let mut state = ListState::default();
-                state.select(Some(suggestion_cursor - window_start));
-                let highlight = if options.color {
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().add_modifier(Modifier::REVERSED)
-                };
-                let title = format!(
-                    "{} {}/{} · {}",
-                    pack.command_palette,
-                    suggestion_cursor + 1,
-                    suggestions.len(),
-                    pack.command_hint,
-                );
-                frame.render_stateful_widget(
-                    List::new(items)
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .border_set(border_set)
-                                .title(title),
-                        )
-                        .highlight_style(highlight)
-                        .highlight_symbol(if options.ascii { "> " } else { "› " }),
-                    chunks[2],
-                    &mut state,
-                );
-            }
-            let prefix = if options.ascii { "> " } else { "❯ " };
-            let prefix_width = UnicodeWidthStr::width(prefix);
-            let available_width =
-                usize::from(chunks[3].width.saturating_sub(2)).saturating_sub(prefix_width);
-            let (visible_input, cursor_column, input_title) = secret_prompt.as_ref().map_or_else(
-                || {
-                    let (visible, cursor) = input.visible_window(available_width, false);
-                    (
-                        visible,
-                        cursor,
-                        input_prompt.as_ref().map_or_else(
-                            || format!("{} · {}", pack.input, pack.editor_hint),
-                            |prompt| {
-                                format!(
-                                    "{} · {}{}",
-                                    pack.setup,
-                                    prompt.prompt,
-                                    prompt
-                                        .placeholder
-                                        .as_ref()
-                                        .map_or_else(String::new, |value| format!(" · {value}"))
-                                )
-                            },
-                        ),
-                    )
-                },
-                |prompt| {
-                    let (visible, cursor) = secret_input.visible_window(available_width, true);
-                    (visible, cursor, format!("Secure · {}", prompt.prompt))
+            rendered_scroll = render_product_tui(
+                frame,
+                TuiView {
+                    snapshot: &snapshot,
+                    pack,
+                    history: &history,
+                    input: &input,
+                    secret_prompt: secret_prompt.as_ref(),
+                    secret_input: &secret_input,
+                    input_prompt: input_prompt.as_ref(),
+                    suggestions: &suggestions,
+                    suggestion_cursor,
+                    transcript_scroll,
+                    show_onboarding,
+                    elapsed: started.elapsed(),
+                    options,
                 },
             );
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(prefix, Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(visible_input),
-                ]))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_set(border_set)
-                        .title(input_title),
-                )
-                .wrap(Wrap { trim: false }),
-                chunks[3],
-            );
-            let separator = if options.ascii { " | " } else { " │ " };
-            let status = format!(
-                "{} {}{}{} {}{}{} {}%{}{} {}{}{} {}{}",
-                pack.model_label,
-                snapshot.model,
-                separator,
-                pack.reasoning_label,
-                snapshot.reasoning,
-                separator,
-                pack.context_label,
-                snapshot.context_percent,
-                separator,
-                pack.cache_label,
-                snapshot
-                    .cache_percent
-                    .map_or_else(|| "n/a".to_owned(), |value| format!("{value}%")),
-                separator,
-                pack.agents_label,
-                snapshot.agents,
-                snapshot
-                    .branch
-                    .as_ref()
-                    .map_or_else(String::new, |branch| format!("{separator}{branch}"))
-            );
-            if snapshot.statusbar_visible {
-                frame.render_widget(Paragraph::new(status), chunks[4]);
-            }
-            let cursor_x = chunks[3]
-                .x
-                .saturating_add(1)
-                .saturating_add(u16::try_from(prefix_width).unwrap_or(u16::MAX))
-                .saturating_add(u16::try_from(cursor_column).unwrap_or(u16::MAX))
-                .min(chunks[3].right().saturating_sub(2));
-            frame.set_cursor_position((cursor_x, chunks[3].y.saturating_add(1)));
         })?;
+        transcript_scroll = rendered_scroll;
 
         if !event::poll(Duration::from_millis(50))? {
             continue;
@@ -790,7 +1204,7 @@ pub fn run_tui<B: TerminalBackend>(
                     );
                 }
                 CancelAction::ArmExit => {
-                    history.push("Press Ctrl+C again within 2s to exit".to_owned());
+                    push_activity(&mut history, pack.exit_hint.to_owned());
                 }
                 CancelAction::Exit => {
                     history.extend(
@@ -943,6 +1357,12 @@ pub fn run_tui<B: TerminalBackend>(
             KeyCode::PageDown if !suggestions.is_empty() => {
                 suggestion_cursor = (suggestion_cursor + 8).min(suggestions.len() - 1);
             }
+            KeyCode::PageUp => {
+                transcript_scroll = transcript_scroll.saturating_add(8);
+            }
+            KeyCode::PageDown => {
+                transcript_scroll = transcript_scroll.saturating_sub(8);
+            }
             KeyCode::Enter => {
                 if let Some(suggestion) = suggestions.get(suggestion_cursor)
                     && input.text() != suggestion.replacement
@@ -973,6 +1393,8 @@ pub fn run_tui<B: TerminalBackend>(
                     }
                     continue;
                 }
+                show_onboarding = false;
+                transcript_scroll = 0;
                 if let Some(prompt) = input_prompt.take() {
                     let response = backend.submit_input_prompt(&prompt.request_id, submitted);
                     history.extend(
@@ -991,13 +1413,9 @@ pub fn run_tui<B: TerminalBackend>(
                 let response = backend.handle_input(&submitted);
                 if response.clear_view {
                     history.clear();
-                } else {
-                    history.extend(
-                        response
-                            .lines
-                            .into_iter()
-                            .map(|line| renderer.sanitize(&line)),
-                    );
+                }
+                for line in response.lines {
+                    push_activity(&mut history, renderer.sanitize(&line));
                 }
                 if response.should_exit {
                     break;
@@ -1031,7 +1449,41 @@ impl Drop for TerminalGuard {
 
 #[cfg(test)]
 mod tests {
+    use harness_event::{EventPriority, EventScope};
+    use ratatui::backend::TestBackend;
+
     use super::*;
+
+    fn snapshot(model_configured: bool) -> TerminalSnapshot {
+        TerminalSnapshot {
+            model: if model_configured {
+                "openai/gpt-product".to_owned()
+            } else {
+                "未配置".to_owned()
+            },
+            model_configured,
+            language: UiLanguage::ZhCn,
+            mode: "balanced".to_owned(),
+            reasoning: "medium".to_owned(),
+            context_percent: 42,
+            cache_percent: Some(75),
+            agents: usize::from(model_configured),
+            project: "C:/workspace/kernary-demo".to_owned(),
+            branch: Some("feature/product-ui".to_owned()),
+            statusbar_visible: true,
+        }
+    }
+
+    fn screen_text(backend: &TestBackend) -> String {
+        let width = usize::from(backend.buffer().area.width);
+        backend
+            .buffer()
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     #[test]
     fn ctrl_c_clears_input_then_arms_and_exits() {
@@ -1105,5 +1557,140 @@ mod tests {
         assert_eq!(suggestion_window(60, 0, 8), (0, 8));
         assert_eq!(suggestion_window(60, 30, 8), (26, 34));
         assert_eq!(suggestion_window(60, 59, 8), (52, 60));
+    }
+
+    #[test]
+    fn product_helpers_are_width_safe() {
+        assert_eq!(middle_truncate("abcdefghij", 7), "abc…hij");
+        assert_eq!(middle_truncate("你好世界", 3), "你好世");
+        assert_eq!(progress_bar(0, 6, true), "------");
+        assert_eq!(progress_bar(42, 6, true), "###---");
+        assert_eq!(progress_bar(100, 6, false), "━━━━━━");
+    }
+
+    #[test]
+    fn transcript_hides_telemetry_and_simplifies_agent_activity() {
+        assert!(!event_is_transcript_worthy(&HarnessEvent::ModelUsage {
+            input_tokens: 1,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 1,
+            reasoning_tokens: 0,
+            total_tokens: 2,
+        }));
+        let envelope = EventEnvelope {
+            schema_version: 1,
+            sequence: 1,
+            recorded_at_millis: 0,
+            scope: EventScope::default(),
+            priority: EventPriority::Normal,
+            event: HarnessEvent::AgentStatus {
+                agent_id: harness_types::AgentDefinitionId::from("agent:coder"),
+                role: "Coder".to_owned(),
+                status: "running".to_owned(),
+                detail: "task:main".to_owned(),
+            },
+        };
+        let rendered = render_transcript_event(
+            &envelope,
+            PlainRenderer::new(RenderStyle {
+                ascii: false,
+                color: true,
+            }),
+            false,
+        );
+        assert_eq!(rendered, "◆ Coder · task:main");
+        assert!(!rendered.contains("agent:coder"));
+
+        let mut history = Vec::new();
+        push_activity(&mut history, "Kernary: first\nsecond".to_owned());
+        assert_eq!(history, ["Kernary: first", "second"]);
+    }
+
+    #[test]
+    fn product_tui_renders_onboarding_without_debug_dashboard_boxes() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let snapshot = snapshot(false);
+        let input = LineEditor::default();
+        let secret_input = LineEditor::default();
+        terminal
+            .draw(|frame| {
+                render_product_tui(
+                    frame,
+                    TuiView {
+                        snapshot: &snapshot,
+                        pack: snapshot.language.pack(),
+                        history: &["[DONE] Ready".to_owned()],
+                        input: &input,
+                        secret_prompt: None,
+                        secret_input: &secret_input,
+                        input_prompt: None,
+                        suggestions: &[],
+                        suggestion_cursor: 0,
+                        transcript_scroll: 0,
+                        show_onboarding: true,
+                        elapsed: Duration::ZERO,
+                        options: TuiOptions {
+                            ascii: false,
+                            color: true,
+                        },
+                    },
+                );
+            })
+            .expect("render product TUI");
+        let screen = screen_text(terminal.backend());
+        let compact = screen.replace(' ', "");
+        assert!(screen.contains("Kernary"), "screen={screen}");
+        assert!(compact.contains("尚未配置模型"), "screen={screen}");
+        assert!(compact.contains("向Kernary提问"), "screen={screen}");
+        assert!(!screen.contains("┌Activity"), "screen={screen}");
+    }
+
+    #[test]
+    fn product_tui_keeps_command_palette_usable_on_narrow_terminal() {
+        let backend = TestBackend::new(52, 14);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let snapshot = snapshot(true);
+        let mut input = LineEditor::default();
+        input.set_text("/pro");
+        let secret_input = LineEditor::default();
+        let suggestions = vec![InputSuggestion::new(
+            "/provider",
+            "/provider ",
+            "配置或切换模型提供商",
+        )];
+        terminal
+            .draw(|frame| {
+                render_product_tui(
+                    frame,
+                    TuiView {
+                        snapshot: &snapshot,
+                        pack: snapshot.language.pack(),
+                        history: &[
+                            "You: build a release".to_owned(),
+                            "Kernary: working".to_owned(),
+                        ],
+                        input: &input,
+                        secret_prompt: None,
+                        secret_input: &secret_input,
+                        input_prompt: None,
+                        suggestions: &suggestions,
+                        suggestion_cursor: 0,
+                        transcript_scroll: 0,
+                        show_onboarding: false,
+                        elapsed: Duration::from_millis(240),
+                        options: TuiOptions {
+                            ascii: false,
+                            color: true,
+                        },
+                    },
+                );
+            })
+            .expect("render narrow product TUI");
+        let screen = screen_text(terminal.backend());
+        assert!(screen.contains("/provider"), "screen={screen}");
+        assert!(screen.contains("/pro"), "screen={screen}");
+        assert!(screen.contains("kernary-demo"), "screen={screen}");
     }
 }

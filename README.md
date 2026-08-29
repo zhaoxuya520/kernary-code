@@ -60,6 +60,16 @@ Kernary 不会在未配置模型时用测试模型伪造结果。第一次进入
 /language ja
 ```
 
+## 产品级终端界面
+
+交互界面采用 transcript-first 信息架构：顶部只保留项目、Git 分支、模型、模式、Context 进度和运行中的 Agent；主区域只显示用户消息、Agent 工作、工具、权限、错误与最终结果。`SystemReady`、`Usage`、`Plan`、`Context` 等内部遥测继续进入可审计 Event Log，但不再淹没主对话。
+
+- 命令面板以悬浮层出现，不改变对话区高度；
+- 输入框区分普通输入、设置向导与 Secure Key 三种语义状态；
+- `PgUp` / `PgDn` 回看长对话，输入与新输出保持在固定位置；
+- 宽屏显示完整运行信息，窄屏自动收缩模型名、进度条和次要状态；
+- 颜色使用语义 token 且继承终端默认前景/背景，`--no-color` 保留完整可读性。
+
 `/connect` 使用不回显的安全输入通道保存 Provider Key；`/model` 只选择真实或本地模型。完成后即可提交普通任务，或运行：
 
 ```bash
@@ -74,6 +84,7 @@ kernary --model openai/gpt-5.6-sol exec --json "运行测试并总结结果"
 - `Home` / `End`、`Delete` / `Backspace`：在任意输入位置编辑；
 - `Ctrl+A` / `Ctrl+E`、`Ctrl+U` / `Ctrl+K` / `Ctrl+W`：兼容常用 Shell 行编辑；
 - 输入 `/`：打开完整可滚动命令面板；`↑` / `↓` 选择，`Tab` 补全，`Esc` 关闭；
+- `PgUp` / `PgDn`：滚动主对话，不干扰输入历史和命令候选；
 - `/connect ` 与 `/model `：动态列出 Provider 与模型；
 - Bracketed Paste 会作为单行文本插入，不会因换行意外提交多条命令。
 
@@ -99,7 +110,7 @@ cargo build --release -p harness-cli --bins
 cargo test --workspace --locked
 ```
 
-Rust toolchain 版本见 `rust-toolchain.toml`。完整中文架构索引见 [TERMINAL_HARNESS_DESIGN_INDEX_ZH.md](TERMINAL_HARNESS_DESIGN_INDEX_ZH.md)。
+Rust toolchain 版本见 `rust-toolchain.toml`。
 
 ## npm 包结构
 

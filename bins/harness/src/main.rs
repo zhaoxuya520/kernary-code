@@ -402,6 +402,7 @@ struct AppBackend {
     application: Application,
     registry: CommandRegistry,
     project_root: String,
+    project_branch: Option<String>,
     provider_config_path: PathBuf,
     vector_config_path: PathBuf,
     mcp_config_path: PathBuf,
@@ -4455,7 +4456,7 @@ impl TerminalBackend for AppBackend {
                 cache_percent: cache.effective_hit_rate_percent,
                 agents: plan.map_or(0, |plan| plan.running),
                 project: self.project_root.clone(),
-                branch: None,
+                branch: self.project_branch.clone(),
                 statusbar_visible: self.application.statusbar_visible(),
             },
             Err(_) => TerminalSnapshot {
@@ -4468,7 +4469,7 @@ impl TerminalBackend for AppBackend {
                 cache_percent: cache.effective_hit_rate_percent,
                 agents: 0,
                 project: self.project_root.clone(),
-                branch: None,
+                branch: self.project_branch.clone(),
                 statusbar_visible: self.application.statusbar_visible(),
             },
         }
@@ -5034,6 +5035,29 @@ fn ensure_selection_credential(
     Ok(())
 }
 
+fn project_branch_label(project_root: &Path) -> Option<String> {
+    let dot_git = project_root.join(".git");
+    let git_directory = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let pointer = fs::read_to_string(&dot_git).ok()?;
+        let path = pointer.trim().strip_prefix("gitdir:")?.trim();
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            path
+        } else {
+            project_root.join(path)
+        }
+    };
+    let head = fs::read_to_string(git_directory.join("HEAD")).ok()?;
+    let head = head.trim();
+    if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
+        return (!branch.is_empty()).then(|| branch.to_owned());
+    }
+    let abbreviated = head.chars().take(8).collect::<String>();
+    (abbreviated.chars().count() == 8).then(|| format!("detached@{abbreviated}"))
+}
+
 fn build_backend(
     project_root: &Path,
     requested_model: Option<&str>,
@@ -5517,6 +5541,7 @@ fn build_backend(
             application,
             registry: CommandRegistry::with_language(language),
             project_root: project_root.display().to_string(),
+            project_branch: project_branch_label(project_root),
             provider_config_path,
             vector_config_path,
             mcp_config_path,

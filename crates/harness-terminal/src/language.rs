@@ -88,6 +88,17 @@ pub struct LanguagePack {
     pub dimensions_label: &'static str,
     pub vector_saved_restart: &'static str,
     pub vector_key_saved: &'static str,
+    pub ready_label: &'static str,
+    pub working_label: &'static str,
+    pub secure_label: &'static str,
+    pub composer_placeholder: &'static str,
+    pub send_hint: &'static str,
+    pub scroll_hint: &'static str,
+    pub you_label: &'static str,
+    pub add_provider_action: &'static str,
+    pub connect_provider_action: &'static str,
+    pub browse_commands_action: &'static str,
+    pub exit_hint: &'static str,
 }
 
 pub(crate) fn command_description(
@@ -485,6 +496,17 @@ const EN: LanguagePack = LanguagePack {
     dimensions_label: "Dimensions",
     vector_saved_restart: "Saved; Ready after restart and activated lazily on first semantic request",
     vector_key_saved: "Key saved in the OS credential store; vector models are not listed automatically",
+    ready_label: "Ready",
+    working_label: "Working",
+    secure_label: "Secure input",
+    composer_placeholder: "Ask Kernary, or type / to browse commands",
+    send_hint: "Enter send · / commands · Ctrl+C cancel",
+    scroll_hint: "PgUp/PgDn scroll",
+    you_label: "YOU",
+    add_provider_action: "Add an OpenAI-compatible endpoint",
+    connect_provider_action: "Connect a built-in provider",
+    browse_commands_action: "Browse every command",
+    exit_hint: "Press Ctrl+C again within 2 seconds to exit",
 };
 
 const ZH_CN: LanguagePack = LanguagePack {
@@ -533,6 +555,17 @@ const ZH_CN: LanguagePack = LanguagePack {
     dimensions_label: "维度",
     vector_saved_restart: "已保存；重启后进入 Ready，首次语义请求再惰性激活",
     vector_key_saved: "Key 已进入系统凭证库；不会自动拉取向量模型目录",
+    ready_label: "就绪",
+    working_label: "正在工作",
+    secure_label: "安全输入",
+    composer_placeholder: "向 Kernary 提问，或输入 / 浏览命令",
+    send_hint: "Enter 发送 · / 命令 · Ctrl+C 取消",
+    scroll_hint: "PgUp/PgDn 滚动",
+    you_label: "你",
+    add_provider_action: "添加 OpenAI-compatible 自定义中转站",
+    connect_provider_action: "连接内置模型提供商",
+    browse_commands_action: "浏览全部命令",
+    exit_hint: "2 秒内再次按 Ctrl+C 退出",
 };
 
 const ZH_TW: LanguagePack = LanguagePack {
@@ -581,6 +614,17 @@ const ZH_TW: LanguagePack = LanguagePack {
     dimensions_label: "維度",
     vector_saved_restart: "已儲存；重新啟動後進入 Ready，首次語意請求時才延遲啟用",
     vector_key_saved: "Key 已進入系統憑證庫；不會自動載入向量模型目錄",
+    ready_label: "就緒",
+    working_label: "正在工作",
+    secure_label: "安全輸入",
+    composer_placeholder: "向 Kernary 提問，或輸入 / 瀏覽命令",
+    send_hint: "Enter 傳送 · / 命令 · Ctrl+C 取消",
+    scroll_hint: "PgUp/PgDn 捲動",
+    you_label: "你",
+    add_provider_action: "新增 OpenAI-compatible 自訂中轉站",
+    connect_provider_action: "連接內建模型提供商",
+    browse_commands_action: "瀏覽全部命令",
+    exit_hint: "2 秒內再次按 Ctrl+C 離開",
 };
 
 const JA: LanguagePack = LanguagePack {
@@ -629,6 +673,17 @@ const JA: LanguagePack = LanguagePack {
     dimensions_label: "次元数",
     vector_saved_restart: "保存しました。再起動後に Ready となり、最初の意味検索で遅延起動します",
     vector_key_saved: "キーを OS 資格情報ストアへ保存しました。ベクトルモデル一覧は自動取得しません",
+    ready_label: "準備完了",
+    working_label: "実行中",
+    secure_label: "安全な入力",
+    composer_placeholder: "Kernary に質問するか、/ でコマンドを表示",
+    send_hint: "Enter 送信 · / コマンド · Ctrl+C 中止",
+    scroll_hint: "PgUp/PgDn スクロール",
+    you_label: "あなた",
+    add_provider_action: "OpenAI 互換エンドポイントを追加",
+    connect_provider_action: "組み込みプロバイダーへ接続",
+    browse_commands_action: "すべてのコマンドを表示",
+    exit_hint: "2 秒以内にもう一度 Ctrl+C を押すと終了します",
 };
 
 #[cfg(test)]

@@ -31,7 +31,9 @@ bin/harness --version
 
 `/language en|zh-CN|zh-TW|ja` 可切换并持久化英语、简体中文、繁体中文和日语语言包。
 
-方向键选择候选，Tab 补全；API Key 通过独立 Secure Lane 输入并进入 OS Credential Store。终端编辑支持左右光标、Home/End、Delete/Backspace、Ctrl+A/E/U/K/W、Ctrl+Left/Right 和安全 Bracketed Paste。
+产品界面把内部遥测与用户对话分层：主区只保留用户消息、Agent/Tool 活动、权限、错误与结果，详细状态仍可从 Event Log 查询。命令候选以悬浮面板显示，设置向导和 Secure Key 使用不同输入状态；顶部状态条会响应终端宽度显示 Git 分支、模型、Context 进度和运行中的 Agent。
+
+方向键选择候选，Tab 补全，PgUp/PgDn 回看对话；API Key 通过独立 Secure Lane 输入并进入 OS Credential Store。终端编辑支持左右光标、Home/End、Delete/Backspace、Ctrl+A/E/U/K/W、Ctrl+Left/Right 和安全 Bracketed Paste。
 
 `doctor`、`--help`、completion 和 man 生成不会创建项目 `.harness` 状态。
 
