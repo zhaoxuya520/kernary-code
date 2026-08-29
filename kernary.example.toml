@@ -1,0 +1,38 @@
+# Kernary 五层配置中的 Project 层示例。
+schema_version = 1
+
+[settings]
+mode = "balanced"
+
+[settings.ui]
+statusbar = true
+
+[settings.vector]
+# 这里只控制检索偏好；没有 Embedding Model 时 on 也不会创建向量设施。
+mode = "auto"
+
+[settings.permissions]
+# safe | ask | auto | full | custom；任何模式都不能绕过 Sandbox hard deny。
+mode = "ask"
+
+[settings.failover]
+# 默认关闭；开启时必须确认成本范围并使用精确 provider/model allowlist。
+enabled = false
+cost_confirmed = false
+targets = ""
+
+[settings.agents]
+max = 8
+parallel = 4
+tokens = 100000
+tools = 128
+runtime_ms = 1800000
+retries = 3
+cost = 32
+
+[settings.context]
+window = 8192
+tool_reserve = 1024
+
+[settings.tools]
+max_on_demand = 8

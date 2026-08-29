@@ -1,0 +1,18 @@
+[package]
+name = "harness-provider-compatible"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "OpenAI-compatible Chat Completions adapter for DeepSeek, OpenRouter, local APIs and Ollama"
+
+[dependencies]
+harness-auth = { path = "../harness-auth" }
+harness-http = { path = "../harness-http" }
+harness-model = { path = "../harness-model" }
+harness-types = { path = "../harness-types" }
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,39 @@
+{
+  "name": "kernary-code",
+  "version": "0.1.0",
+  "description": "Kernary Code terminal-native multi-agent coding runtime",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zhaoxuya520/kernary-code.git"
+  },
+  "homepage": "https://github.com/zhaoxuya520/kernary-code#readme",
+  "bugs": "https://github.com/zhaoxuya520/kernary-code/issues",
+  "type": "commonjs",
+  "bin": {
+    "kernary": "bin/kernary.js",
+    "harness": "bin/kernary.js"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "kernary-code-win32-x64": "0.1.0",
+    "kernary-code-linux-x64-gnu": "0.1.0"
+  },
+  "keywords": [
+    "ai",
+    "coding-agent",
+    "cli",
+    "multi-agent",
+    "mcp",
+    "codex"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

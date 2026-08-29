@@ -1,0 +1,26 @@
+schema_version = 1
+
+# 复制为 kernary.providers.toml。这里只保存 credential reference，绝不能粘贴真实 API key。
+[[providers]]
+id = "company-relay"
+display_name = "Company Relay"
+credential_required = true
+
+[[providers.routes]]
+protocol = "openai-chat"
+endpoint = "https://relay.example.com/v1/chat/completions"
+models = ["company-coder", "company-reasoner"]
+reasoning_field = "reasoning-effort"
+
+[[providers.routes]]
+protocol = "anthropic-messages"
+endpoint = "https://relay.example.com/v1/messages"
+models = ["company-claude-compatible"]
+
+# 可选：只有用户显式执行 /models refresh company-relay 时才访问。
+# 该示例 Provider 有多条协议路由，因此只能确认已知模型，不能把新名字猜到某条协议。
+[providers.discovery]
+format = "openai-models"
+endpoint = "https://relay.example.com/v1/models"
+auth = "bearer"
+routing = "known-routes-only"

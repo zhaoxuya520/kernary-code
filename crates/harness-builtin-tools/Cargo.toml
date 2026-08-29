@@ -1,0 +1,23 @@
+[package]
+name = "harness-builtin-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Sandboxed builtin file, process and patch tools for Harness"
+
+[dependencies]
+harness-permission = { path = "../harness-permission" }
+harness-tool = { path = "../harness-tool" }
+harness-types = { path = "../harness-types" }
+serde_json.workspace = true
+serde.workspace = true
+sha2.workspace = true
+process-wrap.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

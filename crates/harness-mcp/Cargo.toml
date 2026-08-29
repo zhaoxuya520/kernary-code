@@ -1,0 +1,36 @@
+[package]
+name = "harness-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Lazy MCP client, catalog and unified Tool Runtime bridge for Harness"
+
+[dependencies]
+harness-auth = { path = "../harness-auth" }
+harness-http = { path = "../harness-http" }
+harness-permission = { path = "../harness-permission" }
+harness-tool = { path = "../harness-tool" }
+harness-types = { path = "../harness-types" }
+getrandom.workspace = true
+process-wrap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+toml.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+harness-builtin-tools = { path = "../harness-builtin-tools" }
+tempfile.workspace = true
+
+[[bin]]
+name = "harness-mcp-test-server"
+path = "tests/fixtures/mcp_test_server.rs"
+test = false
+bench = false
+doc = false
+
+[lints]
+workspace = true

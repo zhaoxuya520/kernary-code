@@ -1,0 +1,20 @@
+[package]
+name = "harness-terminal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Command registry, plain/JSON renderers and minimal Ratatui frontend for Harness"
+
+[dependencies]
+crossterm.workspace = true
+harness-event = { path = "../harness-event" }
+harness-permission = { path = "../harness-permission" }
+harness-types = { path = "../harness-types" }
+ratatui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

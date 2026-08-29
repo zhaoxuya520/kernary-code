@@ -1,0 +1,17 @@
+[package]
+name = "harness-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Deterministic fixtures and fake utilities for Harness conformance tests"
+
+[dependencies]
+harness-types = { path = "../harness-types" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

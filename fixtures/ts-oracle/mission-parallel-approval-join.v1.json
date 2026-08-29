@@ -1,0 +1,422 @@
+{
+  "schemaVersion": 1,
+  "fixture": "mission-parallel-approval-join",
+  "events": [
+    {
+      "aggregateVersion": 1,
+      "event": {
+        "type": "mission.created",
+        "missionId": "mission:oracle",
+        "projectId": "project:oracle",
+        "goal": "验证并行任务、审批、验收与 Join"
+      }
+    },
+    {
+      "aggregateVersion": 2,
+      "event": {
+        "type": "mission.plan-installed",
+        "nodes": [
+          {
+            "id": "a",
+            "title": "任务 A",
+            "kind": "task",
+            "dependsOn": [],
+            "agentDefinitionId": "agent:a"
+          },
+          {
+            "id": "b",
+            "title": "任务 B",
+            "kind": "task",
+            "dependsOn": [],
+            "agentDefinitionId": "agent:b",
+            "requiresApproval": true
+          },
+          {
+            "id": "join",
+            "title": "汇合验证",
+            "kind": "join",
+            "dependsOn": [
+              "a",
+              "b"
+            ],
+            "agentDefinitionId": "agent:verifier"
+          }
+        ]
+      }
+    },
+    {
+      "aggregateVersion": 3,
+      "event": {
+        "type": "node.started",
+        "nodeId": "a",
+        "runId": "run:a"
+      }
+    },
+    {
+      "aggregateVersion": 4,
+      "event": {
+        "type": "node.started",
+        "nodeId": "b",
+        "runId": "run:b"
+      }
+    },
+    {
+      "aggregateVersion": 5,
+      "event": {
+        "type": "node.submitted",
+        "nodeId": "a",
+        "runId": "run:a",
+        "outputSummary": "任务 A 已由 agent:a 完成"
+      }
+    },
+    {
+      "aggregateVersion": 6,
+      "event": {
+        "type": "approval.requested",
+        "approvalId": "approval:run:b",
+        "nodeId": "b",
+        "runId": "run:b",
+        "action": "filesystem.write",
+        "reason": "任务 B 需要写入项目文件"
+      }
+    },
+    {
+      "aggregateVersion": 7,
+      "event": {
+        "type": "node.accepted",
+        "nodeId": "a",
+        "runId": "run:a"
+      }
+    },
+    {
+      "aggregateVersion": 8,
+      "event": {
+        "type": "approval.resolved",
+        "approvalId": "approval:run:b",
+        "decision": "allow"
+      }
+    },
+    {
+      "aggregateVersion": 9,
+      "event": {
+        "type": "node.submitted",
+        "nodeId": "b",
+        "runId": "run:b",
+        "outputSummary": "任务 B 在获得一次性权限后完成"
+      }
+    },
+    {
+      "aggregateVersion": 10,
+      "event": {
+        "type": "node.accepted",
+        "nodeId": "b",
+        "runId": "run:b"
+      }
+    },
+    {
+      "aggregateVersion": 11,
+      "event": {
+        "type": "node.started",
+        "nodeId": "join",
+        "runId": "run:join"
+      }
+    },
+    {
+      "aggregateVersion": 12,
+      "event": {
+        "type": "node.submitted",
+        "nodeId": "join",
+        "runId": "run:join",
+        "outputSummary": "汇合验证 已由 agent:verifier 完成"
+      }
+    },
+    {
+      "aggregateVersion": 13,
+      "event": {
+        "type": "node.accepted",
+        "nodeId": "join",
+        "runId": "run:join"
+      }
+    },
+    {
+      "aggregateVersion": 14,
+      "event": {
+        "type": "mission.completed"
+      }
+    }
+  ],
+  "finalState": {
+    "missionId": "mission:oracle",
+    "projectId": "project:oracle",
+    "goal": "验证并行任务、审批、验收与 Join",
+    "status": "completed",
+    "version": 14,
+    "nodes": {
+      "a": {
+        "id": "a",
+        "title": "任务 A",
+        "kind": "task",
+        "dependsOn": [],
+        "agentDefinitionId": "agent:a",
+        "status": "accepted",
+        "runId": "run:a",
+        "outputSummary": "任务 A 已由 agent:a 完成"
+      },
+      "b": {
+        "id": "b",
+        "title": "任务 B",
+        "kind": "task",
+        "dependsOn": [],
+        "agentDefinitionId": "agent:b",
+        "requiresApproval": true,
+        "status": "accepted",
+        "runId": "run:b",
+        "approvalId": "approval:run:b",
+        "outputSummary": "任务 B 在获得一次性权限后完成"
+      },
+      "join": {
+        "id": "join",
+        "title": "汇合验证",
+        "kind": "join",
+        "dependsOn": [
+          "a",
+          "b"
+        ],
+        "agentDefinitionId": "agent:verifier",
+        "status": "accepted",
+        "runId": "run:join",
+        "outputSummary": "汇合验证 已由 agent:verifier 完成"
+      }
+    },
+    "runs": {
+      "run:a": {
+        "id": "run:a",
+        "nodeId": "a",
+        "agentDefinitionId": "agent:a",
+        "endpointId": "endpoint:agent:a",
+        "attempt": 1,
+        "status": "accepted"
+      },
+      "run:b": {
+        "id": "run:b",
+        "nodeId": "b",
+        "agentDefinitionId": "agent:b",
+        "endpointId": "endpoint:agent:b",
+        "attempt": 1,
+        "status": "accepted"
+      },
+      "run:join": {
+        "id": "run:join",
+        "nodeId": "join",
+        "agentDefinitionId": "agent:verifier",
+        "endpointId": "endpoint:agent:verifier",
+        "attempt": 1,
+        "status": "accepted"
+      }
+    },
+    "approvals": {
+      "approval:run:b": {
+        "id": "approval:run:b",
+        "nodeId": "b",
+        "runId": "run:b",
+        "action": "filesystem.write",
+        "reason": "任务 B 需要写入项目文件",
+        "status": "allowed"
+      }
+    }
+  },
+  "projection": {
+    "missionId": "mission:oracle",
+    "projectId": "project:oracle",
+    "goal": "验证并行任务、审批、验收与 Join",
+    "status": "completed",
+    "version": 14,
+    "lanes": [
+      {
+        "nodeId": "a",
+        "title": "任务 A",
+        "kind": "task",
+        "agentDefinitionId": "agent:a",
+        "runId": "run:a",
+        "status": "accepted",
+        "dependsOn": []
+      },
+      {
+        "nodeId": "b",
+        "title": "任务 B",
+        "kind": "task",
+        "agentDefinitionId": "agent:b",
+        "runId": "run:b",
+        "status": "accepted",
+        "dependsOn": []
+      },
+      {
+        "nodeId": "join",
+        "title": "汇合验证",
+        "kind": "join",
+        "agentDefinitionId": "agent:verifier",
+        "runId": "run:join",
+        "status": "accepted",
+        "dependsOn": [
+          "a",
+          "b"
+        ]
+      }
+    ],
+    "items": [
+      {
+        "id": "mission:oracle:1",
+        "sequence": 1,
+        "type": "mission.created",
+        "actor": "user",
+        "title": "创建任务",
+        "summary": "验证并行任务、审批、验收与 Join",
+        "status": "completed"
+      },
+      {
+        "id": "mission:oracle:2",
+        "sequence": 2,
+        "type": "mission.plan-installed",
+        "actor": "kernel",
+        "title": "安装任务图",
+        "summary": "3 个节点",
+        "status": "completed"
+      },
+      {
+        "id": "mission:oracle:3",
+        "sequence": 3,
+        "type": "node.started",
+        "actor": "worker",
+        "title": "启动 a",
+        "summary": "run:a",
+        "status": "started"
+      },
+      {
+        "id": "mission:oracle:4",
+        "sequence": 4,
+        "type": "node.started",
+        "actor": "worker",
+        "title": "启动 b",
+        "summary": "run:b",
+        "status": "started"
+      },
+      {
+        "id": "mission:oracle:5",
+        "sequence": 5,
+        "type": "node.submitted",
+        "actor": "worker",
+        "title": "提交 a",
+        "summary": "任务 A 已由 agent:a 完成",
+        "status": "completed"
+      },
+      {
+        "id": "mission:oracle:6",
+        "sequence": 6,
+        "type": "approval.requested",
+        "actor": "worker",
+        "title": "等待权限",
+        "summary": "filesystem.write：任务 B 需要写入项目文件",
+        "status": "waiting"
+      },
+      {
+        "id": "mission:oracle:7",
+        "sequence": 7,
+        "type": "node.accepted",
+        "actor": "verifier",
+        "title": "验收 a",
+        "summary": "run:a",
+        "status": "completed"
+      },
+      {
+        "id": "mission:oracle:8",
+        "sequence": 8,
+        "type": "approval.resolved",
+        "actor": "user",
+        "title": "审批已处理",
+        "summary": "allow",
+        "status": "completed"
+      },
+      {
+        "id": "mission:oracle:9",
+        "sequence": 9,
+        "type": "node.submitted",
+        "actor": "worker",
+        "title": "提交 b",
+        "summary": "任务 B 在获得一次性权限后完成",
+        "status": "completed"
+      },
+      {
+        "id": "mission:oracle:10",
+        "sequence": 10,
+        "type": "node.accepted",
+        "actor": "verifier",
+        "title": "验收 b",
+        "summary": "run:b",
+        "status": "completed"
+      },
+      {
+        "id": "mission:oracle:11",
+        "sequence": 11,
+        "type": "node.started",
+        "actor": "worker",
+        "title": "启动 join",
+        "summary": "run:join",
+        "status": "started"
+      },
+      {
+        "id": "mission:oracle:12",
+        "sequence": 12,
+        "type": "node.submitted",
+        "actor": "worker",
+        "title": "提交 join",
+        "summary": "汇合验证 已由 agent:verifier 完成",
+        "status": "completed"
+      },
+      {
+        "id": "mission:oracle:13",
+        "sequence": 13,
+        "type": "node.accepted",
+        "actor": "verifier",
+        "title": "验收 join",
+        "summary": "run:join",
+        "status": "completed"
+      },
+      {
+        "id": "mission:oracle:14",
+        "sequence": 14,
+        "type": "mission.completed",
+        "actor": "kernel",
+        "title": "Mission 完成",
+        "summary": "所有节点均已验收",
+        "status": "completed"
+      }
+    ],
+    "pendingApprovalIds": []
+  },
+  "outbox": {
+    "count": 7,
+    "statuses": [
+      "completed",
+      "completed",
+      "completed",
+      "completed",
+      "completed",
+      "completed",
+      "completed"
+    ],
+    "effectKinds": [
+      "start-fake-run",
+      "start-fake-run",
+      "verify-fake-run",
+      "resume-fake-run",
+      "verify-fake-run",
+      "start-fake-run",
+      "verify-fake-run"
+    ]
+  },
+  "invariants": {
+    "allNodesAccepted": true,
+    "missionCompleted": true,
+    "pendingApprovals": 0
+  }
+}

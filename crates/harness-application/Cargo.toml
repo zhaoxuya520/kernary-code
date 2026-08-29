@@ -1,0 +1,39 @@
+[package]
+name = "harness-application"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Application use cases that coordinate the Harness kernel through ports"
+
+[dependencies]
+harness-agent = { path = "../harness-agent" }
+harness-auth = { path = "../harness-auth" }
+harness-browser = { path = "../harness-browser" }
+harness-builtin-tools = { path = "../harness-builtin-tools" }
+harness-cache = { path = "../harness-cache" }
+harness-context = { path = "../harness-context" }
+harness-config = { path = "../harness-config" }
+harness-event = { path = "../harness-event" }
+harness-kernel = { path = "../harness-kernel" }
+harness-lsp = { path = "../harness-lsp" }
+harness-model = { path = "../harness-model" }
+harness-mcp = { path = "../harness-mcp" }
+harness-memory = { path = "../harness-memory" }
+harness-permission = { path = "../harness-permission" }
+harness-plugin = { path = "../harness-plugin" }
+harness-skill = { path = "../harness-skill" }
+harness-tool = { path = "../harness-tool" }
+harness-types = { path = "../harness-types" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+harness-storage = { path = "../harness-storage" }
+harness-testkit = { path = "../harness-testkit" }
+tempfile.workspace = true
+
+[lints]
+workspace = true

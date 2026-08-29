@@ -1,0 +1,20 @@
+schema_version = 1
+
+# 复制为 kernary.lsp.toml，并把 command 改为本机语言服务器的绝对路径。
+# Harness 只读取 metadata；直到 /lsp start 或具体查询才启动进程。
+#
+# Windows 示例：
+# [[servers]]
+# id = "rust-analyzer"
+# command = "C:/Users/you/.cargo/bin/rust-analyzer.exe"
+# args = []
+# language_ids = { rs = "rust" }
+# inherit_env = ["RUSTUP_HOME", "CARGO_HOME"]
+#
+# Linux/macOS 示例：
+# [[servers]]
+# id = "rust-analyzer"
+# command = "/absolute/path/to/rust-analyzer"
+# args = []
+# language_ids = { rs = "rust" }
+# inherit_env = ["RUSTUP_HOME", "CARGO_HOME"]

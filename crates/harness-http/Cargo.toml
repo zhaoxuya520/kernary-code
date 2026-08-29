@@ -1,0 +1,16 @@
+[package]
+name = "harness-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Secret-aware blocking HTTPS streaming transport for Harness provider adapters"
+
+[dependencies]
+harness-auth = { path = "../harness-auth" }
+serde_json.workspace = true
+ureq.workspace = true
+
+[lints]
+workspace = true

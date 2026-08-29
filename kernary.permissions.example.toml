@@ -1,0 +1,20 @@
+# 项目 Permission Rule。规则不能绕过 Sandbox hard deny。
+schema_version = 1
+
+[[rules]]
+id = "rule:allow-src-read"
+effect = "allow"
+action = "read"
+pattern = "./src/**"
+
+[[rules]]
+id = "rule:ask-config-write"
+effect = "ask"
+action = "write"
+pattern = "./config/**"
+
+[[rules]]
+id = "rule:deny-secret-read"
+effect = "deny"
+action = "read"
+pattern = "~/.ssh/**"

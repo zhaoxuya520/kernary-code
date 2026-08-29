@@ -1,0 +1,27 @@
+[package]
+name = "harness-provider-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Lazy model discovery and protocol composition for Kernary Provider Catalog"
+
+[dependencies]
+harness-auth = { path = "../harness-auth" }
+harness-http = { path = "../harness-http" }
+harness-model = { path = "../harness-model" }
+harness-provider-anthropic = { path = "../harness-provider-anthropic" }
+harness-provider-catalog = { path = "../harness-provider-catalog" }
+harness-provider-compatible = { path = "../harness-provider-compatible" }
+harness-provider-openai = { path = "../harness-provider-openai" }
+harness-types = { path = "../harness-types" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

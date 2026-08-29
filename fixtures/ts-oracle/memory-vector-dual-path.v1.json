@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "fixture": "memory-vector-dual-path",
+  "lexicalOnly": {
+    "status": {
+      "lexicalReady": true,
+      "recordCount": 1,
+      "ftsIndexedCount": 1,
+      "semanticConfigured": false,
+      "semanticStatus": "not-configured",
+      "vectorIndexedCount": 0
+    },
+    "lexicalResultIds": [
+      "memory:approval"
+    ],
+    "semanticRequest": {
+      "requestedMode": "semantic",
+      "executedMode": "lexical",
+      "degraded": true,
+      "degradationReason": "semantic-not-configured"
+    }
+  },
+  "semantic": {
+    "callsBeforeInitialize": 0,
+    "callsAfterInitialize": 2,
+    "resultIds": [
+      "m:safety",
+      "m:cache"
+    ],
+    "executedMode": "semantic",
+    "callsBeforeExact": 3,
+    "callsAfterExact": 3,
+    "exactExecutedMode": "lexical",
+    "status": {
+      "semanticConfigured": true,
+      "semanticStatus": "ready",
+      "vectorIndexedCount": 2
+    }
+  }
+}

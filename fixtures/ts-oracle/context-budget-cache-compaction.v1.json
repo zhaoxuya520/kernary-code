@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "fixture": "context-budget-cache-compaction",
+  "compile": {
+    "selectedIds": [
+      "core",
+      "goal",
+      "runtime"
+    ],
+    "excludedIds": [
+      "low-memory",
+      "history"
+    ],
+    "inputTokenEstimate": 45,
+    "maxInputTokens": 60,
+    "firstCache": {
+      "stablePrefixHash": "8df86363e59613c96c1ca99753c8f32badc20ca238cddd6833c180669aceb4a2",
+      "appendOnlyHash": "dbc36c49529e69f96b1406efb64f10ea062fd6fedef8bfcdf4e72759bc7d7834",
+      "contextSeriesId": "series:1",
+      "fullFingerprint": "df28170debca81bdb3cb227bb37f97bfb90f2836b5427b538217ffcaa5e6e751",
+      "stableTokenEstimate": 20,
+      "appendOnlyTokenEstimate": 15,
+      "dynamicTokenEstimate": 10
+    },
+    "secondCache": {
+      "stablePrefixHash": "8df86363e59613c96c1ca99753c8f32badc20ca238cddd6833c180669aceb4a2",
+      "appendOnlyHash": "dbc36c49529e69f96b1406efb64f10ea062fd6fedef8bfcdf4e72759bc7d7834",
+      "contextSeriesId": "series:1",
+      "fullFingerprint": "9a29aabb8e39744b11d86bf187b35902431cecb6c9f4e23dd198aaa16d38df9a",
+      "stableTokenEstimate": 20,
+      "appendOnlyTokenEstimate": 15,
+      "dynamicTokenEstimate": 10
+    },
+    "stablePrefixUnchanged": true,
+    "fullFingerprintChanged": true
+  },
+  "compaction": {
+    "retainedItemIds": [
+      "tool-call",
+      "tool-result",
+      "approval",
+      "contract",
+      "recent-user",
+      "recent-agent"
+    ],
+    "summarizedItemIds": [
+      "old-user",
+      "old-agent"
+    ],
+    "tokenUsageBefore": 120,
+    "tokenEstimateAfter": 68,
+    "previousSeriesId": "series:before",
+    "nextSeriesId": "series:1b46a390a26f7a81138aed41",
+    "summary": "历史摘要：old-user,old-agent",
+    "visibleKinds": [
+      "compaction-summary",
+      "tool-call",
+      "tool-result",
+      "approval",
+      "contract",
+      "user-message",
+      "agent-message"
+    ]
+  }
+}

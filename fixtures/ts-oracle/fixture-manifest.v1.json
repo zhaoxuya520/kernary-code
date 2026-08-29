@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "source": "TypeScript D0 oracle",
+  "generatedBy": "scripts/export-ts-oracle.ts",
+  "fixtures": [
+    {
+      "name": "context-budget-cache-compaction.v1.json",
+      "sha256": "ba9d0f5633bd787fc23016ad73337f2bb8d562859f0eba16c2a8b02795c9ff4d"
+    },
+    {
+      "name": "memory-vector-dual-path.v1.json",
+      "sha256": "e13b0e6479f17b44a8978bef5fa9947015206c8592240366ab55512ddae1f45e"
+    },
+    {
+      "name": "mission-command-decisions.v1.json",
+      "sha256": "1a884ca8a6c97a9920d30b460de7953e6c720cd472b443238fa2945901199989"
+    },
+    {
+      "name": "mission-parallel-approval-join.v1.json",
+      "sha256": "4a334d9e306d75bae94b449d2c7acacb49cc82a546ce454141e808d4dbb8fae9"
+    },
+    {
+      "name": "permission-path-and-grants.v1.json",
+      "sha256": "b4578c7ba50bf54db7322d0e992f91e1e720135c2969af6d116ecbdf58513830"
+    }
+  ]
+}

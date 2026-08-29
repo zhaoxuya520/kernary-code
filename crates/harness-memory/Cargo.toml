@@ -1,0 +1,22 @@
+[package]
+name = "harness-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Project-scoped structured memory with lexical-first retrieval and optional semantic capability"
+
+[dependencies]
+harness-auth = { path = "../harness-auth" }
+harness-http = { path = "../harness-http" }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

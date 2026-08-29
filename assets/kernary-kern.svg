@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Kernary Kern mascot</title>
+  <desc id="desc">A compact golden canary with a black kernel diamond and terminal-shaped tail.</desc>
+  <defs>
+    <linearGradient id="gold" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFD85A"/>
+      <stop offset="1" stop-color="#F2A900"/>
+    </linearGradient>
+  </defs>
+  <circle cx="256" cy="256" r="224" fill="#111318"/>
+  <ellipse cx="252" cy="278" rx="132" ry="154" fill="url(#gold)"/>
+  <circle cx="218" cy="212" r="13" fill="#111318"/>
+  <circle cx="302" cy="212" r="13" fill="#111318"/>
+  <path d="M244 242h32l-16 18z" fill="#E56B2F"/>
+  <path d="M256 280l42 42-42 42-42-42z" fill="#111318"/>
+  <path d="M125 282c-46 18-71 55-75 111 44-8 83-31 112-70z" fill="#F2A900"/>
+  <path d="M379 282c46 18 71 55 75 111-44-8-83-31-112-70z" fill="#F2A900"/>
+  <path d="M205 419l51 58 51-58-51 24z" fill="#FFD85A"/>
+  <path d="M324 410l66 31-66 31 20-31z" fill="#FFD85A"/>
+</svg>

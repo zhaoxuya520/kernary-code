@@ -1,0 +1,42 @@
+# 上游研究源码副本：各自保留独立 Git 历史，不进入 Harness 根仓库。
+/codex/
+/pi-mono/
+/deepseek-harness/
+
+# 运行产物与本地分析 case。
+/output/
+/work/
+/.playwright-cli/
+/target/
+/dist/
+/node_modules/
+/npm/kernary-code-*/bin/
+/.harness/
+
+# 本地数据库、日志与临时文件。
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.log
+*.tmp
+*.trace
+
+# 凭证和环境文件。
+.env
+.env.*
+!.env.example
+credentials.json
+auth.json
+*.key
+*.pem
+
+# 编辑器和操作系统文件。
+/.vscode/
+/.idea/
+.DS_Store
+Thumbs.db
+
+# 允许显式提交测试 fixtures 中的数据库快照。
+!fixtures/**/*.sqlite
+!fixtures/**/*.db

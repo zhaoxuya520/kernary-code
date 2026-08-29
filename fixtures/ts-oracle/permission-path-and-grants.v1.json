@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "fixture": "permission-path-and-grants",
+  "inside": {
+    "kind": "allow",
+    "source": "sandbox",
+    "grantApplied": false
+  },
+  "outside": {
+    "kind": "request-approval",
+    "request": {
+      "action": {
+        "kind": "filesystem.write",
+        "path": "{canonical_path}"
+      },
+      "reason": "filesystem.write 不在当前 sandbox profile 允许范围内",
+      "risk": "medium",
+      "sandboxAllowed": false,
+      "availableScopes": [
+        "once",
+        "run",
+        "project"
+      ],
+      "status": "pending"
+    }
+  },
+  "allowOnceSequence": [
+    {
+      "kind": "request-approval",
+      "request": {
+        "action": {
+          "kind": "filesystem.write",
+          "path": "{canonical_path}"
+        },
+        "reason": "filesystem.write 命中当前 approval policy",
+        "risk": "medium",
+        "sandboxAllowed": true,
+        "availableScopes": [
+          "once",
+          "run",
+          "project"
+        ],
+        "status": "allowed"
+      }
+    },
+    {
+      "kind": "allow",
+      "source": "grant",
+      "grantApplied": true
+    },
+    {
+      "kind": "request-approval",
+      "request": {
+        "action": {
+          "kind": "filesystem.write",
+          "path": "{canonical_path}"
+        },
+        "reason": "filesystem.write 命中当前 approval policy",
+        "risk": "medium",
+        "sandboxAllowed": true,
+        "availableScopes": [
+          "once",
+          "run",
+          "project"
+        ],
+        "status": "pending"
+      }
+    }
+  ]
+}

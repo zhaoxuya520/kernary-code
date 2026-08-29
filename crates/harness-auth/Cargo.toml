@@ -1,0 +1,19 @@
+[package]
+name = "harness-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Secret-safe accounts and credential store ports for Harness"
+
+[dependencies]
+harness-types = { path = "../harness-types" }
+keyring.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "harness-lsp-patch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Recoverable LSP WorkspaceEdit preview, PatchStore and FileLease coordinator for Kernary"
+
+[dependencies]
+harness-agent = { path = "../harness-agent" }
+harness-builtin-tools = { path = "../harness-builtin-tools" }
+harness-lsp = { path = "../harness-lsp" }
+harness-permission = { path = "../harness-permission" }
+harness-tool = { path = "../harness-tool" }
+harness-types = { path = "../harness-types" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

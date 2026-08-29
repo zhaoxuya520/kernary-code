@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "maxBinaryBytes": 16000000,
+  "maxWarmHelpP95Millis": 100,
+  "localTargetWarmHelpP95Millis": 30,
+  "defaultIterations": 100
+}

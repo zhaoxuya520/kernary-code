@@ -1,0 +1,59 @@
+[package]
+name = "harness-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Terminal-native Harness CLI and TUI"
+autobins = false
+
+[[bin]]
+name = "kernary"
+path = "src/main.rs"
+
+[[bin]]
+name = "harness"
+path = "src/bin/harness.rs"
+
+[dependencies]
+clap.workspace = true
+clap_complete.workspace = true
+clap_mangen.workspace = true
+crossterm.workspace = true
+harness-agent = { path = "../../crates/harness-agent" }
+harness-application = { path = "../../crates/harness-application" }
+harness-auth = { path = "../../crates/harness-auth" }
+harness-builtin-tools = { path = "../../crates/harness-builtin-tools" }
+harness-browser = { path = "../../crates/harness-browser" }
+harness-cache = { path = "../../crates/harness-cache" }
+harness-codex = { path = "../../crates/harness-codex" }
+harness-config = { path = "../../crates/harness-config" }
+harness-context = { path = "../../crates/harness-context" }
+harness-event = { path = "../../crates/harness-event" }
+harness-http = { path = "../../crates/harness-http" }
+harness-lsp = { path = "../../crates/harness-lsp" }
+harness-lsp-patch = { path = "../../crates/harness-lsp-patch" }
+harness-storage = { path = "../../crates/harness-storage" }
+harness-model = { path = "../../crates/harness-model" }
+harness-mcp = { path = "../../crates/harness-mcp" }
+harness-memory = { path = "../../crates/harness-memory" }
+harness-permission = { path = "../../crates/harness-permission" }
+harness-plugin = { path = "../../crates/harness-plugin" }
+harness-skill = { path = "../../crates/harness-skill" }
+harness-provider-openai = { path = "../../crates/harness-provider-openai" }
+harness-provider-compatible = { path = "../../crates/harness-provider-compatible" }
+harness-provider-anthropic = { path = "../../crates/harness-provider-anthropic" }
+harness-provider-catalog = { path = "../../crates/harness-provider-catalog" }
+harness-provider-runtime = { path = "../../crates/harness-provider-runtime" }
+harness-terminal = { path = "../../crates/harness-terminal" }
+harness-types = { path = "../../crates/harness-types" }
+harness-tool = { path = "../../crates/harness-tool" }
+serde_json.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

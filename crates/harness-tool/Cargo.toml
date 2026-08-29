@@ -1,0 +1,20 @@
+[package]
+name = "harness-tool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Unified tool registry, invocation runtime, journal port and sandbox boundary"
+
+[dependencies]
+harness-permission = { path = "../harness-permission" }
+harness-types = { path = "../harness-types" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

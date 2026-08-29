@@ -1,0 +1,29 @@
+# MCP Server 只在显式 connect/query 时激活；配置加载本身不会启动进程或访问网络。
+
+[[servers]]
+id = "local-example"
+name = "Local Example"
+enabled = false
+trustAnnotations = false
+
+[servers.transport]
+kind = "stdio"
+command = "C:/absolute/path/to/mcp-server.exe"
+args = []
+cwd = "."
+inheritEnv = []
+requestTimeoutMillis = 10000
+maxMessageBytes = 1048576
+
+[[servers]]
+id = "remote-example"
+name = "Remote Example"
+enabled = false
+trustAnnotations = false
+
+[servers.transport]
+kind = "streamable-http"
+endpoint = "https://example.com/mcp"
+legacySseFallback = false
+requestTimeoutMillis = 30000
+maxResponseBytes = 4194304

@@ -1,0 +1,15 @@
+[package]
+name = "harness-event"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Typed bounded event bus and presentation events for Harness"
+
+[dependencies]
+harness-types = { path = "../harness-types" }
+serde.workspace = true
+
+[lints]
+workspace = true

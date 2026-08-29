@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --locked --no-fail-fast
+
+  typescript-oracle:
+    name: TypeScript Oracle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - run: npm test
+      - run: npm run fixtures:check
+
+  browser-e2e:
+    name: Playwright Browser E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+      - run: rustup show
+      - name: Install isolated Playwright runtime
+        run: |
+          python -m pip install playwright==1.60.0
+          python -m playwright install --with-deps chromium
+      - name: Resolve absolute Python and Chromium paths
+        shell: bash
+        run: |
+          echo "HARNESS_BROWSER_PYTHON=$(python -c 'import sys; print(sys.executable)')" >> "$GITHUB_ENV"
+          echo "HARNESS_BROWSER_EXECUTABLE=$(python -c 'from playwright.sync_api import sync_playwright; p=sync_playwright().start(); print(p.chromium.executable_path); p.stop()')" >> "$GITHUB_ENV"
+          echo "HARNESS_BROWSER_E2E=1" >> "$GITHUB_ENV"
+      - name: Process Adapter E2E
+        run: cargo test --locked -p harness-browser --test process_e2e -- --ignored --nocapture
+      - name: CLI Browser E2E
+        run: cargo test --locked -p harness-cli --test cli browser_cli_is_lazy_then_opens_navigates_journals_and_closes -- --ignored --nocapture
+
+  package:
+    name: Package ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: windows-x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: linux-x86_64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: macos-aarch64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+      - run: rustup show
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/package-release.ps1 -Target '${{ matrix.target }}' -OutputDirectory dist
+      - name: Package Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: sh scripts/package-release.sh '${{ matrix.target }}' dist
+      - name: Smoke and performance budget (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $binary = Get-ChildItem dist -Recurse -Filter kernary.exe -File | Select-Object -First 1
+          $compat = Get-ChildItem dist -Recurse -Filter harness.exe -File | Select-Object -First 1
+          & $binary.FullName --version
+          & $compat.FullName --version
+          if ((Get-FileHash $binary.FullName).Hash -ne (Get-FileHash $compat.FullName).Hash) { throw 'primary/compatibility binary mismatch' }
+          & $binary.FullName doctor --json | ConvertFrom-Json | Out-Null
+          python scripts/benchmark-release.py $binary.FullName --iterations 50 --output dist/performance-${{ matrix.target }}.json
+      - name: Smoke and performance budget (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          binary=$(find dist -type f -path '*/bin/kernary' | head -n 1)
+          compat=$(find dist -type f -path '*/bin/harness' | head -n 1)
+          "$binary" --version
+          "$compat" --version
+          cmp "$binary" "$compat"
+          "$binary" doctor --json >/dev/null
+          python scripts/benchmark-release.py "$binary" --iterations 50 --output "dist/performance-${{ matrix.target }}.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kernary-${{ matrix.artifact }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/performance-*.json
+          if-no-files-found: error

@@ -1,0 +1,33 @@
+[package]
+name = "harness-lsp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Lazy read-only Language Server Protocol bridge for Kernary"
+
+[dependencies]
+harness-permission = { path = "../harness-permission" }
+harness-tool = { path = "../harness-tool" }
+process-wrap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+toml.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+harness-builtin-tools = { path = "../harness-builtin-tools" }
+harness-types = { path = "../harness-types" }
+tempfile.workspace = true
+
+[[bin]]
+name = "harness-lsp-test-server"
+path = "tests/fixtures/lsp_test_server.rs"
+test = false
+bench = false
+doc = false
+
+[lints]
+workspace = true

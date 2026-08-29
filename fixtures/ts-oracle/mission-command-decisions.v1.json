@@ -1,0 +1,434 @@
+{
+  "schemaVersion": 1,
+  "fixture": "mission-command-decisions",
+  "effectVocabulary": "production-normalized-v1",
+  "steps": [
+    {
+      "command": {
+        "type": "CreateMission",
+        "missionId": "mission:command-oracle",
+        "projectId": "project:command-oracle",
+        "goal": "验证 Command/Decision/Effect 语义"
+      },
+      "stateVersionBefore": 0,
+      "events": [
+        {
+          "type": "mission.created",
+          "missionId": "mission:command-oracle",
+          "projectId": "project:command-oracle",
+          "goal": "验证 Command/Decision/Effect 语义"
+        }
+      ],
+      "effects": [],
+      "stateVersionAfter": 1
+    },
+    {
+      "command": {
+        "type": "InstallPlan",
+        "nodes": [
+          {
+            "id": "a",
+            "title": "任务 A",
+            "kind": "task",
+            "dependsOn": [],
+            "agentDefinitionId": "agent:a"
+          },
+          {
+            "id": "b",
+            "title": "任务 B",
+            "kind": "task",
+            "dependsOn": [],
+            "agentDefinitionId": "agent:b",
+            "requiresApproval": true
+          },
+          {
+            "id": "join",
+            "title": "汇合验证",
+            "kind": "join",
+            "dependsOn": [
+              "a",
+              "b"
+            ],
+            "agentDefinitionId": "agent:verifier"
+          }
+        ]
+      },
+      "stateVersionBefore": 1,
+      "events": [
+        {
+          "type": "mission.plan-installed",
+          "nodes": [
+            {
+              "id": "a",
+              "title": "任务 A",
+              "kind": "task",
+              "dependsOn": [],
+              "agentDefinitionId": "agent:a"
+            },
+            {
+              "id": "b",
+              "title": "任务 B",
+              "kind": "task",
+              "dependsOn": [],
+              "agentDefinitionId": "agent:b",
+              "requiresApproval": true
+            },
+            {
+              "id": "join",
+              "title": "汇合验证",
+              "kind": "join",
+              "dependsOn": [
+                "a",
+                "b"
+              ],
+              "agentDefinitionId": "agent:verifier"
+            }
+          ]
+        }
+      ],
+      "effects": [],
+      "stateVersionAfter": 2
+    },
+    {
+      "command": {
+        "type": "StartNode",
+        "nodeId": "a",
+        "runId": "run:a"
+      },
+      "stateVersionBefore": 2,
+      "events": [
+        {
+          "type": "node.started",
+          "nodeId": "a",
+          "runId": "run:a"
+        }
+      ],
+      "effects": [
+        {
+          "kind": "agent-run.start",
+          "missionId": "mission:command-oracle",
+          "nodeId": "a",
+          "runId": "run:a"
+        }
+      ],
+      "stateVersionAfter": 3
+    },
+    {
+      "command": {
+        "type": "StartNode",
+        "nodeId": "b",
+        "runId": "run:b"
+      },
+      "stateVersionBefore": 3,
+      "events": [
+        {
+          "type": "node.started",
+          "nodeId": "b",
+          "runId": "run:b"
+        }
+      ],
+      "effects": [
+        {
+          "kind": "agent-run.start",
+          "missionId": "mission:command-oracle",
+          "nodeId": "b",
+          "runId": "run:b"
+        }
+      ],
+      "stateVersionAfter": 4
+    },
+    {
+      "command": {
+        "type": "SubmitNode",
+        "nodeId": "a",
+        "runId": "run:a",
+        "outputSummary": "任务 A 完成"
+      },
+      "stateVersionBefore": 4,
+      "events": [
+        {
+          "type": "node.submitted",
+          "nodeId": "a",
+          "runId": "run:a",
+          "outputSummary": "任务 A 完成"
+        }
+      ],
+      "effects": [
+        {
+          "kind": "agent-run.verify",
+          "missionId": "mission:command-oracle",
+          "nodeId": "a",
+          "runId": "run:a"
+        }
+      ],
+      "stateVersionAfter": 5
+    },
+    {
+      "command": {
+        "type": "RequestApproval",
+        "nodeId": "b",
+        "runId": "run:b",
+        "approvalId": "approval:run:b",
+        "action": "filesystem.write",
+        "reason": "任务 B 需要写入"
+      },
+      "stateVersionBefore": 5,
+      "events": [
+        {
+          "type": "approval.requested",
+          "approvalId": "approval:run:b",
+          "nodeId": "b",
+          "runId": "run:b",
+          "action": "filesystem.write",
+          "reason": "任务 B 需要写入"
+        }
+      ],
+      "effects": [],
+      "stateVersionAfter": 6
+    },
+    {
+      "command": {
+        "type": "AcceptNode",
+        "nodeId": "a",
+        "runId": "run:a"
+      },
+      "stateVersionBefore": 6,
+      "events": [
+        {
+          "type": "node.accepted",
+          "nodeId": "a",
+          "runId": "run:a"
+        }
+      ],
+      "effects": [],
+      "stateVersionAfter": 7
+    },
+    {
+      "command": {
+        "type": "ResolveApproval",
+        "approvalId": "approval:run:b",
+        "decision": "allow"
+      },
+      "stateVersionBefore": 7,
+      "events": [
+        {
+          "type": "approval.resolved",
+          "approvalId": "approval:run:b",
+          "decision": "allow"
+        }
+      ],
+      "effects": [
+        {
+          "kind": "agent-run.resume",
+          "missionId": "mission:command-oracle",
+          "nodeId": "b",
+          "runId": "run:b"
+        }
+      ],
+      "stateVersionAfter": 8
+    },
+    {
+      "command": {
+        "type": "SubmitNode",
+        "nodeId": "b",
+        "runId": "run:b",
+        "outputSummary": "任务 B 完成"
+      },
+      "stateVersionBefore": 8,
+      "events": [
+        {
+          "type": "node.submitted",
+          "nodeId": "b",
+          "runId": "run:b",
+          "outputSummary": "任务 B 完成"
+        }
+      ],
+      "effects": [
+        {
+          "kind": "agent-run.verify",
+          "missionId": "mission:command-oracle",
+          "nodeId": "b",
+          "runId": "run:b"
+        }
+      ],
+      "stateVersionAfter": 9
+    },
+    {
+      "command": {
+        "type": "AcceptNode",
+        "nodeId": "b",
+        "runId": "run:b"
+      },
+      "stateVersionBefore": 9,
+      "events": [
+        {
+          "type": "node.accepted",
+          "nodeId": "b",
+          "runId": "run:b"
+        }
+      ],
+      "effects": [],
+      "stateVersionAfter": 10
+    },
+    {
+      "command": {
+        "type": "StartNode",
+        "nodeId": "join",
+        "runId": "run:join"
+      },
+      "stateVersionBefore": 10,
+      "events": [
+        {
+          "type": "node.started",
+          "nodeId": "join",
+          "runId": "run:join"
+        }
+      ],
+      "effects": [
+        {
+          "kind": "agent-run.start",
+          "missionId": "mission:command-oracle",
+          "nodeId": "join",
+          "runId": "run:join"
+        }
+      ],
+      "stateVersionAfter": 11
+    },
+    {
+      "command": {
+        "type": "SubmitNode",
+        "nodeId": "join",
+        "runId": "run:join",
+        "outputSummary": "Join 完成"
+      },
+      "stateVersionBefore": 11,
+      "events": [
+        {
+          "type": "node.submitted",
+          "nodeId": "join",
+          "runId": "run:join",
+          "outputSummary": "Join 完成"
+        }
+      ],
+      "effects": [
+        {
+          "kind": "agent-run.verify",
+          "missionId": "mission:command-oracle",
+          "nodeId": "join",
+          "runId": "run:join"
+        }
+      ],
+      "stateVersionAfter": 12
+    },
+    {
+      "command": {
+        "type": "AcceptNode",
+        "nodeId": "join",
+        "runId": "run:join"
+      },
+      "stateVersionBefore": 12,
+      "events": [
+        {
+          "type": "node.accepted",
+          "nodeId": "join",
+          "runId": "run:join"
+        }
+      ],
+      "effects": [],
+      "stateVersionAfter": 13
+    },
+    {
+      "command": {
+        "type": "CompleteMission"
+      },
+      "stateVersionBefore": 13,
+      "events": [
+        {
+          "type": "mission.completed"
+        }
+      ],
+      "effects": [],
+      "stateVersionAfter": 14
+    }
+  ],
+  "finalState": {
+    "missionId": "mission:command-oracle",
+    "projectId": "project:command-oracle",
+    "goal": "验证 Command/Decision/Effect 语义",
+    "status": "completed",
+    "version": 14,
+    "nodes": {
+      "a": {
+        "id": "a",
+        "title": "任务 A",
+        "kind": "task",
+        "dependsOn": [],
+        "agentDefinitionId": "agent:a",
+        "status": "accepted",
+        "runId": "run:a",
+        "outputSummary": "任务 A 完成"
+      },
+      "b": {
+        "id": "b",
+        "title": "任务 B",
+        "kind": "task",
+        "dependsOn": [],
+        "agentDefinitionId": "agent:b",
+        "requiresApproval": true,
+        "status": "accepted",
+        "runId": "run:b",
+        "approvalId": "approval:run:b",
+        "outputSummary": "任务 B 完成"
+      },
+      "join": {
+        "id": "join",
+        "title": "汇合验证",
+        "kind": "join",
+        "dependsOn": [
+          "a",
+          "b"
+        ],
+        "agentDefinitionId": "agent:verifier",
+        "status": "accepted",
+        "runId": "run:join",
+        "outputSummary": "Join 完成"
+      }
+    },
+    "runs": {
+      "run:a": {
+        "id": "run:a",
+        "nodeId": "a",
+        "agentDefinitionId": "agent:a",
+        "endpointId": "endpoint:agent:a",
+        "attempt": 1,
+        "status": "accepted"
+      },
+      "run:b": {
+        "id": "run:b",
+        "nodeId": "b",
+        "agentDefinitionId": "agent:b",
+        "endpointId": "endpoint:agent:b",
+        "attempt": 1,
+        "status": "accepted"
+      },
+      "run:join": {
+        "id": "run:join",
+        "nodeId": "join",
+        "agentDefinitionId": "agent:verifier",
+        "endpointId": "endpoint:agent:verifier",
+        "attempt": 1,
+        "status": "accepted"
+      }
+    },
+    "approvals": {
+      "approval:run:b": {
+        "id": "approval:run:b",
+        "nodeId": "b",
+        "runId": "run:b",
+        "action": "filesystem.write",
+        "reason": "任务 B 需要写入",
+        "status": "allowed"
+      }
+    }
+  }
+}

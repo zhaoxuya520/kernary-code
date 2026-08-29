@@ -1,0 +1,78 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/harness-types",
+    "crates/harness-kernel",
+    "crates/harness-testkit",
+    "crates/harness-storage",
+    "crates/harness-event",
+    "crates/harness-application",
+    "crates/harness-context",
+    "crates/harness-config",
+    "crates/harness-cache",
+    "crates/harness-model",
+    "crates/harness-auth",
+    "crates/harness-agent",
+    "crates/harness-browser",
+    "crates/harness-provider-openai",
+    "crates/harness-codex",
+    "crates/harness-http",
+    "crates/harness-provider-compatible",
+    "crates/harness-provider-anthropic",
+    "crates/harness-provider-catalog",
+    "crates/harness-provider-runtime",
+    "crates/harness-permission",
+    "crates/harness-tool",
+    "crates/harness-builtin-tools",
+    "crates/harness-mcp",
+    "crates/harness-memory",
+    "crates/harness-lsp",
+    "crates/harness-lsp-patch",
+    "crates/harness-plugin",
+    "crates/harness-skill",
+    "crates/harness-terminal",
+    "bins/harness",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+authors = ["Harness Contributors"]
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+proptest = "1.7"
+rusqlite = { version = "0.37", features = ["backup", "bundled"] }
+tempfile = "3.27"
+clap = { version = "4.5", features = ["derive"] }
+clap_complete = "=4.6.9"
+clap_mangen = "=0.3.3"
+crossterm = "0.29"
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm_0_29"] }
+unicode-normalization = "0.1"
+ureq = { version = "3.4", features = ["json", "platform-verifier"] }
+keyring = { version = "4.1", features = ["v1"] }
+process-wrap = { version = "9.1", default-features = false, features = ["std", "job-object", "process-group"] }
+semver = "1.0"
+toml = "0.9"
+getrandom = "0.3"
+url = "2.5"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"

@@ -1,0 +1,20 @@
+[package]
+name = "harness-kernel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Deterministic command/event/reducer core for Harness"
+
+[dependencies]
+harness-types = { path = "../harness-types" }
+serde.workspace = true
+
+[dev-dependencies]
+harness-testkit = { path = "../harness-testkit" }
+serde_json.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "harness-provider-anthropic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Anthropic Messages API streaming adapter for Harness"
+
+[dependencies]
+harness-auth = { path = "../harness-auth" }
+harness-http = { path = "../harness-http" }
+harness-model = { path = "../harness-model" }
+harness-types = { path = "../harness-types" }
+serde_json.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true
