@@ -1970,7 +1970,11 @@ fn sandbox_danger_and_network_access_require_explicit_confirmation() {
     let stdout = String::from_utf8(output.stdout).expect("stdout");
     assert!(stdout.contains("请使用 `/sandbox network-on`"));
     assert!(stdout.contains("sandbox.network-access=true"));
-    assert!(stdout.contains("Network boundary: allowed"));
+    if cfg!(any(windows, target_os = "linux")) {
+        assert!(stdout.contains("Network boundary: allowed"));
+    } else {
+        assert!(stdout.contains("Network boundary: unavailable"));
+    }
 
     let resumed = kernary()
         .current_dir(network.path())
