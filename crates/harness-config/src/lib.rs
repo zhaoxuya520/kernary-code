@@ -91,21 +91,30 @@ pub enum LogLevel {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PermissionMode {
-    Safe,
     #[default]
-    Ask,
+    Manual,
+    AcceptEdits,
     Auto,
     Full,
+    Bypass,
+    /// 旧版兼容别名：等价于 Manual。
+    Safe,
+    /// 旧版兼容别名：等价于 Auto。
+    Ask,
+    /// 旧版自定义规则模式。
     Custom,
 }
 
 impl Display for PermissionMode {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::Safe => "safe",
-            Self::Ask => "ask",
+            Self::Manual => "manual",
+            Self::AcceptEdits => "accept-edits",
             Self::Auto => "auto",
             Self::Full => "full",
+            Self::Bypass => "bypass",
+            Self::Safe => "safe",
+            Self::Ask => "ask",
             Self::Custom => "custom",
         })
     }
@@ -248,7 +257,7 @@ impl Default for EffectiveSettings {
             vector_mode: VectorMode::Auto,
             trace_enabled: false,
             log_level: LogLevel::Info,
-            permission_mode: PermissionMode::Ask,
+            permission_mode: PermissionMode::Manual,
             failover_enabled: false,
             failover_cost_confirmed: false,
             failover_targets: String::new(),
@@ -595,6 +604,25 @@ impl ConfigManager {
         Ok(())
     }
 
+    pub fn replace_session(
+        &mut self,
+        values: &BTreeMap<String, String>,
+    ) -> Result<(), ConfigError> {
+        let previous = self.session.clone();
+        self.session = SettingsPatch::default();
+        for (key, value) in values {
+            if let Err(error) = set_patch_value(&mut self.session, key, value) {
+                self.session = previous;
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.validate_effective() {
+            self.session = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn set_runtime(&mut self, key: &str, value: &str) -> Result<(), ConfigError> {
         let previous = self.runtime.clone();
         set_patch_value(&mut self.runtime, key, value)?;
@@ -922,6 +950,9 @@ fn parse_log_level(value: &str) -> Result<LogLevel, ConfigError> {
 
 fn parse_permission_mode(value: &str) -> Result<PermissionMode, ConfigError> {
     match value {
+        "manual" | "default" => Ok(PermissionMode::Manual),
+        "accept-edits" | "edit" => Ok(PermissionMode::AcceptEdits),
+        "bypass" => Ok(PermissionMode::Bypass),
         "safe" => Ok(PermissionMode::Safe),
         "ask" => Ok(PermissionMode::Ask),
         "auto" => Ok(PermissionMode::Auto),
@@ -1057,6 +1088,42 @@ mod tests {
                 .expect_err("invalid language")
                 .code,
             "config-language-invalid"
+        );
+    }
+
+    #[test]
+    fn permission_levels_and_session_replacement_are_strict() {
+        let mut manager = ConfigManager::default();
+        assert_eq!(
+            manager.effective().settings.permission_mode,
+            PermissionMode::Manual
+        );
+        for (value, expected) in [
+            ("manual", PermissionMode::Manual),
+            ("edit", PermissionMode::AcceptEdits),
+            ("auto", PermissionMode::Auto),
+            ("full", PermissionMode::Full),
+            ("bypass", PermissionMode::Bypass),
+        ] {
+            manager
+                .replace_session(&BTreeMap::from([(
+                    "permissions.mode".to_owned(),
+                    value.to_owned(),
+                )]))
+                .expect("replace session");
+            assert_eq!(manager.effective().settings.permission_mode, expected);
+        }
+        assert!(
+            manager
+                .replace_session(&BTreeMap::from([(
+                    "permissions.mode".to_owned(),
+                    "danger".to_owned(),
+                )]))
+                .is_err()
+        );
+        assert_eq!(
+            manager.effective().settings.permission_mode,
+            PermissionMode::Bypass
         );
     }
 }

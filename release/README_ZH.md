@@ -69,7 +69,13 @@ kernary models --refresh ollama
 
 ## Mode、Config 与 Permission
 
-把 `examples/kernary.toml` 复制到项目根目录即可设置 Project 层。运行中可使用 `/config` 查看每项来源，使用 `/mode`、`/settings` 和 `/permissions` 写 Session 或 Runtime 层。`full` 也不能绕过 denied roots、Sandbox allowlist 或 Workspace Patch 强制二次审批。
+把 `examples/kernary.toml` 复制到项目根目录即可设置 Project 层。运行中可使用 `/config` 查看每项来源，使用 `/mode`、`/settings` 和 `/permissions` 写 Session 或 Runtime 层。权限分为 `manual`、`edit`、`auto`、`full`、`bypass`；TUI 使用 Shift+Tab 在前四级循环，最高 `bypass` 必须显式确认，任何等级都不能绕过 denied roots、Sandbox allowlist 或项目边界。
+
+## Session 与私有辅助状态
+
+`kernary` 每次创建新 Session；`kernary -c` 继续当前项目最近会话，`kernary -r [id-or-title]` 从当前项目选择恢复。会话内使用 `/session`、`/session new`、`/session switch` 和 `/session rename`。标题由第一条有效对话本地生成，完整 Transcript 不随 Context 压缩删除。
+
+项目私有指令位于 `.harness/agent.md`，不存在时才读取全局 `~/.kernary/agent.md`；使用 `/agentmd` 管理。向量配置位于 `.harness/vector.toml`，Memory/Repository/Vector SQLite 也全部位于 `.harness/`。Kernary 自动写入 `.git/info/exclude`，这些辅助文件默认不会进入 Git。
 
 细粒度规则可从 `examples/kernary.permissions.toml` 开始，也可使用：
 

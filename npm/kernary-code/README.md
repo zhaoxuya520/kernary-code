@@ -16,6 +16,8 @@ Use `/provider add` for a custom OpenAI-compatible endpoint (URL → secure key 
 
 Kernary includes 15 sleeping-by-default agents. `/team adaptive <1..4> <objective>` builds a capability-routed evidence DAG with Requirements, Explorer, Architect, Planner, Coder workers, Reviewer, and Tester; Security, Performance, and Release gates are added only when the objective requires them. Each specialist receives an isolated context, a minimal tool view, and a role-specific evidence contract.
 
+Running `kernary` creates a new project-local session. Use `kernary -c`, `kernary -r [id-or-title]`, or `/session` to resume/switch only within the current folder. The first user turn creates a local title and the immutable transcript survives context compaction. Permission levels are `manual`, `edit`, `auto`, `full`, and explicitly confirmed `bypass`. Project-private `.harness/agent.md` overrides global `~/.kernary/agent.md`; vector configuration and data live only under `.harness/` and are protected by local Git excludes.
+
 The package installs a native binary selected by npm for Windows x64 or Linux x64 glibc. It does not download executables during `postinstall`.
 
 Source, documentation and checksums: https://github.com/zhaoxuya520/kernary-code

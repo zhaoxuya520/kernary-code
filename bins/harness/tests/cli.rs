@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use harness_memory::VectorProviderConfig;
 use rusqlite::OptionalExtension;
 use tempfile::tempdir;
 
@@ -102,7 +103,7 @@ fn legacy_persisted_fake_selection_migrates_to_unconfigured_without_data_loss() 
 
     let mut migrated = kernary_without_test_model()
         .current_dir(temporary.path())
-        .args(["--ui", "plain", "--ascii"])
+        .args(["--ui", "plain", "--ascii", "-c"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -507,7 +508,7 @@ fn kernary_is_primary_harness_is_alias_and_both_share_durable_session() {
 
     let mut primary = kernary()
         .current_dir(temporary.path())
-        .args(["--ui", "plain", "--ascii"])
+        .args(["--ui", "plain", "--ascii", "-c"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -528,6 +529,94 @@ fn kernary_is_primary_harness_is_alias_and_both_share_durable_session() {
     assert!(stdout.contains("推理 high"), "stdout={stdout}");
     assert!(temporary.path().join(".harness/kernel.sqlite").is_file());
     assert!(!temporary.path().join(".kernary").exists());
+}
+
+#[test]
+fn interactive_launch_creates_project_local_sessions_and_resume_never_crosses_folders() {
+    let project_a = tempdir().expect("project a");
+    for prompt in ["build auth feature", "fix cache regression"] {
+        let mut child = kernary()
+            .current_dir(project_a.path())
+            .args(["--ui", "plain", "--ascii"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn session");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(format!("{prompt}\n/exit\n").as_bytes())
+            .expect("write session");
+        assert!(
+            child
+                .wait_with_output()
+                .expect("session output")
+                .status
+                .success()
+        );
+    }
+
+    let mut list = kernary()
+        .current_dir(project_a.path())
+        .args(["--ui", "plain", "--ascii", "-c"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("continue latest");
+    list.stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"/sessions\n/exit\n")
+        .expect("list");
+    let output = list.wait_with_output().expect("list output");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("Sessions | 2"), "stdout={stdout}");
+    assert!(stdout.contains("build auth feature"), "stdout={stdout}");
+    assert!(stdout.contains("fix cache regression"), "stdout={stdout}");
+    let first_id = stdout
+        .lines()
+        .find(|line| line.contains("build auth feature | session:"))
+        .and_then(|line| line.split(" | ").nth(1))
+        .and_then(|tail| tail.split_whitespace().next())
+        .expect("first session id")
+        .to_owned();
+
+    let mut resumed = kernary()
+        .current_dir(project_a.path())
+        .args(["--ui", "plain", "--ascii", "-r", &first_id])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("resume by id");
+    resumed
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"/status\n/exit\n")
+        .expect("resume commands");
+    let resumed = resumed.wait_with_output().expect("resume output");
+    assert!(resumed.status.success());
+    assert!(
+        String::from_utf8_lossy(&resumed.stdout).contains("build auth feature"),
+        "stdout={}",
+        String::from_utf8_lossy(&resumed.stdout)
+    );
+
+    let project_b = tempdir().expect("project b");
+    let isolated = kernary()
+        .current_dir(project_b.path())
+        .args(["--ui", "plain", "--ascii", "-r", &first_id])
+        .output()
+        .expect("cross-project resume");
+    assert!(!isolated.status.success());
+    assert!(
+        String::from_utf8_lossy(&isolated.stderr).contains("当前项目没有可恢复的 Session")
+            || String::from_utf8_lossy(&isolated.stderr).contains("不存在 Session"),
+        "stderr={}",
+        String::from_utf8_lossy(&isolated.stderr)
+    );
 }
 
 #[test]
@@ -1031,7 +1120,7 @@ fn plain_mode_accepts_slash_commands_from_stdin() {
     let output = child.wait_with_output().expect("wait plain harness");
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
-    assert!(stdout.contains("会话  session:default"));
+    assert!(stdout.contains("会话  未命名会话 | session:"));
     assert!(stdout.contains("模型      未配置"));
     assert!(
         stdout.contains("模型  未配置 | 推理 max"),
@@ -1177,7 +1266,7 @@ fn plain_mode_can_checkpoint_and_compact_real_context() {
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
     assert!(stdout.contains("Checkpoint checkpoint:"));
     assert!(stdout.contains("Forked child session:child"));
-    assert!(stdout.contains("parent session:default unchanged"));
+    assert!(stdout.contains("parent session:") && stdout.contains(" unchanged"));
     assert!(stdout.contains("Rolled back into new series"));
     assert!(stdout.contains("Context compacted Safe"));
     assert!(stdout.contains("Recovery 2 checkpoint(s)"));
@@ -1275,7 +1364,7 @@ fn git_status_runs_through_allowlisted_process_tool() {
     let mut child = harness()
         .current_dir(temporary.path())
         .env("HARNESS_GIT_EXECUTABLE", &git)
-        .args(["--ui", "plain", "--ascii"])
+        .args(["--ui", "plain", "--ascii", "--permission-mode", "full"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -1445,6 +1534,67 @@ entry = "SKILL.md"
 }
 
 #[test]
+fn agent_md_project_override_and_private_git_excludes_are_enforced() {
+    let project = tempdir().expect("project");
+    let global = tempdir().expect("global");
+    std::fs::write(global.path().join("agent.md"), "GLOBAL-INSTRUCTION").expect("global agent md");
+    if let Some(git) = git_executable() {
+        let initialized = Command::new(git)
+            .args(["init", "--quiet"])
+            .current_dir(project.path())
+            .status()
+            .expect("git init");
+        assert!(initialized.success());
+    }
+
+    let run = |expected: &str| {
+        let mut child = kernary()
+            .current_dir(project.path())
+            .env("KERNARY_HOME", global.path())
+            .args(["--ui", "plain", "--ascii"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(b"/agentmd status\n/agentmd show\n/exit\n")
+            .expect("commands");
+        let output = child.wait_with_output().expect("output");
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).expect("stdout");
+        assert!(stdout.contains(expected), "stdout={stdout}");
+        stdout
+    };
+
+    let global_output = run("GLOBAL-INSTRUCTION");
+    assert!(global_output.contains("scope=global"));
+    std::fs::write(
+        project.path().join(".harness/agent.md"),
+        "PROJECT-INSTRUCTION",
+    )
+    .expect("project agent md");
+    let project_output = run("PROJECT-INSTRUCTION");
+    assert!(project_output.contains("scope=project"));
+    assert!(!project_output.contains("GLOBAL-INSTRUCTION"));
+    assert!(!project.path().join("agent.md").exists());
+
+    let exclude = project.path().join(".git/info/exclude");
+    if exclude.is_file() {
+        let exclude = std::fs::read_to_string(exclude).expect("exclude");
+        assert!(exclude.lines().any(|line| line.trim() == "/.harness/"));
+        assert!(
+            exclude
+                .lines()
+                .any(|line| line.trim() == "/kernary.vector.toml")
+        );
+        assert!(exclude.lines().any(|line| line.trim() == "/agent.md"));
+    }
+}
+
+#[test]
 fn memory_repository_and_vector_off_commands_work_without_embedding_model() {
     let temporary = tempdir().expect("tempdir");
     std::fs::create_dir_all(temporary.path().join("src")).expect("src");
@@ -1494,6 +1644,46 @@ fn memory_repository_and_vector_off_commands_work_without_embedding_model() {
         .expect("schema query");
     assert!(vector_table.is_none());
     assert!(!temporary.path().join(".harness/vector").exists());
+}
+
+#[test]
+fn vector_configuration_and_projection_are_project_private_auxiliary_state() {
+    let temporary = tempdir().expect("tempdir");
+    let state = temporary.path().join(".harness");
+    std::fs::create_dir_all(&state).expect("state");
+    VectorProviderConfig::new(
+        "https://embedding.example/v1/embeddings",
+        "embed-private",
+        16,
+        42,
+    )
+    .expect("config")
+    .save(state.join("vector.toml"))
+    .expect("save private vector config");
+    let mut child = kernary()
+        .current_dir(temporary.path())
+        .args(["--ui", "plain", "--ascii"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"/vector status\n/session new\n/exit\n")
+        .expect("commands");
+    let output = child.wait_with_output().expect("output");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("embed-private"), "stdout={stdout}");
+    assert!(
+        stdout.contains("Vector | 已配置（项目私有）"),
+        "stdout={stdout}"
+    );
+    assert!(state.join("vector.toml").is_file());
+    assert!(state.join("memory.sqlite").is_file());
+    assert!(!temporary.path().join("kernary.vector.toml").exists());
 }
 
 #[test]
@@ -1616,7 +1806,8 @@ fn permission_modes_are_durable_visible_and_keep_sandbox_hard_boundaries() {
         "stdout={stdout}"
     );
     assert!(
-        stdout.contains("Sandbox hard denies") && stdout.contains("WorkspacePatch second approval"),
+        stdout.contains("Sandbox hard denies")
+            && stdout.contains("only bypass removes the WorkspacePatch confirmation"),
         "stdout={stdout}"
     );
 
@@ -1644,6 +1835,68 @@ fn permission_modes_are_durable_visible_and_keep_sandbox_hard_boundaries() {
         stdout.contains("Approval policy: Always"),
         "stdout={stdout}"
     );
+}
+
+#[test]
+fn cli_permission_levels_require_explicit_bypass_confirmation() {
+    let temporary = tempdir().expect("tempdir");
+    let denied = kernary()
+        .current_dir(temporary.path())
+        .args(["--ui", "plain", "--permission-mode", "bypass"])
+        .output()
+        .expect("unconfirmed bypass");
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("--confirm-bypass"));
+
+    let prompt_project = tempdir().expect("prompt project");
+    let mut prompted = kernary()
+        .current_dir(prompt_project.path())
+        .args(["--ui", "plain", "--ascii"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("prompted bypass");
+    prompted
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"/permissions bypass\nI UNDERSTAND BYPASS\n/permissions\n/exit\n")
+        .expect("bypass confirmation");
+    let prompted = prompted.wait_with_output().expect("prompted output");
+    assert!(prompted.status.success());
+    let prompted_stdout = String::from_utf8(prompted.stdout).expect("stdout");
+    assert!(prompted_stdout.contains("Setup: 确认最高权限模式"));
+    assert!(prompted_stdout.contains("BypassWithinSandbox"));
+
+    for (mode, policy, extra) in [
+        ("manual", "Always", false),
+        ("edit", "CommandsOnly", false),
+        ("auto", "OnRequest", false),
+        ("full", "NeverWithinSandbox", false),
+        ("bypass", "BypassWithinSandbox", true),
+    ] {
+        let mode_project = tempdir().expect("mode project");
+        let mut command = kernary();
+        command
+            .current_dir(mode_project.path())
+            .args(["--ui", "plain", "--ascii", "--permission-mode", mode])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        if extra {
+            command.arg("--confirm-bypass");
+        }
+        let mut child = command.spawn().expect("mode process");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(b"/permissions\n/exit\n")
+            .expect("commands");
+        let output = child.wait_with_output().expect("mode output");
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).expect("stdout");
+        assert!(stdout.contains(policy), "mode={mode} stdout={stdout}");
+    }
 }
 
 #[test]
@@ -1931,10 +2184,7 @@ fn session_goal_reset_and_forget_control_plane_is_durable_and_recoverable() {
     );
     assert!(stdout.contains("retained="), "stdout={stdout}");
     assert!(stdout.contains("Sessions | 2"), "stdout={stdout}");
-    assert!(
-        stdout.contains("session:default [current]"),
-        "stdout={stdout}"
-    );
+    assert!(stdout.contains("[current]"), "stdout={stdout}");
     assert!(stdout.contains("session:child-control"), "stdout={stdout}");
     assert!(stdout.contains("目标  <empty>"), "stdout={stdout}");
     assert!(

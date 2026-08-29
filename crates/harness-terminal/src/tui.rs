@@ -175,8 +175,14 @@ fn activity_lines(
     lines
 }
 
-fn onboarding_lines(pack: &LanguagePack, theme: ProductTheme, ascii: bool) -> Vec<Line<'static>> {
-    vec![
+fn onboarding_lines(
+    pack: &LanguagePack,
+    theme: ProductTheme,
+    ascii: bool,
+    model_configured: bool,
+    vector_configured: bool,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
         Line::default(),
         Line::from(Span::styled(
             compact_mark(ascii).to_owned(),
@@ -185,26 +191,47 @@ fn onboarding_lines(pack: &LanguagePack, theme: ProductTheme, ascii: bool) -> Ve
         Line::styled(TAGLINE.to_owned(), theme.muted),
         Line::default(),
         Line::from(Span::styled(
-            pack.onboarding_title.to_owned(),
+            if model_configured {
+                pack.new_session_title.to_owned()
+            } else {
+                pack.onboarding_title.to_owned()
+            },
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::default(),
-        Line::from(vec![
-            Span::styled("/provider add", theme.accent.add_modifier(Modifier::BOLD)),
+    ];
+    if !model_configured {
+        lines.extend([
+            Line::from(vec![
+                Span::styled("/provider add", theme.accent.add_modifier(Modifier::BOLD)),
+                Span::styled("   ", theme.muted),
+                Span::raw(pack.add_provider_action.to_owned()),
+            ]),
+            Line::from(vec![
+                Span::styled("/connect", theme.accent.add_modifier(Modifier::BOLD)),
+                Span::styled("        ", theme.muted),
+                Span::raw(pack.connect_provider_action.to_owned()),
+            ]),
+        ]);
+    }
+    if !vector_configured {
+        lines.push(Line::from(vec![
+            Span::styled("/vector setup", theme.accent.add_modifier(Modifier::BOLD)),
             Span::styled("   ", theme.muted),
-            Span::raw(pack.add_provider_action.to_owned()),
-        ]),
-        Line::from(vec![
-            Span::styled("/connect", theme.accent.add_modifier(Modifier::BOLD)),
-            Span::styled("        ", theme.muted),
-            Span::raw(pack.connect_provider_action.to_owned()),
-        ]),
-        Line::from(vec![
-            Span::styled("/", theme.accent.add_modifier(Modifier::BOLD)),
-            Span::styled("               ", theme.muted),
-            Span::raw(pack.browse_commands_action.to_owned()),
-        ]),
-    ]
+            Span::raw(pack.vector_setup_action.to_owned()),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("/agentmd status", theme.accent.add_modifier(Modifier::BOLD)),
+        Span::styled("  ", theme.muted),
+        Span::raw(pack.agent_md_action.to_owned()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("/", theme.accent.add_modifier(Modifier::BOLD)),
+        Span::styled("               ", theme.muted),
+        Span::raw(pack.browse_commands_action.to_owned()),
+    ]));
+    lines
 }
 
 fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
@@ -218,14 +245,17 @@ fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
 /// TUI 顶部/状态栏需要的只读快照。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalSnapshot {
+    pub session_title: String,
     pub model: String,
     pub model_configured: bool,
     pub language: UiLanguage,
     pub mode: String,
+    pub permission_mode: String,
     pub reasoning: String,
     pub context_percent: u8,
     pub cache_percent: Option<u8>,
     pub agents: usize,
+    pub vector_configured: bool,
     pub project: String,
     pub branch: Option<String>,
     pub statusbar_visible: bool,
@@ -269,6 +299,12 @@ pub trait TerminalBackend {
         Vec::new()
     }
     fn poll(&mut self) -> BackendResponse {
+        BackendResponse::default()
+    }
+    fn initial_history(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn cycle_permission_mode(&mut self) -> BackendResponse {
         BackendResponse::default()
     }
 }
@@ -673,6 +709,11 @@ fn render_product_tui(frame: &mut Frame<'_>, view: TuiView<'_>) -> usize {
         ),
         Span::raw("  "),
         Span::styled(project, Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled("  /  ", theme.muted),
+        Span::styled(
+            middle_truncate(&view.snapshot.session_title, 32),
+            theme.muted,
+        ),
     ];
     if let Some(branch) = &view.snapshot.branch {
         identity.extend([
@@ -720,6 +761,9 @@ fn render_product_tui(frame: &mut Frame<'_>, view: TuiView<'_>) -> usize {
             Span::styled("  ·  ", theme.muted),
             Span::styled(format!("{} ", view.pack.mode_label), theme.muted),
             Span::raw(view.snapshot.mode.clone()),
+            Span::styled("  ·  ", theme.muted),
+            Span::styled(format!("{} ", view.pack.permission_label), theme.muted),
+            Span::raw(view.snapshot.permission_mode.clone()),
         ]);
     }
     if area.width >= 108 {
@@ -727,6 +771,24 @@ fn render_product_tui(frame: &mut Frame<'_>, view: TuiView<'_>) -> usize {
             Span::styled("  ·  ", theme.muted),
             Span::styled(format!("{} ", view.pack.reasoning_label), theme.muted),
             Span::raw(view.snapshot.reasoning.clone()),
+        ]);
+    }
+    if area.width >= 118 {
+        runtime.extend([
+            Span::styled("  ·  ", theme.muted),
+            Span::styled(format!("{} ", view.pack.vector_label), theme.muted),
+            Span::styled(
+                if view.snapshot.vector_configured {
+                    view.pack.vector_configured_label
+                } else {
+                    view.pack.vector_unconfigured_label
+                },
+                if view.snapshot.vector_configured {
+                    theme.success
+                } else {
+                    theme.muted
+                },
+            ),
         ]);
     }
     let bar_width = if area.width >= 90 { 10 } else { 6 };
@@ -766,8 +828,14 @@ fn render_product_tui(frame: &mut Frame<'_>, view: TuiView<'_>) -> usize {
         chunks[0],
     );
 
-    let transcript_lines = if view.show_onboarding && !view.snapshot.model_configured {
-        onboarding_lines(view.pack, theme, view.options.ascii)
+    let transcript_lines = if view.show_onboarding {
+        onboarding_lines(
+            view.pack,
+            theme,
+            view.options.ascii,
+            view.snapshot.model_configured,
+            view.snapshot.vector_configured,
+        )
     } else {
         activity_lines(view.history, theme, view.pack)
     };
@@ -883,6 +951,8 @@ fn render_product_tui(frame: &mut Frame<'_>, view: TuiView<'_>) -> usize {
         if area.width >= 92 {
             footer.push_str(separator);
             footer.push_str(view.pack.scroll_hint);
+            footer.push_str(separator);
+            footer.push_str(view.pack.permission_cycle_hint);
             if let Some(cache) = view.snapshot.cache_percent {
                 footer.push_str(separator);
                 footer.push_str(view.pack.cache_label);
@@ -988,7 +1058,7 @@ pub fn run_tui<B: TerminalBackend>(
         ascii: options.ascii,
         color: options.color,
     });
-    let mut history = Vec::<String>::new();
+    let mut history = backend.initial_history();
     let mut input = LineEditor::default();
     let mut command_history = Vec::<String>::new();
     let mut history_cursor: Option<usize> = None;
@@ -1001,8 +1071,7 @@ pub fn run_tui<B: TerminalBackend>(
     let mut secret_input = LineEditor::default();
     let mut input_prompt: Option<InputPrompt> = None;
 
-    let initial_snapshot = backend.snapshot();
-    let mut show_onboarding = !initial_snapshot.model_configured;
+    let mut show_onboarding = history.is_empty();
     let mut transcript_scroll = 0usize;
 
     loop {
@@ -1323,6 +1392,12 @@ pub fn run_tui<B: TerminalBackend>(
                     .checked_sub(1)
                     .unwrap_or(suggestions.len() - 1);
             }
+            KeyCode::BackTab => {
+                let response = backend.cycle_permission_mode();
+                for line in response.lines {
+                    push_activity(&mut history, renderer.sanitize(&line));
+                }
+            }
             KeyCode::Up => {
                 if !suggestions.is_empty() {
                     suggestion_cursor = suggestion_cursor
@@ -1456,6 +1531,7 @@ mod tests {
 
     fn snapshot(model_configured: bool) -> TerminalSnapshot {
         TerminalSnapshot {
+            session_title: "Product session".to_owned(),
             model: if model_configured {
                 "openai/gpt-product".to_owned()
             } else {
@@ -1464,10 +1540,12 @@ mod tests {
             model_configured,
             language: UiLanguage::ZhCn,
             mode: "balanced".to_owned(),
+            permission_mode: "manual".to_owned(),
             reasoning: "medium".to_owned(),
             context_percent: 42,
             cache_percent: Some(75),
             agents: usize::from(model_configured),
+            vector_configured: false,
             project: "C:/workspace/kernary-demo".to_owned(),
             branch: Some("feature/product-ui".to_owned()),
             statusbar_visible: true,

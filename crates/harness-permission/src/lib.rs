@@ -19,8 +19,10 @@ use serde::{Deserialize, Serialize};
 pub enum ApprovalPolicy {
     UntrustedOnly,
     OnRequest,
+    CommandsOnly,
     Always,
     NeverWithinSandbox,
+    BypassWithinSandbox,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -535,13 +537,32 @@ impl PermissionEngine {
         let agent_high_risk = envelope.origin != InvocationOrigin::User
             && matches!(risk_of(&action), RiskLevel::High | RiskLevel::Critical);
         let mandatory_workspace_patch =
-            matches!(action, PermissionAction::WorkspacePatchApply { .. });
+            matches!(action, PermissionAction::WorkspacePatchApply { .. })
+                && self.approval_policy != ApprovalPolicy::BypassWithinSandbox;
+        let command_or_external = matches!(
+            action,
+            PermissionAction::ProcessSpawn { .. }
+                | PermissionAction::NetworkConnect { .. }
+                | PermissionAction::BrowserOpen { .. }
+                | PermissionAction::BrowserAct { .. }
+                | PermissionAction::BrowserUpload { .. }
+                | PermissionAction::BrowserDownload { .. }
+                | PermissionAction::McpCall {
+                    side_effect: true,
+                    ..
+                }
+                | PermissionAction::PluginCall {
+                    side_effect: true,
+                    ..
+                }
+        );
         let policy_requests = mandatory_workspace_patch
             || matches!(
                 matching_rule.map(|rule| rule.effect),
                 Some(PermissionRuleEffect::Ask)
             )
             || self.approval_policy == ApprovalPolicy::Always
+            || (self.approval_policy == ApprovalPolicy::CommandsOnly && command_or_external)
             || (self.approval_policy == ApprovalPolicy::UntrustedOnly
                 && envelope.information_flow.integrity == harness_types::IntegrityLabel::Untrusted)
             || (self.approval_policy == ApprovalPolicy::OnRequest
@@ -1303,6 +1324,78 @@ mod tests {
             )
             .expect("outside");
         assert!(matches!(outside, PermissionDecision::RequestApproval(_)));
+    }
+
+    #[test]
+    fn commands_only_and_bypass_have_distinct_confirm_boundaries() {
+        let temporary = tempdir().expect("tempdir");
+        let root = temporary.path().to_path_buf();
+        let executable = root.join("tool.exe");
+        let mut profile = workspace_write_profile(root.clone());
+        profile.subprocess.allowed_executables = vec![executable.clone()];
+        let mut edit_mode = PermissionEngine::new(profile.clone(), ApprovalPolicy::CommandsOnly);
+        assert!(matches!(
+            edit_mode
+                .evaluate(
+                    PermissionAction::FilesystemWrite {
+                        path: root.join("src/main.rs"),
+                    },
+                    &envelope("run:edit"),
+                    PermissionRequestId::from("approval:edit"),
+                    1,
+                )
+                .expect("edit decision"),
+            PermissionDecision::Allow { .. }
+        ));
+        assert!(matches!(
+            edit_mode
+                .evaluate(
+                    PermissionAction::ProcessSpawn {
+                        executable,
+                        arguments: vec!["test".to_owned()],
+                        cwd: root.clone(),
+                    },
+                    &envelope("run:command"),
+                    PermissionRequestId::from("approval:command"),
+                    2,
+                )
+                .expect("command decision"),
+            PermissionDecision::RequestApproval(_)
+        ));
+
+        let mut full = PermissionEngine::new(profile.clone(), ApprovalPolicy::NeverWithinSandbox);
+        assert!(matches!(
+            full.evaluate(
+                PermissionAction::WorkspacePatchApply {
+                    operation: "apply".to_owned(),
+                    preview_id: "preview:1".to_owned(),
+                    preview_fingerprint: "sha256:test".to_owned(),
+                    paths: vec![root.join("src/main.rs")],
+                },
+                &envelope("run:full"),
+                PermissionRequestId::from("approval:full"),
+                3,
+            )
+            .expect("full decision"),
+            PermissionDecision::RequestApproval(_)
+        ));
+        let mut bypass = PermissionEngine::new(profile, ApprovalPolicy::BypassWithinSandbox);
+        assert!(matches!(
+            bypass
+                .evaluate(
+                    PermissionAction::WorkspacePatchApply {
+                        operation: "apply".to_owned(),
+                        preview_id: "preview:2".to_owned(),
+                        preview_fingerprint: "sha256:test".to_owned(),
+                        paths: vec![root.join("src/main.rs")],
+                    },
+                    &envelope("run:bypass"),
+                    PermissionRequestId::from("approval:bypass"),
+                    4,
+                )
+                .expect("bypass decision"),
+            PermissionDecision::Allow { .. }
+        ));
     }
 
     #[test]

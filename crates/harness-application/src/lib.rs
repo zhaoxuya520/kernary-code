@@ -44,8 +44,8 @@ use harness_kernel::{
     ApprovalDecision, ApprovalStatus as KernelApprovalStatus, ClaimedEffect, CompletionFence,
     DomainEvent, EffectCompletion, EffectIntent, EffectOutcome, GoalRevision, KernelStore,
     MissionCommand, MissionEpoch, MissionState, MissionStatus, NewEffect, NodeKind, NodeStatus,
-    RunFence, SessionCommand, SessionState, SessionStatus, WorkflowNodeDefinition, decide_mission,
-    decide_session, find_ready_node_ids, reduce_session,
+    RunFence, SessionCommand, SessionMessage, SessionMessageRole, SessionState, SessionStatus,
+    WorkflowNodeDefinition, decide_mission, decide_session, find_ready_node_ids, reduce_session,
 };
 use harness_lsp::{LspDiagnostic, LspLocation, LspManager, LspServerView, LspSymbol};
 use harness_mcp::{
@@ -106,11 +106,57 @@ impl Display for ApplicationError {
 
 impl Error for ApplicationError {}
 
+const SESSION_TITLE_MAX_CHARACTERS: usize = 48;
+
+fn summarize_session_title(first_message: &str) -> String {
+    let normalized = first_message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut title = normalized.as_str();
+    for prefix in [
+        "请帮我",
+        "帮我",
+        "请你",
+        "我想要",
+        "我想",
+        "麻烦",
+        "please ",
+        "can you ",
+        "could you ",
+    ] {
+        if title.to_lowercase().starts_with(prefix) {
+            title = title.get(prefix.len()..).unwrap_or(title).trim_start();
+            break;
+        }
+    }
+    let clause = title
+        .split(['。', '！', '？', ';', '；', '\n'])
+        .next()
+        .unwrap_or(title)
+        .trim();
+    let clause = if clause.is_empty() {
+        normalized.trim()
+    } else {
+        clause
+    };
+    let characters = clause.chars().collect::<Vec<_>>();
+    if characters.len() <= SESSION_TITLE_MAX_CHARACTERS {
+        return clause.to_owned();
+    }
+    characters
+        .into_iter()
+        .take(SESSION_TITLE_MAX_CHARACTERS.saturating_sub(1))
+        .chain(std::iter::once('…'))
+        .collect()
+}
+
 /// `/status` 使用的 Terminal-neutral ViewModel。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StatusView {
     pub session_id: SessionId,
+    pub session_title: Option<String>,
     pub session_status: SessionStatus,
     pub session_version: u64,
     pub goal: Option<String>,
@@ -125,12 +171,22 @@ pub struct StatusView {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionSummaryView {
     pub session_id: SessionId,
+    pub title: Option<String>,
     pub current: bool,
     pub status: SessionStatus,
     pub version: u64,
+    pub created_at_millis: i64,
+    pub updated_at_millis: i64,
     pub goal: Option<String>,
     pub parent_session_id: Option<SessionId>,
     pub forked_from_checkpoint_id: Option<CheckpointId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConversationEntryView {
+    pub role: String,
+    pub text: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -882,6 +938,11 @@ where
                 project_id: self.project_id.clone(),
             })?;
         }
+        if self.recover_session()?.updated_at_millis == 0 {
+            self.apply_session_command(SessionCommand::Touch {
+                at_millis: self.clock.now_unix_millis(),
+            })?;
+        }
         self.reconcile_model_session()?;
         self.ensure_context_series()?;
         self.reconcile_goal_context()?;
@@ -982,14 +1043,268 @@ where
                 Ok(SessionSummaryView {
                     current: session_id == self.session_id,
                     session_id,
+                    title: state.title,
                     status: state.status,
                     version: state.version,
+                    created_at_millis: state.created_at_millis,
+                    updated_at_millis: state.updated_at_millis,
                     goal,
                     parent_session_id: state.parent_session_id,
                     forked_from_checkpoint_id: state.forked_from_checkpoint_id,
                 })
             })
             .collect()
+    }
+
+    pub fn touch_session(&mut self) -> Result<StatusView, ApplicationError> {
+        self.apply_session_command(SessionCommand::Touch {
+            at_millis: self.clock.now_unix_millis(),
+        })?;
+        self.status()
+    }
+
+    pub fn record_user_message(&mut self, message: &str) -> Result<(), ApplicationError> {
+        if message.trim().is_empty() {
+            return Err(ApplicationError::new(
+                "conversation-message-empty",
+                "User message 不能为空",
+            ));
+        }
+        self.touch_session()?;
+        self.ensure_session_title(message)?;
+        self.append_session_message(SessionMessageRole::User, message)?;
+        self.append_context_item(
+            ContextKind::Conversation,
+            Priority::High,
+            "user:terminal",
+            message,
+            false,
+        )?;
+        Ok(())
+    }
+
+    fn record_assistant_message(&mut self, message: &str) -> Result<(), ApplicationError> {
+        self.append_session_message(SessionMessageRole::Assistant, message)?;
+        self.append_context_item(
+            ContextKind::Conversation,
+            Priority::High,
+            "assistant:kernary",
+            message,
+            false,
+        )
+    }
+
+    fn append_session_message(
+        &mut self,
+        role: SessionMessageRole,
+        text: &str,
+    ) -> Result<(), ApplicationError> {
+        self.apply_session_command(SessionCommand::AppendMessage {
+            message: SessionMessage {
+                id: self.ids.next_id("session-message"),
+                role,
+                text: text.to_owned(),
+                created_at_millis: self.clock.now_unix_millis(),
+            },
+        })?;
+        Ok(())
+    }
+
+    pub fn set_agent_instructions(
+        &mut self,
+        scope: Option<&str>,
+        content: Option<&str>,
+    ) -> Result<(), ApplicationError> {
+        let replacement = match (scope, content) {
+            (Some(scope), Some(content)) if !content.trim().is_empty() => {
+                if content.len() > 64 * 1024 {
+                    return Err(ApplicationError::new(
+                        "agent-md-too-large",
+                        content.len().to_string(),
+                    ));
+                }
+                Some(self.new_context_item(
+                    ContextKind::Constraint,
+                    Priority::Critical,
+                    "instructions:agent-md",
+                    &format!("<agent-md scope=\"{scope}\">\n{content}\n</agent-md>"),
+                    true,
+                ))
+            }
+            _ => None,
+        };
+        self.replace_context_source("instructions:agent-md", replacement)
+    }
+
+    pub fn ensure_session_title(
+        &mut self,
+        first_message: &str,
+    ) -> Result<String, ApplicationError> {
+        let state = self.recover_session()?;
+        if let Some(title) = state.title {
+            return Ok(title);
+        }
+        let title = summarize_session_title(first_message);
+        if title.is_empty() {
+            return Err(ApplicationError::new(
+                "session-title-empty",
+                "首条对话不能生成 Session title",
+            ));
+        }
+        self.apply_session_command(SessionCommand::SetTitle {
+            title: title.clone(),
+            at_millis: self.clock.now_unix_millis(),
+        })?;
+        Ok(title)
+    }
+
+    pub fn rename_session(&mut self, title: &str) -> Result<StatusView, ApplicationError> {
+        self.apply_session_command(SessionCommand::SetTitle {
+            title: title.to_owned(),
+            at_millis: self.clock.now_unix_millis(),
+        })?;
+        self.status()
+    }
+
+    pub fn conversation_history(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ConversationEntryView>, ApplicationError> {
+        let state = self.recover_session()?;
+        let mut entries = state
+            .transcript
+            .into_iter()
+            .map(|message| ConversationEntryView {
+                role: match message.role {
+                    SessionMessageRole::User => "user".to_owned(),
+                    SessionMessageRole::Assistant => "assistant".to_owned(),
+                },
+                text: message.text,
+            })
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            entries = self
+                .active_context_series()?
+                .items
+                .into_iter()
+                .filter(|item| item.context.kind == ContextKind::Conversation)
+                .map(|item| ConversationEntryView {
+                    role: if item.context.source.starts_with("assistant:") {
+                        "assistant".to_owned()
+                    } else {
+                        "user".to_owned()
+                    },
+                    text: item.context.content,
+                })
+                .collect();
+        }
+        let keep = limit.clamp(1, 500);
+        if entries.len() > keep {
+            entries.drain(..entries.len() - keep);
+        }
+        Ok(entries)
+    }
+
+    pub fn new_session(&mut self) -> Result<StatusView, ApplicationError> {
+        let inherited = self
+            .recover_session()?
+            .settings
+            .into_iter()
+            .filter(|(key, value)| {
+                key != "permissions.mode" || !matches!(value.as_str(), "full" | "bypass")
+            })
+            .collect::<Vec<_>>();
+        let session_id = SessionId::from(self.ids.next_id("session"));
+        self.activate_session(session_id, true)?;
+        for (key, value) in inherited {
+            self.set_setting(&key, &value, ConfigLayer::Session)?;
+        }
+        self.status()
+    }
+
+    pub fn switch_session(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<StatusView, ApplicationError> {
+        self.activate_session(session_id, false)
+    }
+
+    fn activate_session(
+        &mut self,
+        session_id: SessionId,
+        create: bool,
+    ) -> Result<StatusView, ApplicationError> {
+        if let Some(mission_id) = self.active_mission_id.as_ref()
+            && self.recover_mission(mission_id)?.status == MissionStatus::Running
+        {
+            return Err(ApplicationError::new(
+                "session-switch-active-mission",
+                "活动 Mission 结束或取消前不能切换 Session",
+            ));
+        }
+        let target = self.recover_session_id(&session_id)?;
+        if create {
+            if target.version != 0 {
+                return Err(ApplicationError::new(
+                    "session-exists",
+                    session_id.to_string(),
+                ));
+            }
+        } else if target.version == 0 || target.project_id != self.project_id {
+            return Err(ApplicationError::new(
+                "session-not-found-in-project",
+                session_id.to_string(),
+            ));
+        }
+
+        let target_settings = if create {
+            BTreeMap::new()
+        } else {
+            target.settings.clone()
+        };
+        let mut candidate = self.config.clone();
+        candidate
+            .replace_session(&target_settings)
+            .map_err(config_error)?;
+        let effective = candidate.effective();
+        if let Some(runtime) = self.tool_runtime.as_ref() {
+            runtime
+                .set_approval_policy(permission_approval_policy(
+                    effective.settings.permission_mode,
+                ))
+                .map_err(tool_error)?;
+        }
+        if let Some(runtime) = self.model_runtime.as_mut() {
+            runtime
+                .set_failover_policy(model_route_policy(&effective)?)
+                .map_err(|error| ApplicationError::new(error.code, error.message))?;
+        }
+        self.session_id = session_id.clone();
+        self.active_mission_id = None;
+        self.config = candidate;
+        self.effective_config = effective;
+        self.mode_profile = ModeProfile::resolve(&self.effective_config.settings);
+        self.agent_budget_policy = mode_agent_budget(&self.mode_profile);
+        if create {
+            self.apply_session_command(SessionCommand::CreateSession {
+                session_id,
+                project_id: self.project_id.clone(),
+            })?;
+            self.apply_session_command(SessionCommand::Touch {
+                at_millis: self.clock.now_unix_millis(),
+            })?;
+        }
+        self.reconcile_model_session()?;
+        self.ensure_context_series()?;
+        self.reconcile_goal_context()?;
+        self.publish(
+            HarnessEvent::SessionChanged {
+                status: "active".to_owned(),
+            },
+            self.session_scope(),
+            EventPriority::Normal,
+        )?;
+        self.status()
     }
 
     /// 创建 checkpoint 后重置当前 Context；保留 Goal 与 hard-required/pinned 项。
@@ -1079,6 +1394,7 @@ where
         )?;
         Ok(StatusView {
             session_id: state.session_id,
+            session_title: state.title,
             session_status: state.status,
             session_version: state.version,
             goal,
@@ -3481,6 +3797,62 @@ where
             child = reduce_session(&child, event)
                 .map_err(|error| ApplicationError::new(error.code, error.message))?;
         }
+        let touch_events = decide_session(
+            &child,
+            &SessionCommand::Touch {
+                at_millis: self.clock.now_unix_millis(),
+            },
+        )
+        .map_err(|error| ApplicationError::new(error.code, error.message))?;
+        for event in &touch_events {
+            child = reduce_session(&child, event)
+                .map_err(|error| ApplicationError::new(error.code, error.message))?;
+        }
+        events.extend(touch_events);
+        if let Some(parent_title) = parent_before.title.as_deref() {
+            let title = format!("{parent_title} · 分支");
+            let title = title.chars().take(80).collect::<String>();
+            let title_events = decide_session(
+                &child,
+                &SessionCommand::SetTitle {
+                    title,
+                    at_millis: self.clock.now_unix_millis(),
+                },
+            )
+            .map_err(|error| ApplicationError::new(error.code, error.message))?;
+            for event in &title_events {
+                child = reduce_session(&child, event)
+                    .map_err(|error| ApplicationError::new(error.code, error.message))?;
+            }
+            events.extend(title_events);
+        }
+        for item in source
+            .items
+            .iter()
+            .filter(|item| item.context.kind == ContextKind::Conversation)
+        {
+            let message_events = decide_session(
+                &child,
+                &SessionCommand::AppendMessage {
+                    message: SessionMessage {
+                        id: self.ids.next_id("session-message"),
+                        role: if item.context.source.starts_with("assistant:") {
+                            SessionMessageRole::Assistant
+                        } else {
+                            SessionMessageRole::User
+                        },
+                        text: item.context.content.clone(),
+                        created_at_millis: item.context.timestamp_millis,
+                    },
+                },
+            )
+            .map_err(|error| ApplicationError::new(error.code, error.message))?;
+            for event in &message_events {
+                child = reduce_session(&child, event)
+                    .map_err(|error| ApplicationError::new(error.code, error.message))?;
+            }
+            events.extend(message_events);
+        }
         if let (Some(provider_id), Some(model_id)) = (
             parent_before.model.provider_id.clone(),
             parent_before.model.model_id.clone(),
@@ -3663,6 +4035,7 @@ where
         let runtime = self.model_runtime.as_ref().cloned().ok_or_else(|| {
             ApplicationError::new("model-runtime-missing", "并行 Team 需要 Model Runtime")
         })?;
+        self.record_user_message(prompt)?;
         if self.status()?.goal.is_none() {
             self.set_goal(prompt)?;
         }
@@ -3891,6 +4264,7 @@ where
                 "Adaptive workflow 需要 Model Runtime",
             ));
         }
+        self.record_user_message(prompt)?;
         let profile = AdaptiveTeamProfile::classify(prompt);
         let requirements_id = TaskId::from("task:requirements");
         let explorer_id = TaskId::from("task:explorer");
@@ -4081,6 +4455,7 @@ where
                 "Role workflow 需要 Model Runtime",
             ));
         }
+        self.record_user_message(prompt)?;
         if self.status()?.goal.is_none() {
             self.set_goal(prompt)?;
         }
@@ -4947,24 +5322,30 @@ where
                 MissionCommand::CompleteMission {},
             )?;
         }
+        let final_state = self.recover_mission(&continuation.mission_id)?;
+        if final_state.status == MissionStatus::Completed && !accepted_results.is_empty() {
+            let summary = accepted_results
+                .iter()
+                .map(|result| result.result.summary.trim())
+                .filter(|summary| !summary.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if !summary.is_empty() {
+                self.record_assistant_message(&summary)?;
+            }
+        }
         Ok(AgentTeamFinalizeStep {
-            plan: self.plan_for(&continuation.mission_id)?,
+            plan: plan_view(&final_state),
             next: None,
         })
     }
 
     /// 用真实 Kernel/Storage/Outbox 驱动当前 Model Provider。
     pub fn run_fake_task(&mut self, prompt: &str) -> Result<PlanView, ApplicationError> {
+        self.record_user_message(prompt)?;
         if self.status()?.goal.is_none() {
             self.set_goal(prompt)?;
         }
-        self.append_context_item(
-            ContextKind::Conversation,
-            Priority::High,
-            "user:terminal",
-            prompt,
-            false,
-        )?;
         self.replace_context_source(
             "task:active",
             Some(self.new_context_item(
@@ -5208,6 +5589,7 @@ where
                             return Err(error);
                         }
                     };
+                    self.record_assistant_message(&output_summary)?;
                     let compressed_result = AgentResult {
                         status: "completed".to_owned(),
                         summary: output_summary.clone(),
@@ -7302,10 +7684,13 @@ fn mode_agent_budget(profile: &ModeProfile) -> AgentBudgetPolicy {
 
 const fn permission_approval_policy(mode: PermissionMode) -> ApprovalPolicy {
     match mode {
-        PermissionMode::Safe => ApprovalPolicy::Always,
-        PermissionMode::Ask | PermissionMode::Custom => ApprovalPolicy::OnRequest,
-        PermissionMode::Auto => ApprovalPolicy::UntrustedOnly,
+        PermissionMode::Manual | PermissionMode::Safe => ApprovalPolicy::Always,
+        PermissionMode::AcceptEdits => ApprovalPolicy::CommandsOnly,
+        PermissionMode::Ask | PermissionMode::Auto | PermissionMode::Custom => {
+            ApprovalPolicy::OnRequest
+        }
         PermissionMode::Full => ApprovalPolicy::NeverWithinSandbox,
+        PermissionMode::Bypass => ApprovalPolicy::BypassWithinSandbox,
     }
 }
 
@@ -8091,7 +8476,7 @@ mod tests {
         let temporary = tempdir().expect("tempdir");
         let (mut application, subscription) = application(&temporary.path().join("app.sqlite"));
         let boot = application.boot().expect("boot");
-        assert_eq!(boot.session_version, 1);
+        assert_eq!(boot.session_version, 2, "create + touch");
         let goal = application
             .set_goal("完成终端 vertical slice")
             .expect("goal");
@@ -8101,6 +8486,10 @@ mod tests {
             .expect("fake task");
         assert_eq!(plan.accepted, 1);
         assert_eq!(plan.status, Some(MissionStatus::Completed));
+        let history = application.conversation_history(10).expect("history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].role, "user");
+        assert_eq!(history[1].role, "assistant");
         assert!(
             application
                 .store()
@@ -8152,6 +8541,59 @@ mod tests {
         let queue = application.agent_queue().expect("queue");
         assert!(queue.mission_id.is_some());
         assert_eq!(queue.items.len(), 1);
+    }
+
+    #[test]
+    fn project_sessions_have_titles_isolated_context_and_switchable_settings() {
+        let temporary = tempdir().expect("tempdir");
+        let (mut application, _) = application(&temporary.path().join("sessions-v2.sqlite"));
+        application.boot().expect("boot");
+        let first_id = application.status().expect("status").session_id;
+        application
+            .record_user_message("请帮我 重构认证模块；保持兼容")
+            .expect("first message");
+        application
+            .set_setting("permissions.mode", "auto", ConfigLayer::Session)
+            .expect("auto permission");
+        let first = application.status().expect("first status");
+        assert_eq!(first.session_title.as_deref(), Some("重构认证模块"));
+        assert_eq!(
+            application.conversation_history(10).expect("history").len(),
+            1
+        );
+
+        let second = application.new_session().expect("new session");
+        assert_ne!(second.session_id, first_id);
+        assert!(second.session_title.is_none());
+        assert!(
+            application
+                .conversation_history(10)
+                .expect("new history")
+                .is_empty()
+        );
+        assert_eq!(
+            application.config().settings.permission_mode,
+            PermissionMode::Auto,
+            "安全的目录级偏好复制到新 Session，但后续修改彼此独立"
+        );
+        application.rename_session("第二个任务").expect("rename");
+        let sessions = application.sessions().expect("sessions");
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions.iter().filter(|session| session.current).count(), 1);
+
+        let restored = application.switch_session(first_id).expect("switch back");
+        assert_eq!(restored.session_title.as_deref(), Some("重构认证模块"));
+        assert_eq!(
+            application
+                .conversation_history(10)
+                .expect("restored")
+                .len(),
+            1
+        );
+        assert_eq!(
+            application.config().settings.permission_mode,
+            PermissionMode::Auto
+        );
     }
 
     #[test]
@@ -8271,6 +8713,9 @@ mod tests {
         let (mut application, _subscription) =
             application(&temporary.path().join("context.sqlite"));
         application.boot().expect("boot");
+        application
+            .set_agent_instructions(Some("project"), Some("RUN-PROJECT-TESTS"))
+            .expect("agent md");
         application.set_goal("审查认证补丁").expect("goal");
         application
             .append_context_item(
@@ -8303,6 +8748,7 @@ mod tests {
         let reviewer = application
             .agent_working_context(AgentRole::Reviewer)
             .expect("reviewer context");
+        assert!(reviewer.stable_instructions.contains("RUN-PROJECT-TESTS"));
         assert!(reviewer.dynamic_context.contains("只审查 auth.rs"));
         assert!(!reviewer.dynamic_context.contains("无关的主会话私有历史"));
         assert!(!reviewer.dynamic_context.contains("完整能力正文"));
@@ -8697,7 +9143,7 @@ mod tests {
         let mut application = application.with_model_runtime(fake_model_runtime());
         let boot = application.boot().expect("boot");
         assert_eq!(boot.model, "fake/deterministic");
-        assert_eq!(boot.session_version, 2, "create + model selection");
+        assert_eq!(boot.session_version, 3, "create + touch + model selection");
         let reasoning = application
             .set_reasoning(ReasoningLevel::Max)
             .expect("reasoning");

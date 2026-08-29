@@ -22,9 +22,9 @@ pub use mission_decision::{
     CommandError, DecideResult, EffectIntent, MissionCommand, decide_mission,
 };
 pub use session::{
-    GoalRevision, GoalState, SessionCommand, SessionCommandError, SessionEvent, SessionModelState,
-    SessionState, SessionStatus, SessionVersionedEvent, decide_session, reduce_session,
-    replay_session,
+    GoalRevision, GoalState, SessionCommand, SessionCommandError, SessionEvent, SessionMessage,
+    SessionMessageRole, SessionModelState, SessionState, SessionStatus, SessionVersionedEvent,
+    decide_session, reduce_session, replay_session,
 };
 pub use storage_port::{
     ClaimedEffect, CommitReceipt, EffectCompletion, EffectOutcome, EffectResultRecord, KernelStore,

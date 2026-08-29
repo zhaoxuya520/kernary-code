@@ -14,7 +14,7 @@ mode = "auto"
 
 [settings.permissions]
 # safe | ask | auto | full | custom；任何模式都不能绕过 Sandbox hard deny。
-mode = "ask"
+mode = "manual"
 
 [settings.failover]
 # 默认关闭；开启时必须确认成本范围并使用精确 provider/model allowlist。

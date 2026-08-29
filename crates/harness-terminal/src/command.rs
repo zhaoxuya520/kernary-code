@@ -14,6 +14,9 @@ pub enum SlashCommand {
     AgentShow {
         agent_id: String,
     },
+    AgentMd {
+        operation: AgentMdCommand,
+    },
     Agents {
         mode: AgentDisplayMode,
     },
@@ -164,6 +167,13 @@ pub enum SlashCommand {
     },
     Session,
     Sessions,
+    SessionSwitch {
+        target: String,
+    },
+    SessionNew,
+    SessionRename {
+        title: String,
+    },
     Settings {
         operation: SettingsCommand,
     },
@@ -421,6 +431,14 @@ pub enum PermissionCommand {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentMdCommand {
+    Status,
+    Show,
+    InitProject,
+    InitGlobal,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FailoverCommand {
     Status,
@@ -533,6 +551,11 @@ const COMMANDS: &[CommandSpec] = &[
         name: "/agent",
         synopsis: "/agent <agent-id>",
         description: "查看一个 Agent 的角色、能力、工具边界与生命周期",
+    },
+    CommandSpec {
+        name: "/agentmd",
+        synopsis: "/agentmd [status|show|init-project|init-global]",
+        description: "管理全局或项目私有 agent.md；项目文件存在时覆盖全局文件",
     },
     CommandSpec {
         name: "/agents",
@@ -726,7 +749,7 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/permissions",
-        synopsis: "/permissions [safe|ask|auto|full|custom|rules|rule add <effect> <action> <pattern>|rule remove <id>]",
+        synopsis: "/permissions [manual|edit|auto|full|bypass|custom|rules|rule add <effect> <action> <pattern>|rule remove <id>]",
         description: "管理 Permission 模式与持久规则；任何规则都不能绕过 Sandbox hard deny",
     },
     CommandSpec {
@@ -791,8 +814,8 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/session",
-        synopsis: "/session",
-        description: "显示当前 Session",
+        synopsis: "/session [list|new|switch <id-or-title>|rename <title>]",
+        description: "选择、创建、切换或重命名当前项目的 Session",
     },
     CommandSpec {
         name: "/sessions",
@@ -901,6 +924,21 @@ impl CommandRegistry {
             "/account" if remainder.is_empty() => SlashCommand::Account,
             "/agent" if !remainder.is_empty() => SlashCommand::AgentShow {
                 agent_id: remainder.to_owned(),
+            },
+            "/agentmd" => SlashCommand::AgentMd {
+                operation: match remainder {
+                    "" | "status" => AgentMdCommand::Status,
+                    "show" => AgentMdCommand::Show,
+                    "init-project" => AgentMdCommand::InitProject,
+                    "init-global" => AgentMdCommand::InitGlobal,
+                    _ => {
+                        return Err(CommandParseError {
+                            code: "invalid-agentmd-command",
+                            message: "用法：/agentmd [status|show|init-project|init-global]"
+                                .to_owned(),
+                        });
+                    }
+                },
             },
             "/agents" if matches!(remainder, "" | "normal") => SlashCommand::Agents {
                 mode: AgentDisplayMode::Normal,
@@ -1129,7 +1167,20 @@ impl CommandRegistry {
             "/permissions" if remainder.is_empty() => SlashCommand::Permissions {
                 operation: PermissionCommand::Show,
             },
-            "/permissions" if matches!(remainder, "safe" | "ask" | "auto" | "full" | "custom") => {
+            "/permissions"
+                if matches!(
+                    remainder,
+                    "manual"
+                        | "accept-edits"
+                        | "edit"
+                        | "auto"
+                        | "full"
+                        | "bypass"
+                        | "safe"
+                        | "ask"
+                        | "custom"
+                ) =>
+            {
                 SlashCommand::Permissions {
                     operation: PermissionCommand::Mode {
                         mode: remainder.to_owned(),
@@ -1212,6 +1263,20 @@ impl CommandRegistry {
                 ),
             },
             "/session" if remainder.is_empty() => SlashCommand::Session,
+            "/session" if remainder == "list" => SlashCommand::Sessions,
+            "/session" if remainder == "new" => SlashCommand::SessionNew,
+            "/session" if let Some(title) = remainder.strip_prefix("rename ") => {
+                SlashCommand::SessionRename {
+                    title: title.trim().to_owned(),
+                }
+            }
+            "/session" => SlashCommand::SessionSwitch {
+                target: remainder
+                    .strip_prefix("switch ")
+                    .unwrap_or(remainder)
+                    .trim()
+                    .to_owned(),
+            },
             "/sessions" if matches!(remainder, "" | "list") => SlashCommand::Sessions,
             "/settings" => SlashCommand::Settings {
                 operation: parse_settings(remainder)?,
@@ -1337,11 +1402,18 @@ fn argument_suggestions(input: &str) -> Vec<InputSuggestion> {
             ("compact", "紧凑单行状态"),
             ("tree", "控制面与 Worker 树"),
         ],
+        "/agentmd" => &[
+            ("status", "显示实际加载的 scope、路径和大小"),
+            ("show", "显示当前生效的 agent.md 内容"),
+            ("init-project", "创建项目私有 .harness/agent.md"),
+            ("init-global", "创建全局 ~/.kernary/agent.md"),
+        ],
         "/permissions" => &[
-            ("safe", "所有敏感操作询问"),
-            ("ask", "按规则询问"),
-            ("auto", "仅不可信操作询问"),
-            ("full", "Sandbox 内自动执行"),
+            ("manual", "所有 Tool 操作手动确认"),
+            ("edit", "文件编辑自动，终端与外部操作确认"),
+            ("auto", "Sandbox 内低风险自动，高风险确认"),
+            ("full", "Sandbox 内自动，Patch 应用仍确认"),
+            ("bypass", "最高权限；需输入确认短语"),
             ("custom", "使用自定义规则"),
             ("rules", "列出持久权限规则"),
             ("rule add ", "添加 allow/ask/deny 规则"),
@@ -1478,7 +1550,7 @@ fn parse_permission(value: &str) -> Result<PermissionCommand, CommandParseError>
     }
     Err(CommandParseError {
         code: "invalid-permission-command",
-        message: "用法：/permissions [safe|ask|auto|full|custom|rules|rule add <allow|ask|deny> <read|write|execute|network|browser|mcp|plugin> <pattern>|rule remove <id>]".to_owned(),
+        message: "用法：/permissions [manual|edit|auto|full|bypass|custom|rules|rule add <allow|ask|deny> <read|write|execute|network|browser|mcp|plugin> <pattern>|rule remove <id>]".to_owned(),
     })
 }
 
@@ -2189,6 +2261,32 @@ mod tests {
         assert_eq!(
             registry.parse("/sessions").expect("sessions"),
             ParsedInput::Command(SlashCommand::Sessions)
+        );
+        assert_eq!(
+            registry.parse("/session new").expect("new session"),
+            ParsedInput::Command(SlashCommand::SessionNew)
+        );
+        assert_eq!(
+            registry
+                .parse("/session switch session:123")
+                .expect("switch session"),
+            ParsedInput::Command(SlashCommand::SessionSwitch {
+                target: "session:123".to_owned()
+            })
+        );
+        assert_eq!(
+            registry
+                .parse("/session rename auth refactor")
+                .expect("rename session"),
+            ParsedInput::Command(SlashCommand::SessionRename {
+                title: "auth refactor".to_owned()
+            })
+        );
+        assert_eq!(
+            registry.parse("/agentmd init-project").expect("agent md"),
+            ParsedInput::Command(SlashCommand::AgentMd {
+                operation: AgentMdCommand::InitProject
+            })
         );
         assert_eq!(
             registry.parse("/reset context").expect("reset"),

@@ -50,6 +50,22 @@ pub struct SessionModelState {
     pub reasoning: ReasoningLevel,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionMessageRole {
+    User,
+    Assistant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionMessage {
+    pub id: String,
+    pub role: SessionMessageRole,
+    pub text: String,
+    pub created_at_millis: i64,
+}
+
 /// Session 聚合的最小状态。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -58,6 +74,14 @@ pub struct SessionState {
     pub project_id: ProjectId,
     pub status: SessionStatus,
     pub version: u64,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub created_at_millis: i64,
+    #[serde(default)]
+    pub updated_at_millis: i64,
+    #[serde(default)]
+    pub transcript: Vec<SessionMessage>,
     pub goal: GoalState,
     #[serde(default)]
     pub model: SessionModelState,
@@ -77,6 +101,10 @@ impl SessionState {
             project_id: ProjectId::default(),
             status: SessionStatus::New,
             version: 0,
+            title: None,
+            created_at_millis: 0,
+            updated_at_millis: 0,
+            transcript: Vec::new(),
             goal: GoalState::default(),
             model: SessionModelState::default(),
             parent_session_id: None,
@@ -127,6 +155,12 @@ pub enum SessionCommand {
     SetSetting { key: String, value: String },
     #[serde(rename = "session.setting-clear")]
     ClearSetting { key: String },
+    #[serde(rename = "session.title-set")]
+    SetTitle { title: String, at_millis: i64 },
+    #[serde(rename = "session.touch")]
+    Touch { at_millis: i64 },
+    #[serde(rename = "session.message-append")]
+    AppendMessage { message: SessionMessage },
 }
 
 /// Session 已发生的事实。
@@ -170,6 +204,12 @@ pub enum SessionEvent {
     SessionSettingChanged { key: String, value: String },
     #[serde(rename = "session.setting-cleared")]
     SessionSettingCleared { key: String },
+    #[serde(rename = "session.title-changed")]
+    SessionTitleChanged { title: String, at_millis: i64 },
+    #[serde(rename = "session.touched")]
+    SessionTouched { at_millis: i64 },
+    #[serde(rename = "session.message-appended")]
+    SessionMessageAppended { message: SessionMessage },
 }
 
 /// 带聚合版本的 Session Event。
@@ -377,6 +417,51 @@ pub fn decide_session(
                 key: key.clone(),
             }])
         }
+        SessionCommand::SetTitle { title, at_millis } => {
+            let title = title.trim();
+            if state.status == SessionStatus::New || title.is_empty() || title.chars().count() > 80
+            {
+                return Err(SessionCommandError::new(
+                    "session-title-invalid",
+                    "Session title 必须是 1..=80 个字符",
+                ));
+            }
+            if state.title.as_deref() == Some(title) {
+                return Err(SessionCommandError::new("session-title-unchanged", title));
+            }
+            Ok(vec![SessionEvent::SessionTitleChanged {
+                title: title.to_owned(),
+                at_millis: *at_millis,
+            }])
+        }
+        SessionCommand::Touch { at_millis } => {
+            if state.status == SessionStatus::New || *at_millis < state.updated_at_millis {
+                return Err(SessionCommandError::new(
+                    "session-touch-invalid",
+                    at_millis.to_string(),
+                ));
+            }
+            Ok(vec![SessionEvent::SessionTouched {
+                at_millis: *at_millis,
+            }])
+        }
+        SessionCommand::AppendMessage { message } => {
+            if state.status == SessionStatus::New
+                || message.id.trim().is_empty()
+                || message.text.trim().is_empty()
+                || message.text.len() > 1024 * 1024
+                || state.transcript.len() >= 100_000
+                || state.transcript.iter().any(|entry| entry.id == message.id)
+            {
+                return Err(SessionCommandError::new(
+                    "session-message-invalid",
+                    message.id.clone(),
+                ));
+            }
+            Ok(vec![SessionEvent::SessionMessageAppended {
+                message: message.clone(),
+            }])
+        }
     }
 }
 
@@ -441,6 +526,32 @@ pub fn reduce_session(
         }
         SessionEvent::SessionSettingCleared { key } => {
             next.settings.remove(key);
+        }
+        SessionEvent::SessionTitleChanged { title, at_millis } => {
+            next.title = Some(title.clone());
+            if next.created_at_millis == 0 {
+                next.created_at_millis = *at_millis;
+            }
+            next.updated_at_millis = next.updated_at_millis.max(*at_millis);
+        }
+        SessionEvent::SessionTouched { at_millis } => {
+            if next.created_at_millis == 0 {
+                next.created_at_millis = *at_millis;
+            }
+            next.updated_at_millis = next.updated_at_millis.max(*at_millis);
+        }
+        SessionEvent::SessionMessageAppended { message } => {
+            if next.transcript.iter().any(|entry| entry.id == message.id) {
+                return Err(SessionCommandError::new(
+                    "session-message-duplicate",
+                    message.id.clone(),
+                ));
+            }
+            next.transcript.push(message.clone());
+            if next.created_at_millis == 0 {
+                next.created_at_millis = message.created_at_millis;
+            }
+            next.updated_at_millis = next.updated_at_millis.max(message.created_at_millis);
         }
     }
     Ok(next)
@@ -542,6 +653,55 @@ mod tests {
             state.goal.current_revision_id,
             Some(GoalRevisionId::from("goal:2"))
         );
+    }
+
+    #[test]
+    fn session_title_and_activity_are_versioned_and_backward_compatible() {
+        let mut state = SessionState::empty(SessionId::from("session:title"));
+        apply(
+            &mut state,
+            SessionCommand::CreateSession {
+                session_id: SessionId::from("session:title"),
+                project_id: ProjectId::from("project:test"),
+            },
+        )
+        .expect("create");
+        apply(&mut state, SessionCommand::Touch { at_millis: 10 }).expect("touch");
+        apply(
+            &mut state,
+            SessionCommand::SetTitle {
+                title: "认证模块重构".to_owned(),
+                at_millis: 11,
+            },
+        )
+        .expect("title");
+        assert_eq!(state.title.as_deref(), Some("认证模块重构"));
+        assert_eq!(state.created_at_millis, 10);
+        assert_eq!(state.updated_at_millis, 11);
+        assert!(
+            apply(
+                &mut state,
+                SessionCommand::SetTitle {
+                    title: "认证模块重构".to_owned(),
+                    at_millis: 12,
+                },
+            )
+            .is_err()
+        );
+
+        let legacy = serde_json::json!({
+            "sessionId":"session:legacy",
+            "projectId":"project:test",
+            "status":"active",
+            "version":1,
+            "goal":{"currentRevisionId":null,"revisions":{},"locked":false},
+            "parentSessionId":null,
+            "forkedFromCheckpointId":null,
+            "settings":{}
+        });
+        let legacy: SessionState = serde_json::from_value(legacy).expect("legacy state");
+        assert!(legacy.title.is_none());
+        assert_eq!(legacy.updated_at_millis, 0);
     }
 
     #[test]

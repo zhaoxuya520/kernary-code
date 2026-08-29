@@ -76,9 +76,9 @@ use harness_provider_runtime::CatalogProviderRuntime;
 use harness_skill::{SkillRegistry, SkillSource};
 use harness_storage::{ProjectMaintenance, ProjectStateLock, SqliteKernelStore};
 use harness_terminal::{
-    AgentDisplayMode, BackendResponse, BrowserCommand as BrowserCliCommand, BudgetCommand,
-    CommandRegistry, CompactCommandMode, FailoverCommand, GitCommand, IndexCommand, InputPrompt,
-    InputSuggestion, JsonRenderer, LspCommand, MASCOT_NAME, McpCommand, MemoryCommand,
+    AgentDisplayMode, AgentMdCommand, BackendResponse, BrowserCommand as BrowserCliCommand,
+    BudgetCommand, CommandRegistry, CompactCommandMode, FailoverCommand, GitCommand, IndexCommand,
+    InputPrompt, InputSuggestion, JsonRenderer, LspCommand, MASCOT_NAME, McpCommand, MemoryCommand,
     PRODUCT_NAME, PRODUCT_SHORT_NAME, ParsedInput, PermissionCommand, PlainRenderer, PluginCommand,
     ProviderCommand, QueueCommand, RenderStyle, SecretPrompt, SettingLayer, SettingsCommand,
     SkillCommand, SlashCommand, TAGLINE, TeamCommand, TerminalBackend, TerminalCapabilities,
@@ -113,6 +113,23 @@ struct Cli {
     /// 启动后选择 provider/model；不会自动 failover。
     #[arg(long, global = true)]
     model: Option<String>,
+    /// 恢复当前项目 Session；不带值时打开选择器。
+    #[arg(short = 'r', long = "resume", num_args = 0..=1, default_missing_value = "__picker__", value_name = "SESSION", conflicts_with = "continue_session", global = true)]
+    resume: Option<String>,
+    /// 继续当前项目最近一次 Session。
+    #[arg(
+        short = 'c',
+        long = "continue",
+        conflicts_with = "resume",
+        global = true
+    )]
+    continue_session: bool,
+    /// 本次 Session 的权限等级。
+    #[arg(long, value_parser = ["manual", "edit", "accept-edits", "auto", "full", "bypass"], global = true)]
+    permission_mode: Option<String>,
+    /// 显式确认 CLI bypass 最高权限模式。
+    #[arg(long, requires = "permission_mode", global = true)]
+    confirm_bypass: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -405,6 +422,8 @@ struct AppBackend {
     registry: CommandRegistry,
     project_root: String,
     project_branch: Option<String>,
+    agent_instructions: Option<AgentInstructionsFile>,
+    seed_session_settings: BTreeMap<String, String>,
     provider_config_path: PathBuf,
     vector_config_path: PathBuf,
     mcp_config_path: PathBuf,
@@ -420,6 +439,13 @@ struct AppBackend {
     test_model_enabled: bool,
     /// 最后释放，保证 Application 与后台 Worker 都已停止。
     _project_lock: ProjectStateLock,
+}
+
+#[derive(Clone, Debug)]
+struct AgentInstructionsFile {
+    scope: &'static str,
+    path: PathBuf,
+    content: String,
 }
 
 struct PendingCredential {
@@ -447,6 +473,11 @@ enum SetupState {
         endpoint: String,
         previous_secret: Option<SecretString>,
     },
+    SessionSwitch,
+    PermissionElevation {
+        mode: String,
+        confirmation: String,
+    },
 }
 
 struct BackgroundTeam {
@@ -462,6 +493,39 @@ impl AppBackend {
     fn language(&self) -> UiLanguage {
         UiLanguage::parse(&self.application.config().settings.ui_language)
             .unwrap_or(UiLanguage::ZhCn)
+    }
+
+    fn apply_agent_instructions(&mut self) -> Result<(), ApplicationError> {
+        self.application.set_agent_instructions(
+            self.agent_instructions.as_ref().map(|file| file.scope),
+            self.agent_instructions
+                .as_ref()
+                .map(|file| file.content.as_str()),
+        )
+    }
+
+    fn reload_agent_instructions(&mut self) -> BackendResponse {
+        self.agent_instructions = match load_agent_instructions(Path::new(&self.project_root)) {
+            Ok(instructions) => instructions,
+            Err(error) => return Self::response_error(error),
+        };
+        if let Err(error) = self.apply_agent_instructions() {
+            return Self::response_error(error);
+        }
+        BackendResponse {
+            lines: self.agent_instructions.as_ref().map_or_else(
+                || vec!["agent.md 未配置".to_owned()],
+                |file| {
+                    vec![format!(
+                        "agent.md · scope={} · path={} · bytes={}",
+                        file.scope,
+                        file.path.display(),
+                        file.content.len()
+                    )]
+                },
+            ),
+            ..BackendResponse::default()
+        }
     }
 
     fn response_error(error: impl std::fmt::Display) -> BackendResponse {
@@ -530,6 +594,38 @@ impl AppBackend {
     }
 
     fn input_suggestions(&self, input: &str) -> Vec<InputSuggestion> {
+        if matches!(self.pending_setup, Some(SetupState::SessionSwitch)) {
+            let prefix = input.trim().to_lowercase();
+            return self
+                .application
+                .sessions()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|session| !session.current)
+                .filter(|session| {
+                    session.session_id.as_str().to_lowercase().contains(&prefix)
+                        || session
+                            .title
+                            .as_deref()
+                            .unwrap_or_default()
+                            .to_lowercase()
+                            .contains(&prefix)
+                })
+                .map(|session| {
+                    InputSuggestion::new(
+                        session.session_id.to_string(),
+                        session
+                            .title
+                            .clone()
+                            .unwrap_or_else(|| "未命名会话".to_owned()),
+                        format!(
+                            "{} · {:?} · v{}",
+                            session.session_id, session.status, session.version
+                        ),
+                    )
+                })
+                .collect();
+        }
         if let Some(SetupState::ProviderDefault { models, .. }) = &self.pending_setup {
             let prefix = input.trim();
             let pack = self.language().pack();
@@ -1150,6 +1246,29 @@ impl AppBackend {
                     ..BackendResponse::default()
                 }
             }
+            (SetupState::SessionSwitch, "session-switch") => self.switch_session_response(&value),
+            (SetupState::PermissionElevation { mode, confirmation }, "permission-elevation") => {
+                if value.trim() != confirmation {
+                    return self.retry_setup_input(
+                        SetupState::PermissionElevation { mode, confirmation },
+                        "permission-elevation",
+                        "确认最高权限模式",
+                        Some("输入显示的完整确认短语".to_owned()),
+                        "确认短语不匹配",
+                    );
+                }
+                match self
+                    .application
+                    .set_setting("permissions.mode", &mode, ConfigLayer::Session)
+                {
+                    Ok(view) => BackendResponse {
+                        lines: Self::config_lines(&view, Some("permissions.mode"), false),
+                        clear_view: true,
+                        ..BackendResponse::default()
+                    },
+                    Err(error) => Self::response_error(error),
+                }
+            }
             (state, _) => {
                 self.pending_setup = Some(state);
                 Self::response_error("设置向导 request ID 不匹配")
@@ -1590,8 +1709,11 @@ impl AppBackend {
         };
         vec![
             format!(
-                "{}  {} · {:?}",
-                pack.session_label, status.session_id, status.session_status
+                "{}  {} · {} · {:?}",
+                pack.session_label,
+                status.session_title.as_deref().unwrap_or("未命名会话"),
+                status.session_id,
+                status.session_status
             ),
             format!(
                 "{}  {}{}",
@@ -1608,6 +1730,80 @@ impl AppBackend {
                 pack.mode_label, status.mode, status.session_version
             ),
         ]
+    }
+
+    fn resolve_session_target(&self, target: &str) -> Result<SessionId, String> {
+        let target = target.trim();
+        if target.is_empty() {
+            return Err("Session ID/title 不能为空".to_owned());
+        }
+        let sessions = self
+            .application
+            .sessions()
+            .map_err(|error| error.to_string())?;
+        if let Some(session) = sessions
+            .iter()
+            .find(|session| session.session_id.as_str() == target)
+        {
+            return Ok(session.session_id.clone());
+        }
+        let matches = sessions
+            .into_iter()
+            .filter(|session| session.title.as_deref() == Some(target))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [session] => Ok(session.session_id.clone()),
+            [] => Err(format!("当前项目不存在 Session：{target}")),
+            _ => Err(format!(
+                "Session title 重复：{target}；请使用唯一 Session ID"
+            )),
+        }
+    }
+
+    fn switch_session_response(&mut self, target: &str) -> BackendResponse {
+        if self.background_team.is_some() {
+            return Self::response_error("Agent Team 运行期间不能切换 Session");
+        }
+        let session_id = match self.resolve_session_target(target) {
+            Ok(session_id) => session_id,
+            Err(error) => return Self::response_error(error),
+        };
+        let status = match self.application.switch_session(session_id) {
+            Ok(status) => status,
+            Err(error) => return Self::response_error(error),
+        };
+        if let Err(error) = self.apply_agent_instructions() {
+            return Self::response_error(error);
+        }
+        self.registry = CommandRegistry::with_language(self.language());
+        self.model_ready = self.application.model().ok().is_some_and(|model| {
+            (!is_hidden_internal_model(&model.provider_id, &model.model_id)
+                || (self.test_model_enabled
+                    && is_internal_test_model(&model.provider_id, &model.model_id)))
+                && self
+                    .provider_credential_ready(&model.provider_id)
+                    .unwrap_or(false)
+        });
+        let mut lines = vec![format!(
+            "Session · {} · {}",
+            status.session_title.as_deref().unwrap_or("未命名会话"),
+            status.session_id
+        )];
+        if let Ok(history) = self.application.conversation_history(200) {
+            lines.extend(history.into_iter().map(|entry| {
+                if entry.role == "assistant" {
+                    format!("Kernary: {}", entry.text)
+                } else {
+                    format!("You: {}", entry.text)
+                }
+            }));
+        }
+        lines.extend(self.status_lines(&status));
+        BackendResponse {
+            lines,
+            clear_view: true,
+            ..BackendResponse::default()
+        }
     }
 
     fn goal_history_lines(history: &GoalHistoryView) -> Vec<String> {
@@ -1645,10 +1841,12 @@ impl AppBackend {
         let mut lines = vec![format!("Sessions · {}", sessions.len())];
         lines.extend(sessions.iter().map(|session| {
             format!(
-                "{}{} · {:?} · version={} · goal={} · parent={} · checkpoint={}",
+                "{} · {}{} · {:?} · updated={} · version={} · goal={} · parent={} · checkpoint={}",
+                session.title.as_deref().unwrap_or("未命名会话"),
                 session.session_id,
                 if session.current { " [current]" } else { "" },
                 session.status,
+                session.updated_at_millis,
                 session.version,
                 session.goal.as_deref().unwrap_or("<empty>"),
                 session
@@ -2975,6 +3173,41 @@ impl AppBackend {
 }
 
 impl TerminalBackend for AppBackend {
+    fn initial_history(&self) -> Vec<String> {
+        self.application
+            .conversation_history(200)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| {
+                if entry.role == "assistant" {
+                    format!("Kernary: {}", entry.text)
+                } else {
+                    format!("You: {}", entry.text)
+                }
+            })
+            .collect()
+    }
+
+    fn cycle_permission_mode(&mut self) -> BackendResponse {
+        let current = self.application.config().settings.permission_mode;
+        let next = match current {
+            PermissionMode::Manual | PermissionMode::Safe => "edit",
+            PermissionMode::AcceptEdits => "auto",
+            PermissionMode::Auto | PermissionMode::Ask | PermissionMode::Custom => "full",
+            PermissionMode::Full | PermissionMode::Bypass => "manual",
+        };
+        match self
+            .application
+            .set_setting("permissions.mode", next, ConfigLayer::Session)
+        {
+            Ok(view) => BackendResponse {
+                lines: Self::config_lines(&view, Some("permissions.mode"), false),
+                ..BackendResponse::default()
+            },
+            Err(error) => Self::response_error(error),
+        }
+    }
+
     fn handle_input(&mut self, input: &str) -> BackendResponse {
         self.drain_event_log();
         let parsed = match self.registry.parse(input) {
@@ -3031,6 +3264,39 @@ impl TerminalBackend for AppBackend {
                         ..BackendResponse::default()
                     },
                     Err(error) => Self::response_error(error),
+                },
+                SlashCommand::AgentMd { operation } => match operation {
+                    AgentMdCommand::Status => self.reload_agent_instructions(),
+                    AgentMdCommand::Show => self.agent_instructions.as_ref().map_or_else(
+                        || BackendResponse {
+                            lines: vec!["agent.md 未配置".to_owned()],
+                            ..BackendResponse::default()
+                        },
+                        |file| BackendResponse {
+                            lines: vec![format!(
+                                "agent.md · scope={} · path={}",
+                                file.scope,
+                                file.path.display()
+                            ), file.content.clone()],
+                            ..BackendResponse::default()
+                        },
+                    ),
+                    AgentMdCommand::InitProject => {
+                        let path = Path::new(&self.project_root).join(".harness/agent.md");
+                        match create_agent_md(&path, "project") {
+                            Ok(()) => self.reload_agent_instructions(),
+                            Err(error) => Self::response_error(error),
+                        }
+                    }
+                    AgentMdCommand::InitGlobal => {
+                        let Some(path) = global_agent_md_path() else {
+                            return Self::response_error("无法确定 Kernary 全局目录");
+                        };
+                        match create_agent_md(&path, "global") {
+                            Ok(()) => self.reload_agent_instructions(),
+                            Err(error) => Self::response_error(error),
+                        }
+                    }
                 },
                 SlashCommand::Agents { mode } => match self.application.agents() {
                     Ok(team) => BackendResponse {
@@ -3905,13 +4171,34 @@ impl TerminalBackend for AppBackend {
                 SlashCommand::Permissions { operation } => match operation {
                     PermissionCommand::Show | PermissionCommand::Mode { .. } => {
                         if let PermissionCommand::Mode { mode } = operation
-                            && let Err(error) = self.application.set_setting(
+                        {
+                            if mode == "bypass" {
+                                let confirmation = "I UNDERSTAND BYPASS".to_owned();
+                                self.pending_setup = Some(SetupState::PermissionElevation {
+                                    mode,
+                                    confirmation: confirmation.clone(),
+                                });
+                                return BackendResponse {
+                                    lines: vec![
+                                        "Bypass 会取消 Sandbox 内所有手动审批，包括 Workspace Patch；硬拒绝路径和项目边界仍然有效。"
+                                            .to_owned(),
+                                        format!("输入确认短语：{confirmation}"),
+                                    ],
+                                    input_prompt: Some(InputPrompt {
+                                        request_id: "permission-elevation".to_owned(),
+                                        prompt: "确认最高权限模式".to_owned(),
+                                        placeholder: Some(confirmation),
+                                    }),
+                                    ..BackendResponse::default()
+                                };
+                            }
+                            if let Err(error) = self.application.set_setting(
                                 "permissions.mode",
                                 &mode,
                                 ConfigLayer::Session,
-                            )
-                        {
-                            return Self::response_error(error);
+                            ) {
+                                return Self::response_error(error);
+                            }
                         }
                         match self.application.tools() {
                             Ok(view) => {
@@ -3925,7 +4212,7 @@ impl TerminalBackend for AppBackend {
                                     format!("Permission rules: {}", view.permission_rules.len()),
                                     format!("Pending approvals: {}", view.pending_approvals),
                                     format!("Active grants: {}", view.active_grants),
-                                    "Sandbox hard denies and WorkspacePatch second approval remain mandatory"
+                                    "Sandbox hard denies remain mandatory; only bypass removes the WorkspacePatch confirmation"
                                         .to_owned(),
                                 ]);
                                 BackendResponse {
@@ -4249,13 +4536,35 @@ impl TerminalBackend for AppBackend {
                         }
                     }
                 },
-                SlashCommand::Status | SlashCommand::Session => match self.application.status() {
+                SlashCommand::Status => match self.application.status() {
                     Ok(status) => BackendResponse {
                         lines: self.status_lines(&status),
                         ..BackendResponse::default()
                     },
                     Err(error) => Self::response_error(error),
                 },
+                SlashCommand::Session => {
+                    let sessions = match self.application.sessions() {
+                        Ok(sessions) => sessions,
+                        Err(error) => return Self::response_error(error),
+                    };
+                    if sessions.len() <= 1 {
+                        return BackendResponse {
+                            lines: vec!["当前项目还没有其他历史 Session".to_owned()],
+                            ..BackendResponse::default()
+                        };
+                    }
+                    self.pending_setup = Some(SetupState::SessionSwitch);
+                    BackendResponse {
+                        lines: Self::session_lines(&sessions),
+                        input_prompt: Some(InputPrompt {
+                            request_id: "session-switch".to_owned(),
+                            prompt: "选择当前项目的历史会话".to_owned(),
+                            placeholder: Some("输入标题或 Session ID".to_owned()),
+                        }),
+                        ..BackendResponse::default()
+                    }
+                }
                 SlashCommand::Sessions => match self.application.sessions() {
                     Ok(sessions) => BackendResponse {
                         lines: Self::session_lines(&sessions),
@@ -4263,6 +4572,46 @@ impl TerminalBackend for AppBackend {
                     },
                     Err(error) => Self::response_error(error),
                 },
+                SlashCommand::SessionSwitch { target } => {
+                    self.switch_session_response(&target)
+                }
+                SlashCommand::SessionNew => {
+                    if self.background_team.is_some() {
+                        Self::response_error("Agent Team 运行期间不能新建 Session")
+                    } else {
+                        match self.application.new_session() {
+                            Ok(status) => {
+                                if let Err(error) = self.apply_agent_instructions() {
+                                    return Self::response_error(error);
+                                }
+                                let mut lines = self.status_lines(&status);
+                                lines.push(format!(
+                                    "Vector · {}",
+                                    if self.vector_config_path.is_file() {
+                                        "已配置（项目私有）"
+                                    } else {
+                                        "未配置 · 使用 /vector setup"
+                                    }
+                                ));
+                                BackendResponse {
+                                    lines,
+                                    clear_view: true,
+                                    ..BackendResponse::default()
+                                }
+                            }
+                            Err(error) => Self::response_error(error),
+                        }
+                    }
+                }
+                SlashCommand::SessionRename { title } => {
+                    match self.application.rename_session(&title) {
+                        Ok(status) => BackendResponse {
+                            lines: self.status_lines(&status),
+                            ..BackendResponse::default()
+                        },
+                        Err(error) => Self::response_error(error),
+                    }
+                }
                 SlashCommand::Settings { operation } => match operation {
                     SettingsCommand::Show { key } => self.settings_show(key.as_deref()),
                     SettingsCommand::Set {
@@ -4465,8 +4814,13 @@ impl TerminalBackend for AppBackend {
         let cache = self.application.cache();
         let language = UiLanguage::parse(&self.application.config().settings.ui_language)
             .unwrap_or(UiLanguage::ZhCn);
+        let vector_configured = self.vector_config_path.is_file();
         match status {
             Ok(status) => TerminalSnapshot {
+                session_title: status
+                    .session_title
+                    .clone()
+                    .unwrap_or_else(|| "新会话".to_owned()),
                 model: if self.model_ready {
                     status.model
                 } else if is_hidden_internal_model_name(&status.model) {
@@ -4477,23 +4831,38 @@ impl TerminalBackend for AppBackend {
                 model_configured: self.model_ready,
                 language,
                 mode: status.mode,
+                permission_mode: self
+                    .application
+                    .config()
+                    .settings
+                    .permission_mode
+                    .to_string(),
                 reasoning: status.reasoning,
                 context_percent: context.as_ref().map_or(0, |context| context.percent),
                 cache_percent: cache.effective_hit_rate_percent,
                 agents: plan.map_or(0, |plan| plan.running),
+                vector_configured,
                 project: self.project_root.clone(),
                 branch: self.project_branch.clone(),
                 statusbar_visible: self.application.statusbar_visible(),
             },
             Err(_) => TerminalSnapshot {
+                session_title: "新会话".to_owned(),
                 model: "unavailable".to_owned(),
                 model_configured: false,
                 language,
                 mode: "lite".to_owned(),
+                permission_mode: self
+                    .application
+                    .config()
+                    .settings
+                    .permission_mode
+                    .to_string(),
                 reasoning: "off".to_owned(),
                 context_percent: context.as_ref().map_or(0, |context| context.percent),
                 cache_percent: cache.effective_hit_rate_percent,
                 agents: 0,
+                vector_configured,
                 project: self.project_root.clone(),
                 branch: self.project_branch.clone(),
                 statusbar_visible: self.application.statusbar_visible(),
@@ -4639,6 +5008,102 @@ fn event_scope_summary(entry: &EventEnvelope) -> String {
     }
 }
 
+#[derive(Clone, Debug)]
+struct StartupSessionSummary {
+    id: SessionId,
+    title: String,
+    updated_at_millis: i64,
+}
+
+fn load_startup_sessions(
+    project_root: &Path,
+) -> Result<Vec<StartupSessionSummary>, Box<dyn std::error::Error>> {
+    let database = project_root.join(".harness/kernel.sqlite");
+    if !database.is_file() {
+        return Ok(Vec::new());
+    }
+    let store = SqliteKernelStore::open(database)?;
+    store
+        .list_session_ids_by_recency()?
+        .into_iter()
+        .map(|id| {
+            let state = store.recover_session(&id)?;
+            Ok(StartupSessionSummary {
+                id,
+                title: state.title.unwrap_or_else(|| "未命名会话".to_owned()),
+                updated_at_millis: state.updated_at_millis,
+            })
+        })
+        .collect()
+}
+
+fn resolve_startup_session(
+    project_root: &Path,
+    resume: Option<&str>,
+    continue_session: bool,
+) -> Result<Option<SessionId>, Box<dyn std::error::Error>> {
+    if resume.is_none() && !continue_session {
+        return Ok(None);
+    }
+    let sessions = load_startup_sessions(project_root)?;
+    if sessions.is_empty() {
+        return Err("当前项目没有可恢复的 Session".into());
+    }
+    if continue_session {
+        return Ok(Some(sessions[0].id.clone()));
+    }
+    let target = resume.expect("resume 已检查");
+    if target == "__picker__" {
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            return Err("非交互终端必须使用 `kernary -r <session-id-or-title>`".into());
+        }
+        println!("当前项目 Sessions：");
+        for (index, session) in sessions.iter().enumerate() {
+            println!(
+                "  {}) {} · {} · updated={}",
+                index + 1,
+                session.title,
+                session.id,
+                session.updated_at_millis
+            );
+        }
+        print!("选择序号：");
+        io::stdout().flush()?;
+        let mut selection = String::new();
+        io::stdin().read_line(&mut selection)?;
+        let index = selection
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|index| (1..=sessions.len()).contains(index))
+            .ok_or("Session 序号无效")?;
+        return Ok(Some(sessions[index - 1].id.clone()));
+    }
+    if let Some(session) = sessions
+        .iter()
+        .find(|session| session.id.as_str() == target)
+    {
+        return Ok(Some(session.id.clone()));
+    }
+    let matches = sessions
+        .iter()
+        .filter(|session| session.title == target)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [session] => Ok(Some(session.id.clone())),
+        [] => Err(format!("当前项目不存在 Session：{target}").into()),
+        _ => Err(format!("Session title 重复：{target}；请改用 Session ID").into()),
+    }
+}
+
+fn new_interactive_session_id() -> Result<SessionId, Box<dyn std::error::Error>> {
+    Ok(SessionId::from(format!(
+        "session:{}:{}",
+        unix_millis()?,
+        std::process::id()
+    )))
+}
+
 pub fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -4653,6 +5118,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let command_name = invoked_command_name();
     let cli = Cli::from_arg_matches(&invocation_command(command_name).get_matches())?;
     let current_directory = std::env::current_dir()?;
+    ensure_private_git_excludes(&current_directory)?;
     match &cli.command {
         Some(Command::Doctor { json }) => {
             return doctor(&current_directory, *json, cli.ascii, cli.no_color);
@@ -4684,13 +5150,50 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let exec_mode = matches!(&cli.command, Some(Command::Exec { .. }));
+    if cli.command.is_some() && (cli.resume.is_some() || cli.continue_session) {
+        return Err("-r/--resume 与 -c/--continue 仅用于交互式 `kernary` 启动".into());
+    }
+    if cli.permission_mode.as_deref() == Some("bypass") && !cli.confirm_bypass {
+        return Err(
+            "Bypass 最高权限必须同时提供 `--confirm-bypass`；Sandbox hard deny 仍然有效".into(),
+        );
+    }
+    if cli.confirm_bypass && cli.permission_mode.as_deref() != Some("bypass") {
+        return Err("--confirm-bypass 只能与 --permission-mode bypass 一起使用".into());
+    }
+    let selected_session = if cli.command.is_none() {
+        resolve_startup_session(
+            &current_directory,
+            cli.resume.as_deref(),
+            cli.continue_session,
+        )?
+        .map_or_else(new_interactive_session_id, Ok)?
+    } else {
+        SessionId::from("session:default")
+    };
     let requested_model = cli.model.clone();
     if let Some(selection) = requested_model.as_deref() {
         ensure_selection_credential(&current_directory, selection, !exec_mode)?;
     }
-    let (mut backend, subscription) =
-        build_backend(&current_directory, requested_model.as_deref())?;
+    let (mut backend, subscription) = build_backend(
+        &current_directory,
+        requested_model.as_deref(),
+        selected_session,
+    )?;
     backend.application.boot()?;
+    for (key, value) in std::mem::take(&mut backend.seed_session_settings) {
+        backend
+            .application
+            .set_setting(&key, &value, ConfigLayer::Session)?;
+    }
+    backend.apply_agent_instructions()?;
+    if let Some(permission_mode) = cli.permission_mode.as_deref() {
+        backend.application.set_setting(
+            "permissions.mode",
+            permission_mode,
+            ConfigLayer::Session,
+        )?;
+    }
     if let Some(selection) = requested_model.as_deref() {
         let (provider, model) = parse_model_selection(selection)?;
         backend.application.select_model(provider, model)?;
@@ -5061,20 +5564,138 @@ fn ensure_selection_credential(
     Ok(())
 }
 
-fn project_branch_label(project_root: &Path) -> Option<String> {
+fn global_agent_md_path() -> Option<PathBuf> {
+    std::env::var_os("KERNARY_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .map(|home| {
+            if std::env::var_os("KERNARY_HOME").is_some() {
+                home.join("agent.md")
+            } else {
+                home.join(".kernary/agent.md")
+            }
+        })
+}
+
+fn read_agent_md(path: &Path, scope: &'static str) -> io::Result<Option<AgentInstructionsFile>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_file() || metadata.len() > 64 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("agent.md 必须是 64KiB 内普通文件：{}", path.display()),
+        ));
+    }
+    Ok(Some(AgentInstructionsFile {
+        scope,
+        path: path.to_path_buf(),
+        content: fs::read_to_string(path)?,
+    }))
+}
+
+fn load_agent_instructions(project_root: &Path) -> io::Result<Option<AgentInstructionsFile>> {
+    let project_path = project_root.join(".harness/agent.md");
+    if let Some(project) = read_agent_md(&project_path, "project")? {
+        return Ok(Some(project));
+    }
+    global_agent_md_path().map_or(Ok(None), |path| read_agent_md(&path, "global"))
+}
+
+fn agent_md_template(scope: &str) -> String {
+    format!(
+        "# Kernary agent.md ({scope})\n\n- 在这里填写每个会话都应遵守的具体规则。\n- 保持简短、可验证；任务专属流程请使用 Skill。\n- 本文件是本机辅助产物，不属于项目交付物。\n"
+    )
+}
+
+fn create_agent_md(path: &Path, scope: &str) -> io::Result<()> {
+    if path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("agent.md 已存在：{}", path.display()),
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "agent.md 缺少父目录"))?;
+    fs::create_dir_all(parent)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(agent_md_template(scope).as_bytes())?;
+    file.sync_all()
+}
+
+fn project_git_directory(project_root: &Path) -> Option<PathBuf> {
     let dot_git = project_root.join(".git");
-    let git_directory = if dot_git.is_dir() {
-        dot_git
+    if dot_git.is_dir() {
+        Some(dot_git)
     } else {
         let pointer = fs::read_to_string(&dot_git).ok()?;
         let path = pointer.trim().strip_prefix("gitdir:")?.trim();
         let path = PathBuf::from(path);
         if path.is_absolute() {
-            path
+            Some(path)
         } else {
-            project_root.join(path)
+            Some(project_root.join(path))
         }
+    }
+}
+
+fn project_git_common_directory(project_root: &Path) -> Option<PathBuf> {
+    let git_directory = project_git_directory(project_root)?;
+    let common = git_directory.join("commondir");
+    if !common.is_file() {
+        return Some(git_directory);
+    }
+    let path = PathBuf::from(fs::read_to_string(common).ok()?.trim());
+    Some(if path.is_absolute() {
+        path
+    } else {
+        git_directory.join(path)
+    })
+}
+
+fn ensure_private_git_excludes(project_root: &Path) -> io::Result<()> {
+    let Some(git_directory) = project_git_common_directory(project_root) else {
+        return Ok(());
     };
+    let info_directory = git_directory.join("info");
+    fs::create_dir_all(&info_directory)?;
+    let path = info_directory.join("exclude");
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let required = ["/.harness/", "/kernary.vector.toml", "/agent.md"];
+    if required
+        .iter()
+        .all(|entry| existing.lines().any(|line| line.trim() == *entry))
+    {
+        return Ok(());
+    }
+    let mut addition = String::new();
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        addition.push('\n');
+    }
+    addition.push_str("# Kernary local auxiliary state (never a project artifact)\n");
+    for entry in required {
+        if !existing.lines().any(|line| line.trim() == entry) {
+            addition.push_str(entry);
+            addition.push('\n');
+        }
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(addition.as_bytes())?;
+    file.sync_all()
+}
+
+fn project_branch_label(project_root: &Path) -> Option<String> {
+    let git_directory = project_git_directory(project_root)?;
     let head = fs::read_to_string(git_directory.join("HEAD")).ok()?;
     let head = head.trim();
     if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
@@ -5087,18 +5708,47 @@ fn project_branch_label(project_root: &Path) -> Option<String> {
 fn build_backend(
     project_root: &Path,
     requested_model: Option<&str>,
+    session_id: SessionId,
 ) -> Result<(AppBackend, EventSubscription), Box<dyn std::error::Error>> {
     let startup_started = Instant::now();
     let state_directory = project_root.join(".harness");
     fs::create_dir_all(&state_directory)?;
+    let agent_instructions = load_agent_instructions(project_root)?;
     let project_lock = ProjectStateLock::acquire(&state_directory)?;
     let database_path = state_directory.join("kernel.sqlite");
     let store = SqliteKernelStore::open(&database_path)?;
-    let session_id = SessionId::from("session:default");
     let persisted = store.recover_session(&session_id)?;
-    let config = load_runtime_config(project_root, &persisted.settings)?;
+    let model_seed = if persisted.version == 0 {
+        store
+            .list_session_ids_by_recency()?
+            .into_iter()
+            .find(|candidate| candidate != &session_id)
+            .map(|candidate| store.recover_session(&candidate))
+            .transpose()?
+            .unwrap_or_else(|| persisted.clone())
+    } else {
+        persisted.clone()
+    };
+    let seed_session_settings = if persisted.version == 0 {
+        model_seed
+            .settings
+            .iter()
+            .filter(|(key, value)| {
+                key.as_str() != "permissions.mode" || !matches!(value.as_str(), "full" | "bypass")
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>()
+    } else {
+        BTreeMap::new()
+    };
+    let config_values = if persisted.version == 0 {
+        &seed_session_settings
+    } else {
+        &persisted.settings
+    };
+    let config = load_runtime_config(project_root, config_values)?;
     let test_model_enabled = internal_test_model_enabled();
-    let persisted_selection = persisted
+    let persisted_selection = model_seed
         .model
         .provider_id
         .clone()
@@ -5135,7 +5785,18 @@ fn build_backend(
         Arc::new(OsCredentialStore::new("dev.openai.harness")?);
     let provider_config_path = configured_path(project_root, "KERNARY_PROVIDER_CONFIG")
         .unwrap_or_else(|| default_project_catalog_path(project_root));
-    let vector_config_path = project_root.join("kernary.vector.toml");
+    let vector_config_path = state_directory.join("vector.toml");
+    let legacy_vector_config_path = project_root.join("kernary.vector.toml");
+    if !vector_config_path.exists()
+        && legacy_vector_config_path.is_file()
+        && let Some(config) = VectorProviderConfig::load(&legacy_vector_config_path)?
+    {
+        config.save(&vector_config_path)?;
+        eprintln!(
+            "[WARN] 已把旧向量配置迁移到项目私有路径 {}；旧文件已加入本地 Git exclude，可手动删除",
+            vector_config_path.display()
+        );
+    }
     let mut provider_catalog = load_provider_catalog(project_root)?;
     for (provider_id, model_id) in requested_selection.iter().chain(persisted_selection.iter()) {
         if provider_catalog.get(provider_id).is_some() {
@@ -5234,7 +5895,7 @@ fn build_backend(
         model_registry,
         initial_selection.0,
         initial_selection.1,
-        persisted.model.reasoning,
+        model_seed.model.reasoning,
     )?;
     let event_bus = EventBus::new();
     let subscription = event_bus.subscribe(1_024)?;
@@ -5568,6 +6229,8 @@ fn build_backend(
             registry: CommandRegistry::with_language(language),
             project_root: project_root.display().to_string(),
             project_branch: project_branch_label(project_root),
+            agent_instructions,
+            seed_session_settings,
             provider_config_path,
             vector_config_path,
             mcp_config_path,
@@ -5903,10 +6566,13 @@ fn env_u32(name: &str, fallback: u32) -> u32 {
 
 const fn permission_policy(mode: PermissionMode) -> ApprovalPolicy {
     match mode {
-        PermissionMode::Safe => ApprovalPolicy::Always,
-        PermissionMode::Ask | PermissionMode::Custom => ApprovalPolicy::OnRequest,
-        PermissionMode::Auto => ApprovalPolicy::UntrustedOnly,
+        PermissionMode::Manual | PermissionMode::Safe => ApprovalPolicy::Always,
+        PermissionMode::AcceptEdits => ApprovalPolicy::CommandsOnly,
+        PermissionMode::Ask | PermissionMode::Auto | PermissionMode::Custom => {
+            ApprovalPolicy::OnRequest
+        }
         PermissionMode::Full => ApprovalPolicy::NeverWithinSandbox,
+        PermissionMode::Bypass => ApprovalPolicy::BypassWithinSandbox,
     }
 }
 
@@ -6374,6 +7040,10 @@ fn doctor(
     let embedding_model_configured = compat_env_var("HARNESS_EMBEDDING_MODEL")
         .ok()
         .is_some_and(|value| !value.trim().is_empty())
+        || VectorProviderConfig::load(project_root.join(".harness/vector.toml"))
+            .ok()
+            .flatten()
+            .is_some()
         || VectorProviderConfig::load(project_root.join("kernary.vector.toml"))
             .ok()
             .flatten()

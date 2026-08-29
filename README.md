@@ -49,7 +49,7 @@ Kernary 不会在未配置模型时用测试模型伪造结果。第一次进入
 /vector setup
 ```
 
-依次输入 Embedding Base URL、Secure Key 和手写模型名。Kernary 不拉取向量模型目录，只发送一次真实 Embedding 请求；成功后记录返回维度并保存 `kernary.vector.toml`。使用 `/vector clear` 可恢复 lexical-only。
+依次输入 Embedding Base URL、Secure Key 和手写模型名。Kernary 不拉取向量模型目录，只发送一次真实 Embedding 请求；成功后记录返回维度并保存到项目私有 `.harness/vector.toml`。向量配置、投影与数据库都只存在当前项目的 `.harness/`，使用 `/vector clear` 可恢复 lexical-only。
 
 界面语言支持高度定制的命令目录、快捷键提示和设置向导：
 
@@ -77,6 +77,58 @@ kernary --model openai/gpt-5.6-sol exec --json "运行测试并总结结果"
 ```
 
 未配置可用模型时，普通输入与 Headless/Exec 会明确返回 `MODEL_NOT_CONFIGURED`，不会创建 Agent Mission 或模拟 Usage。
+
+## 项目隔离的多会话
+
+直接运行 `kernary` 每次创建新的项目本地 Session。Session 使用独立 ID、不可变 Transcript、Context、标题和设置；第一次有效用户对话会在本地生成不超过 48 字符的标题，不额外调用模型。Context 压缩不会删除 Session Transcript。
+
+```text
+kernary                    # 新 Session
+kernary -c                 # 继续当前项目最近 Session
+kernary -r                 # 当前项目 Session 选择器
+kernary -r <id-or-title>   # 按 ID 或唯一标题恢复
+
+/session                   # 会话内选择器
+/session list
+/session new
+/session switch <id-or-title>
+/session rename <title>
+```
+
+Session 只从当前工作目录的 `.harness/kernel.sqlite` 读取；不会搜索或显示其他项目的历史。
+
+## 权限等级
+
+权限策略与 Sandbox 技术边界保持分离：
+
+- `manual`：所有 Tool 操作确认；
+- `edit`：项目文件编辑自动，终端命令与外部操作确认；
+- `auto`：Sandbox 内低风险自动，高风险或越界操作确认；
+- `full`：Sandbox 内自动执行，Workspace Patch 仍二次确认；
+- `bypass`：Sandbox 内取消手动确认，包括 Patch；必须输入确认短语或传 `--confirm-bypass`。
+
+```text
+/permissions manual|edit|auto|full|bypass
+kernary --permission-mode edit
+kernary --permission-mode bypass --confirm-bypass
+```
+
+TUI 中可用 `Shift+Tab` 在 `manual → edit → auto → full` 之间循环；`bypass` 不进入快捷循环。
+
+任何等级都不能绕过 denied roots、项目边界和 Sandbox hard deny。
+
+## 私有 agent.md
+
+Kernary 使用本机辅助指令文件 `agent.md`：项目私有 `.harness/agent.md` 存在时覆盖全局 `~/.kernary/agent.md`，否则读取全局文件。它们不会叠加，避免冲突和 Context 膨胀。
+
+```text
+/agentmd status
+/agentmd show
+/agentmd init-project
+/agentmd init-global
+```
+
+Kernary 会把 `/.harness/`、旧 `/kernary.vector.toml` 和 `/agent.md` 写入当前仓库的 `.git/info/exclude`，这些文件默认不属于项目产物。
 
 ## 内置 Agent 与 Adaptive 工作流
 

@@ -233,6 +233,10 @@ impl SqliteKernelStore {
         Ok(state)
     }
 
+    pub fn list_session_ids_by_recency(&self) -> StoreResult<Vec<SessionId>> {
+        <Self as KernelStore>::list_session_ids(self)
+    }
+
     fn send(&self, command: StoreCommand) -> StoreResult<()> {
         self.sender
             .send(command)

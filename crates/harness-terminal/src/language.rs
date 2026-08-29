@@ -99,6 +99,14 @@ pub struct LanguagePack {
     pub connect_provider_action: &'static str,
     pub browse_commands_action: &'static str,
     pub exit_hint: &'static str,
+    pub vector_label: &'static str,
+    pub vector_configured_label: &'static str,
+    pub vector_unconfigured_label: &'static str,
+    pub vector_setup_action: &'static str,
+    pub new_session_title: &'static str,
+    pub agent_md_action: &'static str,
+    pub permission_label: &'static str,
+    pub permission_cycle_hint: &'static str,
 }
 
 pub(crate) fn command_description(
@@ -119,6 +127,11 @@ pub(crate) fn command_description(
             "Inspect one agent's role, capabilities, and lifecycle",
             "檢視單一 Agent 的角色、能力與生命週期",
             "単一エージェントの役割・能力・状態を確認します",
+        ),
+        "/agentmd" => (
+            "Manage global or project-private agent.md instructions",
+            "管理全域或專案私有的 agent.md 指令",
+            "グローバルまたはプロジェクト専用の agent.md 指示を管理します",
         ),
         "/agents" => (
             "List agents using normal, verbose, compact, or tree views",
@@ -296,9 +309,9 @@ pub(crate) fn command_description(
             "永続パッチ記録を一覧表示します",
         ),
         "/permissions" => (
-            "Manage permission modes and durable rules",
-            "管理權限模式與持久規則",
-            "権限モードと永続ルールを管理します",
+            "Manage manual, edit, auto, full, bypass modes and durable rules",
+            "管理手動、編輯、自動、完整、bypass 模式與持久規則",
+            "手動・編集・自動・フル・bypass モードと永続ルールを管理します",
         ),
         "/pin" => (
             "Add context that compaction cannot remove",
@@ -371,9 +384,9 @@ pub(crate) fn command_description(
             "実際のサンドボックス機能と強制境界を表示します",
         ),
         "/session" => (
-            "Show the current durable session",
-            "顯示目前持久化 Session",
-            "現在の永続セッションを表示します",
+            "Pick, create, switch, or rename a project-local session",
+            "選擇、建立、切換或重新命名專案本機 Session",
+            "プロジェクト内のセッションを選択・作成・切替・改名します",
         ),
         "/sessions" => (
             "List project sessions and fork lineage",
@@ -507,6 +520,14 @@ const EN: LanguagePack = LanguagePack {
     connect_provider_action: "Connect a built-in provider",
     browse_commands_action: "Browse every command",
     exit_hint: "Press Ctrl+C again within 2 seconds to exit",
+    vector_label: "Vector",
+    vector_configured_label: "configured",
+    vector_unconfigured_label: "off",
+    vector_setup_action: "Configure optional project-local semantic memory",
+    new_session_title: "New project-local session. Start with a focused task.",
+    agent_md_action: "Inspect global/project private instructions",
+    permission_label: "Permission",
+    permission_cycle_hint: "Shift+Tab permission",
 };
 
 const ZH_CN: LanguagePack = LanguagePack {
@@ -566,6 +587,14 @@ const ZH_CN: LanguagePack = LanguagePack {
     connect_provider_action: "连接内置模型提供商",
     browse_commands_action: "浏览全部命令",
     exit_hint: "2 秒内再次按 Ctrl+C 退出",
+    vector_label: "向量",
+    vector_configured_label: "已配置",
+    vector_unconfigured_label: "未配置",
+    vector_setup_action: "配置可选的项目私有语义记忆",
+    new_session_title: "新的项目本地会话；从一个明确任务开始。",
+    agent_md_action: "查看全局/项目私有指令",
+    permission_label: "权限",
+    permission_cycle_hint: "Shift+Tab 切换权限",
 };
 
 const ZH_TW: LanguagePack = LanguagePack {
@@ -625,6 +654,14 @@ const ZH_TW: LanguagePack = LanguagePack {
     connect_provider_action: "連接內建模型提供商",
     browse_commands_action: "瀏覽全部命令",
     exit_hint: "2 秒內再次按 Ctrl+C 離開",
+    vector_label: "向量",
+    vector_configured_label: "已設定",
+    vector_unconfigured_label: "未設定",
+    vector_setup_action: "設定可選的專案私有語意記憶",
+    new_session_title: "新的專案本機會話；請從明確任務開始。",
+    agent_md_action: "檢視全域/專案私有指令",
+    permission_label: "權限",
+    permission_cycle_hint: "Shift+Tab 切換權限",
 };
 
 const JA: LanguagePack = LanguagePack {
@@ -684,6 +721,14 @@ const JA: LanguagePack = LanguagePack {
     connect_provider_action: "組み込みプロバイダーへ接続",
     browse_commands_action: "すべてのコマンドを表示",
     exit_hint: "2 秒以内にもう一度 Ctrl+C を押すと終了します",
+    vector_label: "ベクトル",
+    vector_configured_label: "設定済み",
+    vector_unconfigured_label: "未設定",
+    vector_setup_action: "任意のプロジェクト専用セマンティックメモリを設定",
+    new_session_title: "新しいプロジェクト専用セッションです。明確なタスクから始めてください。",
+    agent_md_action: "グローバル/プロジェクト専用の指示を確認",
+    permission_label: "権限",
+    permission_cycle_hint: "Shift+Tab 権限切替",
 };
 
 #[cfg(test)]

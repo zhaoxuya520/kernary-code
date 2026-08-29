@@ -12,11 +12,11 @@ pub use brand::{
     MASCOT_NAME, PRODUCT_NAME, PRODUCT_SHORT_NAME, TAGLINE, compact_mark, mascot_lines,
 };
 pub use command::{
-    AgentDisplayMode, BrowserCommand, BudgetCommand, CommandRegistry, CompactCommandMode,
-    FailoverCommand, GitCommand, IndexCommand, InputSuggestion, LspCommand, McpCommand,
-    MemoryCommand, ParsedInput, PermissionCommand, PluginCommand, ProviderCommand, QueueCommand,
-    SettingLayer, SettingsCommand, SkillCommand, SlashCommand, TeamCommand, TraceCommand,
-    VectorCommand,
+    AgentDisplayMode, AgentMdCommand, BrowserCommand, BudgetCommand, CommandRegistry,
+    CompactCommandMode, FailoverCommand, GitCommand, IndexCommand, InputSuggestion, LspCommand,
+    McpCommand, MemoryCommand, ParsedInput, PermissionCommand, PluginCommand, ProviderCommand,
+    QueueCommand, SettingLayer, SettingsCommand, SkillCommand, SlashCommand, TeamCommand,
+    TraceCommand, VectorCommand,
 };
 pub use language::{LanguagePack, UiLanguage};
 pub use render::{ActivityIcon, JsonRenderer, PlainRenderer, RenderStyle, TerminalCapabilities};
