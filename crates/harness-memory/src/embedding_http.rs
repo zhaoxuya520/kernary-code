@@ -14,6 +14,8 @@ pub struct HttpEmbeddingConfig {
     pub provider: String,
     pub endpoint: String,
     pub credential_id: Option<String>,
+    /// 固定维度模型为 false；只有显式协商可变维度时才发送 dimensions。
+    pub send_dimensions: bool,
     pub allow_remote_project_private: bool,
     pub timeout_millis: Option<u64>,
 }
@@ -59,6 +61,40 @@ impl HttpEmbeddingFactory {
             text,
         )
     }
+
+    /// 自动探测失败后的显式维度验证；Provider 必须返回完全相同的向量长度。
+    pub fn probe_with_dimensions(
+        &self,
+        model: &str,
+        dimensions: usize,
+        text: &str,
+    ) -> Result<Vec<f32>, MemoryError> {
+        let model = model.trim();
+        if model.is_empty() {
+            return Err(MemoryError::new("embedding-model-empty", "model"));
+        }
+        if !(1..=65_536).contains(&dimensions) {
+            return Err(MemoryError::new(
+                "embedding-dimensions-invalid",
+                dimensions.to_string(),
+            ));
+        }
+        let vector = request_embedding(
+            &self.config,
+            self.credentials.as_ref(),
+            self.transport.as_ref(),
+            model,
+            Some(dimensions),
+            text,
+        )?;
+        if vector.len() != dimensions {
+            return Err(MemoryError::new(
+                "embedding-dimensions-mismatch",
+                format!("requested={dimensions}, actual={}", vector.len()),
+            ));
+        }
+        Ok(vector)
+    }
 }
 impl EmbeddingProviderFactory for HttpEmbeddingFactory {
     fn create(
@@ -95,7 +131,9 @@ impl EmbeddingProvider for HttpEmbeddingProvider {
             self.credentials.as_ref(),
             self.transport.as_ref(),
             &self.profile.model,
-            Some(self.profile.dimensions),
+            self.config
+                .send_dimensions
+                .then_some(self.profile.dimensions),
             text,
         )
     }

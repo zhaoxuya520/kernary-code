@@ -955,12 +955,19 @@ fn render_product_tui(frame: &mut Frame<'_>, view: TuiView<'_>) -> usize {
 
     if status_height > 0 {
         let separator = if view.options.ascii { " | " } else { "  ·  " };
-        let mut footer = view.pack.send_hint.to_owned();
+        let setup_active = view.input_prompt.is_some() || view.secret_prompt.is_some();
+        let mut footer = if setup_active {
+            view.pack.setup_cancel_hint.to_owned()
+        } else {
+            view.pack.send_hint.to_owned()
+        };
         if area.width >= 92 {
-            footer.push_str(separator);
-            footer.push_str(view.pack.scroll_hint);
-            footer.push_str(separator);
-            footer.push_str(view.pack.permission_cycle_hint);
+            if !setup_active {
+                footer.push_str(separator);
+                footer.push_str(view.pack.scroll_hint);
+                footer.push_str(separator);
+                footer.push_str(view.pack.permission_cycle_hint);
+            }
             if let Some(cache) = view.snapshot.cache_percent {
                 footer.push_str(separator);
                 footer.push_str(view.pack.cache_label);
@@ -1779,5 +1786,47 @@ mod tests {
         assert!(screen.contains("/provider"), "screen={screen}");
         assert!(screen.contains("/pro"), "screen={screen}");
         assert!(screen.contains("kernary-demo"), "screen={screen}");
+    }
+
+    #[test]
+    fn setup_composer_exposes_escape_and_cancel_return_path() {
+        let backend = TestBackend::new(100, 16);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let snapshot = snapshot(false);
+        let input = LineEditor::default();
+        let secret_input = LineEditor::default();
+        let prompt = InputPrompt {
+            request_id: "vector-url".to_owned(),
+            prompt: "Embedding API Base URL".to_owned(),
+            placeholder: None,
+        };
+        terminal
+            .draw(|frame| {
+                render_product_tui(
+                    frame,
+                    TuiView {
+                        snapshot: &snapshot,
+                        pack: snapshot.language.pack(),
+                        history: &[],
+                        input: &input,
+                        secret_prompt: None,
+                        secret_input: &secret_input,
+                        input_prompt: Some(&prompt),
+                        suggestions: &[],
+                        suggestion_cursor: 0,
+                        transcript_scroll: 0,
+                        show_onboarding: false,
+                        elapsed: Duration::ZERO,
+                        options: TuiOptions {
+                            ascii: false,
+                            color: true,
+                        },
+                    },
+                );
+            })
+            .expect("render setup TUI");
+        let screen = screen_text(terminal.backend());
+        let compact = screen.replace(' ', "");
+        assert!(compact.contains("Esc或/cancel返回聊天"), "screen={screen}");
     }
 }

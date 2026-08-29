@@ -11,7 +11,17 @@ pub const DEFAULT_VECTOR_PROVIDER: &str = "default";
 pub const DEFAULT_VECTOR_CREDENTIAL_ID: &str = "vector:default";
 const MAX_VECTOR_CONFIG_BYTES: u64 = 64 * 1024;
 
-/// 每个项目只允许一个 Embedding Provider；Key 仍只存在 OS Credential Store。
+/// 维度协商模式：固定维度模型不发送 dimensions，可变维度模型显式发送用户选择。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VectorDimensionMode {
+    AutoDetected,
+    /// 兼容旧配置：旧版运行时始终发送 dimensions。
+    #[default]
+    Requested,
+}
+
+/// 全局只允许一个 Embedding Provider；Key 仍只存在 OS Credential Store。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct VectorProviderConfig {
@@ -20,6 +30,8 @@ pub struct VectorProviderConfig {
     pub model: String,
     pub credential_id: String,
     pub dimensions: usize,
+    #[serde(default)]
+    pub dimension_mode: VectorDimensionMode,
     pub verified_at_millis: i64,
 }
 
@@ -36,10 +48,37 @@ impl VectorProviderConfig {
             model: model.into().trim().to_owned(),
             credential_id: DEFAULT_VECTOR_CREDENTIAL_ID.to_owned(),
             dimensions,
+            dimension_mode: VectorDimensionMode::AutoDetected,
             verified_at_millis,
         };
         config.validate()?;
         Ok(config)
+    }
+
+    pub fn new_requested(
+        endpoint: impl Into<String>,
+        model: impl Into<String>,
+        dimensions: usize,
+        verified_at_millis: i64,
+    ) -> Result<Self, MemoryError> {
+        let mut config = Self::new(endpoint, model, dimensions, verified_at_millis)?;
+        config.dimension_mode = VectorDimensionMode::Requested;
+        Ok(config)
+    }
+
+    #[must_use]
+    pub const fn sends_dimensions(&self) -> bool {
+        matches!(self.dimension_mode, VectorDimensionMode::Requested)
+    }
+
+    pub fn refresh_detected_dimensions(
+        &mut self,
+        dimensions: usize,
+        verified_at_millis: i64,
+    ) -> Result<(), MemoryError> {
+        self.dimensions = dimensions;
+        self.verified_at_millis = verified_at_millis;
+        self.validate()
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Option<Self>, MemoryError> {
@@ -179,5 +218,37 @@ mod tests {
         );
         let source = fs::read_to_string(path).expect("source");
         assert!(!source.to_ascii_lowercase().contains("api_key"));
+    }
+
+    #[test]
+    fn requested_and_detected_dimensions_have_distinct_wire_contracts() {
+        let detected =
+            VectorProviderConfig::new("https://relay.example/v1/embeddings", "fixed-model", 768, 1)
+                .expect("detected");
+        let requested = VectorProviderConfig::new_requested(
+            "https://relay.example/v1/embeddings",
+            "variable-model",
+            1_024,
+            2,
+        )
+        .expect("requested");
+        assert!(!detected.sends_dimensions());
+        assert!(requested.sends_dimensions());
+    }
+
+    #[test]
+    fn legacy_config_without_dimension_mode_preserves_requested_wire_behavior() {
+        let temporary = tempdir().expect("tempdir");
+        let path = temporary.path().join("legacy-vector.toml");
+        fs::write(
+            &path,
+            "schema_version = 1\nendpoint = \"https://relay.example/v1/embeddings\"\nmodel = \"legacy\"\ncredential_id = \"vector:default\"\ndimensions = 1536\nverified_at_millis = 1\n",
+        )
+        .expect("legacy config");
+        let loaded = VectorProviderConfig::load(path)
+            .expect("load")
+            .expect("config");
+        assert_eq!(loaded.dimension_mode, VectorDimensionMode::Requested);
+        assert!(loaded.sends_dimensions());
     }
 }

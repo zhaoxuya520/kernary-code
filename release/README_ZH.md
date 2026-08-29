@@ -27,7 +27,7 @@ bin/harness --version
 
 自定义文本模型提供商使用 `/provider add`，向导完成 URL、Key、自动模型发现与默认模型选择。`/provider switch` 切换提供商，`/model` 只切换当前提供商内的模型。
 
-向量模型使用 `/vector setup` 单独配置：只允许一个 Provider，模型名手写且不做目录发现，保存前必须通过一次真实 Embedding 验证。`/vector clear` 删除项目配置、凭证引用与向量投影。
+向量模型使用 `/vector setup` 单独配置：全局只允许一个 Provider，模型名手写且不做目录发现。维度先从不带 `dimensions` 的真实响应自动识别；检测失败才要求手动输入并再次验证。Provider/Key 全局复用，每个项目启动时自动健康检查；Memory 和向量投影仍按项目隔离。`/vector clear` 二次确认后删除全局配置与凭证，并清除当前项目投影。
 
 `/language en|zh-CN|zh-TW|ja` 可切换并持久化英语、简体中文、繁体中文和日语语言包。
 
@@ -90,7 +90,7 @@ kernary models --refresh ollama
 
 `kernary` 每次创建新 Session；`kernary -c` 继续当前项目最近会话，`kernary -r [id-or-title]` 从当前项目选择恢复。会话内使用 `/session`、`/session new`、`/session switch` 和 `/session rename`。标题由第一条有效对话本地生成，完整 Transcript 不随 Context 压缩删除。
 
-项目私有指令位于 `.harness/agent.md`，不存在时才读取全局 `~/.kernary/agent.md`；使用 `/agentmd` 管理。向量配置位于 `.harness/vector.toml`，Memory/Repository/Vector SQLite 也全部位于 `.harness/`。Kernary 自动写入 `.git/info/exclude`，这些辅助文件默认不会进入 Git。
+项目私有指令位于 `.harness/agent.md`，不存在时才读取全局 `~/.kernary/agent.md`；使用 `/agentmd` 管理。全局向量 Provider 位于 Kernary 用户配置目录的 `vector.toml`，Memory/Repository/Vector SQLite 则全部位于各项目 `.harness/`。旧项目向量配置会在全局配置缺失时自动迁移；Kernary 继续写入 `.git/info/exclude`，项目辅助数据默认不会进入 Git。
 
 细粒度规则可从 `examples/kernary.permissions.toml` 开始，也可使用：
 
@@ -155,7 +155,7 @@ Restore 前自动生成 `pre-restore-*` recovery point。备份不包含 OS Cred
 
 ## Optional Vector
 
-未设置或留空 `KERNARY_EMBEDDING_MODEL`（legacy fallback：`HARNESS_EMBEDDING_MODEL`）时，Kernary 不构造 Embedding Provider/Vector Backend，不创建向量表、目录、generation 或 job。设置有效模型后也只进入 Ready；首次 semantic/hybrid 请求才惰性激活。
+未配置全局向量 Provider，也未设置 `KERNARY_EMBEDDING_MODEL`（legacy fallback：`HARNESS_EMBEDDING_MODEL`）时，Kernary 不构造 Embedding Provider/Vector Backend，不创建向量表、generation 或 job。项目启动健康检查通过后进入 Ready；首次 semantic/hybrid 请求才惰性激活当前项目投影，失败则明确降级为 lexical-only。
 
 ## 命令与状态兼容
 

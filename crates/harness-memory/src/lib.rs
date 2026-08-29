@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! 项目级结构化 Memory。Lexical 永远可用；Semantic 只由有效 Embedding Model 配置派生。
+//! 项目级结构化 Memory。数据按项目隔离；Semantic 由全局 Embedding Provider 配置派生。
 
 mod embedding_http;
 mod repository;

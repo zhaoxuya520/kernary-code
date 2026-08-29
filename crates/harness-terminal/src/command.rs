@@ -877,7 +877,7 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/vector",
         synopsis: "/vector [status|setup|clear|on|off|auto|purge]",
-        description: "配置并验证单一 Embedding Provider，或管理向量检索偏好",
+        description: "配置并验证全局 Embedding Provider，或管理当前项目向量检索",
     },
     CommandSpec {
         name: "/why",
@@ -1454,8 +1454,8 @@ fn argument_suggestions(input: &str) -> Vec<InputSuggestion> {
         ],
         "/vector" => &[
             ("status", "显示向量硬门与后端状态"),
-            ("setup", "配置 URL、Key 与手填 Embedding 模型"),
-            ("clear", "移除单一 Embedding Provider 配置"),
+            ("setup", "配置全局 URL、Key、模型与自动/手动维度"),
+            ("clear", "确认后移除全局 Embedding Provider 配置"),
             ("on", "有 Embedding Model 时允许语义检索"),
             ("off", "强制 lexical 路径"),
             ("auto", "按能力与模式自动选择"),

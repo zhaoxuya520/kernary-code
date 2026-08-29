@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -13,15 +13,33 @@ use tempfile::tempdir;
 type CliFactory = fn() -> Command;
 type DocumentationCase<'a> = (CliFactory, Vec<&'a str>, &'a str);
 
+static VECTOR_CONFIG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn isolated_global_vector_config() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "kernary-cli-vector-{}-{}.toml",
+        std::process::id(),
+        VECTOR_CONFIG_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 fn harness() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_harness"));
     command.env("KERNARY_ENABLE_TEST_MODEL", "1");
+    command.env(
+        "KERNARY_GLOBAL_VECTOR_CONFIG",
+        isolated_global_vector_config(),
+    );
     command
 }
 
 fn kernary() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_kernary"));
     command.env("KERNARY_ENABLE_TEST_MODEL", "1");
+    command.env(
+        "KERNARY_GLOBAL_VECTOR_CONFIG",
+        isolated_global_vector_config(),
+    );
     command
 }
 
@@ -29,6 +47,10 @@ fn kernary_without_test_model() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_kernary"));
     command.env_remove("KERNARY_ENABLE_TEST_MODEL");
     command.env_remove("HARNESS_ENABLE_TEST_MODEL");
+    command.env(
+        "KERNARY_GLOBAL_VECTOR_CONFIG",
+        isolated_global_vector_config(),
+    );
     command
 }
 
@@ -354,8 +376,11 @@ fn doctor_json_reports_storage_and_terminal_capabilities() {
     assert!(value["providers"]["catalogCount"].as_u64().unwrap_or(0) >= 10);
     assert_eq!(value["providers"]["customConfigPresent"], false);
     assert_eq!(value["storageSchema"], 3);
-    assert_eq!(value["stage"], 21);
-    assert_eq!(value["stageTrack"], "25-platform-native-subprocess-sandbox");
+    assert_eq!(value["stage"], 22);
+    assert_eq!(
+        value["stageTrack"],
+        "26-global-vector-health-and-setup-navigation"
+    );
     assert_eq!(value["sandbox"]["mode"], "workspace-write");
     assert!(value["sandbox"]["available"].as_bool().is_some());
     assert!(value["sandbox"]["backend"].as_str().is_some());
@@ -1085,6 +1110,43 @@ fn slash_connect_uses_secure_lane_and_cancels_without_tty() {
 }
 
 #[test]
+fn every_setup_wizard_accepts_cancel_and_returns_to_normal_chat() {
+    let temporary = tempdir().expect("tempdir");
+    let mut child = kernary()
+        .current_dir(temporary.path())
+        .args(["--ui", "plain", "--ascii"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn setup cancellation test");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(
+            b"keep this conversation visible\n/provider add\n/cancel\n/status\n/provider add\nhttps://example.com/v1\n/cancel\n/status\n/vector setup\n/cancel\n/status\n/vector setup\nhttp://127.0.0.1:9/v1\n/cancel\n/status\n/vector clear\n/cancel\n/status\n/permissions bypass\n/cancel\n/status\n/exit\n",
+        )
+        .expect("commands");
+    let output = child.wait_with_output().expect("output");
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.matches("设置已取消").count() >= 6, "stdout={stdout}");
+    assert!(
+        stdout.matches("模式  balanced").count() >= 6,
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.matches("keep this conversation visible").count() >= 2,
+        "stdout={stdout}"
+    );
+    assert!(!temporary.path().join("kernary.providers.toml").exists());
+}
+
+#[test]
 fn ascii_headless_has_no_decorative_unicode() {
     let temporary = tempdir().expect("tempdir");
     let output = harness()
@@ -1186,7 +1248,7 @@ fn language_switch_persists_and_localizes_command_help() {
     let stdout = String::from_utf8(output.stdout).expect("stdout");
     assert!(stdout.contains("Language: en"), "stdout={stdout}");
     assert!(
-        stdout.contains("Configure and validate the single embedding provider"),
+        stdout.contains("Configure the global embedding provider and project-local retrieval"),
         "stdout={stdout}"
     );
 }
@@ -1643,7 +1705,7 @@ fn memory_repository_and_vector_off_commands_work_without_embedding_model() {
         "stdout={stdout}"
     );
     assert!(stdout.contains("Vector Absent"), "stdout={stdout}");
-    assert!(stdout.contains("schemaPresent=false"), "stdout={stdout}");
+    assert!(stdout.contains("Vector Schema    false"), "stdout={stdout}");
     assert!(stdout.contains("src/auth.rs"), "stdout={stdout}");
     let connection = rusqlite::Connection::open(temporary.path().join(".harness/memory.sqlite"))
         .expect("memory db");
@@ -1660,21 +1722,18 @@ fn memory_repository_and_vector_off_commands_work_without_embedding_model() {
 }
 
 #[test]
-fn vector_configuration_and_projection_are_project_private_auxiliary_state() {
+fn legacy_project_vector_config_migrates_to_global_and_project_data_stays_local() {
     let temporary = tempdir().expect("tempdir");
     let state = temporary.path().join(".harness");
+    let global_config = temporary.path().join("global/vector.toml");
     std::fs::create_dir_all(&state).expect("state");
-    VectorProviderConfig::new(
-        "https://embedding.example/v1/embeddings",
-        "embed-private",
-        16,
-        42,
-    )
-    .expect("config")
-    .save(state.join("vector.toml"))
-    .expect("save private vector config");
+    VectorProviderConfig::new("http://127.0.0.1:9/v1/embeddings", "embed-private", 16, 42)
+        .expect("config")
+        .save(state.join("vector.toml"))
+        .expect("save private vector config");
     let mut child = kernary()
         .current_dir(temporary.path())
+        .env("KERNARY_GLOBAL_VECTOR_CONFIG", &global_config)
         .args(["--ui", "plain", "--ascii"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1689,14 +1748,53 @@ fn vector_configuration_and_projection_are_project_private_auxiliary_state() {
     let output = child.wait_with_output().expect("output");
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("stdout");
-    assert!(stdout.contains("embed-private"), "stdout={stdout}");
-    assert!(
-        stdout.contains("Vector | 已配置（项目私有）"),
-        "stdout={stdout}"
-    );
+    assert!(stdout.contains("Startup Health"), "stdout={stdout}");
+    assert!(stdout.contains("Vector global | 不可用"), "stdout={stdout}");
+    assert!(global_config.is_file());
     assert!(state.join("vector.toml").is_file());
     assert!(state.join("memory.sqlite").is_file());
     assert!(!temporary.path().join("kernary.vector.toml").exists());
+
+    let second_project = tempdir().expect("second project");
+    let second_state = second_project.path().join(".harness");
+    std::fs::create_dir_all(&second_state).expect("second state");
+    VectorProviderConfig::new(
+        "http://127.0.0.1:9/v1/embeddings",
+        "must-not-replace-global",
+        32,
+        43,
+    )
+    .expect("second config")
+    .save(second_state.join("vector.toml"))
+    .expect("save second legacy config");
+    let mut second = kernary()
+        .current_dir(second_project.path())
+        .env("KERNARY_GLOBAL_VECTOR_CONFIG", &global_config)
+        .args(["--ui", "plain", "--ascii"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("second project");
+    second
+        .stdin
+        .as_mut()
+        .expect("second stdin")
+        .write_all(b"/exit\n")
+        .expect("second exit");
+    assert!(
+        second
+            .wait_with_output()
+            .expect("second output")
+            .status
+            .success()
+    );
+    assert_eq!(
+        VectorProviderConfig::load(&global_config)
+            .expect("load global")
+            .expect("global config")
+            .model,
+        "embed-private"
+    );
 }
 
 #[test]

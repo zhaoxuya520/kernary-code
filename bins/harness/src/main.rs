@@ -50,7 +50,7 @@ use harness_mcp::{
 use harness_memory::{
     DEFAULT_VECTOR_CREDENTIAL_ID, DEFAULT_VECTOR_PROVIDER, EmbeddingConfig, HttpEmbeddingConfig,
     HttpEmbeddingFactory, MemoryKind, ProjectMemory, RepositoryIndex, RetrievalMode,
-    SemanticCapability, VectorProviderConfig,
+    SemanticCapability, VectorDimensionMode, VectorProviderConfig,
 };
 #[cfg(debug_assertions)]
 use harness_model::FakeModelProvider;
@@ -427,6 +427,13 @@ fn restore_vector_credential(store: &dyn CredentialStore, previous: Option<Secre
     }
 }
 
+fn is_setup_cancel_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "/cancel" | "/back"
+    )
+}
+
 struct AppBackend {
     application: Application,
     registry: CommandRegistry,
@@ -448,6 +455,7 @@ struct AppBackend {
     model_ready: bool,
     test_model_enabled: bool,
     process_sandbox: Arc<ProcessSandbox>,
+    vector_health: VectorHealth,
     /// 最后释放，保证 Application 与后台 Worker 都已停止。
     _project_lock: ProjectStateLock,
 }
@@ -457,6 +465,35 @@ struct AgentInstructionsFile {
     scope: &'static str,
     path: PathBuf,
     content: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum VectorHealth {
+    Missing,
+    Healthy {
+        dimensions: usize,
+        dimension_mode: VectorDimensionMode,
+    },
+    Unhealthy {
+        reason: String,
+    },
+}
+
+impl VectorHealth {
+    const fn is_healthy(&self) -> bool {
+        matches!(self, Self::Healthy { .. })
+    }
+
+    fn summary(&self) -> String {
+        match self {
+            Self::Missing => "未配置".to_owned(),
+            Self::Healthy {
+                dimensions,
+                dimension_mode,
+            } => format!("正常 · {dimensions}d · {dimension_mode:?}"),
+            Self::Unhealthy { reason } => format!("不可用 · {reason}"),
+        }
+    }
 }
 
 struct PendingCredential {
@@ -483,6 +520,15 @@ enum SetupState {
     VectorModel {
         endpoint: String,
         previous_secret: Option<SecretString>,
+    },
+    VectorDimensions {
+        endpoint: String,
+        model: String,
+        previous_secret: Option<SecretString>,
+        detection_error: String,
+    },
+    VectorClear {
+        confirmation: String,
     },
     SessionSwitch,
     PermissionElevation {
@@ -665,6 +711,10 @@ impl AppBackend {
     }
 
     fn input_suggestions(&self, input: &str) -> Vec<InputSuggestion> {
+        if self.pending_setup.is_some() && !input.trim().is_empty() && is_setup_cancel_value(input)
+        {
+            return Vec::new();
+        }
         if matches!(self.pending_setup, Some(SetupState::SessionSwitch)) {
             let prefix = input.trim().to_lowercase();
             return self
@@ -969,6 +1019,66 @@ impl AppBackend {
         }
     }
 
+    fn embedding_factory(
+        endpoint: &str,
+        store: Arc<dyn CredentialStore>,
+        send_dimensions: bool,
+    ) -> Result<HttpEmbeddingFactory, String> {
+        HttpEmbeddingFactory::new(
+            HttpEmbeddingConfig {
+                provider: DEFAULT_VECTOR_PROVIDER.to_owned(),
+                endpoint: endpoint.to_owned(),
+                credential_id: Some(DEFAULT_VECTOR_CREDENTIAL_ID.to_owned()),
+                send_dimensions,
+                allow_remote_project_private: true,
+                timeout_millis: Some(30_000),
+            },
+            store,
+            Arc::new(UreqStreamingTransport::default()),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn finish_vector_setup(
+        &mut self,
+        config: VectorProviderConfig,
+        store: &dyn CredentialStore,
+        previous_secret: Option<SecretString>,
+    ) -> BackendResponse {
+        if let Err(error) = config.save(&self.vector_config_path) {
+            restore_vector_credential(store, previous_secret);
+            return Self::response_error(error);
+        }
+        self.vector_health = VectorHealth::Healthy {
+            dimensions: config.dimensions,
+            dimension_mode: config.dimension_mode,
+        };
+        BackendResponse {
+            lines: vec![
+                format!(
+                    "{} · {}={}",
+                    self.language().pack().vector_verified,
+                    self.language().pack().model_label,
+                    config.model
+                ),
+                format!(
+                    "{} {} · mode={:?} · endpoint={}",
+                    self.language().pack().dimensions_label,
+                    config.dimensions,
+                    config.dimension_mode,
+                    config.endpoint
+                ),
+                format!(
+                    "Global · {} · {}",
+                    self.vector_config_path.display(),
+                    self.language().pack().vector_saved_restart
+                ),
+            ],
+            clear_view: true,
+            ..BackendResponse::default()
+        }
+    }
+
     fn cancel_setup(&mut self, state: SetupState) -> BackendResponse {
         match state {
             SetupState::ProviderDefault { definition, .. } => {
@@ -979,6 +1089,9 @@ impl AppBackend {
                 }
             }
             SetupState::VectorModel {
+                previous_secret, ..
+            }
+            | SetupState::VectorDimensions {
                 previous_secret, ..
             } => {
                 if let Ok(store) = OsCredentialStore::new("dev.openai.harness") {
@@ -995,8 +1108,23 @@ impl AppBackend {
             _ => {}
         }
         self.pending_setup = None;
+        let mut lines = self
+            .application
+            .conversation_history(200)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| {
+                if entry.role == "assistant" {
+                    format!("Kernary: {}", entry.text)
+                } else {
+                    format!("You: {}", entry.text)
+                }
+            })
+            .collect::<Vec<_>>();
+        lines.push(self.language().pack().cancelled.to_owned());
         BackendResponse {
-            lines: vec![self.language().pack().cancelled.to_owned()],
+            lines,
+            clear_view: true,
             ..BackendResponse::default()
         }
     }
@@ -1006,7 +1134,7 @@ impl AppBackend {
             return Self::response_error("没有等待中的设置向导");
         };
         let value = value.trim().to_owned();
-        if value.is_empty() {
+        if is_setup_cancel_value(&value) {
             return self.cancel_setup(state);
         }
         match (state, request_id) {
@@ -1253,34 +1381,111 @@ impl AppBackend {
                     Ok(store) => Arc::new(store),
                     Err(error) => return Self::response_error(error),
                 };
-                let factory = match HttpEmbeddingFactory::new(
-                    HttpEmbeddingConfig {
-                        provider: DEFAULT_VECTOR_PROVIDER.to_owned(),
-                        endpoint: endpoint.clone(),
-                        credential_id: Some(DEFAULT_VECTOR_CREDENTIAL_ID.to_owned()),
-                        allow_remote_project_private: true,
-                        timeout_millis: Some(30_000),
-                    },
-                    store.clone(),
-                    Arc::new(UreqStreamingTransport::default()),
-                ) {
+                let factory = match Self::embedding_factory(&endpoint, store.clone(), false) {
                     Ok(factory) => factory,
                     Err(error) => {
                         restore_vector_credential(store.as_ref(), previous_secret);
                         return Self::response_error(error);
                     }
                 };
-                let vector = match factory.probe(&value, "Kernary embedding validation") {
-                    Ok(vector) => vector,
+                match factory.probe(&value, "Kernary embedding dimension detection") {
+                    Ok(vector) => {
+                        let config = match VectorProviderConfig::new(
+                            endpoint,
+                            value,
+                            vector.len(),
+                            unix_millis().unwrap_or_default(),
+                        ) {
+                            Ok(config) => config,
+                            Err(error) => {
+                                restore_vector_credential(store.as_ref(), previous_secret);
+                                return Self::response_error(error);
+                            }
+                        };
+                        self.finish_vector_setup(config, store.as_ref(), previous_secret)
+                    }
                     Err(error) => {
-                        restore_vector_credential(store.as_ref(), previous_secret);
-                        return Self::response_error(format!("Embedding 验证失败：{error}"));
+                        let detection_error = error.to_string();
+                        self.pending_setup = Some(SetupState::VectorDimensions {
+                            endpoint,
+                            model: value,
+                            previous_secret,
+                            detection_error: detection_error.clone(),
+                        });
+                        BackendResponse {
+                            lines: vec![
+                                self.language().pack().vector_dimensions_fallback.to_owned(),
+                                format!("Detection: {detection_error}"),
+                            ],
+                            input_prompt: Some(InputPrompt {
+                                request_id: "vector-dimensions".to_owned(),
+                                prompt: self.language().pack().vector_dimensions_prompt.to_owned(),
+                                placeholder: Some("1024".to_owned()),
+                            }),
+                            ..BackendResponse::default()
+                        }
+                    }
+                }
+            }
+            (
+                SetupState::VectorDimensions {
+                    endpoint,
+                    model,
+                    previous_secret,
+                    detection_error,
+                },
+                "vector-dimensions",
+            ) => {
+                let dimensions = match value.parse::<usize>() {
+                    Ok(dimensions) if (1..=65_536).contains(&dimensions) => dimensions,
+                    _ => {
+                        return self.retry_setup_input(
+                            SetupState::VectorDimensions {
+                                endpoint,
+                                model,
+                                previous_secret,
+                                detection_error,
+                            },
+                            "vector-dimensions",
+                            self.language().pack().vector_dimensions_prompt,
+                            Some("1024".to_owned()),
+                            "维度必须是 1..65536 的整数",
+                        );
                     }
                 };
-                let config = match VectorProviderConfig::new(
+                let store = match OsCredentialStore::new("dev.openai.harness") {
+                    Ok(store) => Arc::new(store),
+                    Err(error) => return Self::response_error(error),
+                };
+                let factory = match Self::embedding_factory(&endpoint, store.clone(), true) {
+                    Ok(factory) => factory,
+                    Err(error) => {
+                        restore_vector_credential(store.as_ref(), previous_secret);
+                        return Self::response_error(error);
+                    }
+                };
+                if let Err(error) = factory.probe_with_dimensions(
+                    &model,
+                    dimensions,
+                    "Kernary explicit embedding dimension validation",
+                ) {
+                    return self.retry_setup_input(
+                        SetupState::VectorDimensions {
+                            endpoint,
+                            model,
+                            previous_secret,
+                            detection_error,
+                        },
+                        "vector-dimensions",
+                        self.language().pack().vector_dimensions_prompt,
+                        Some(dimensions.to_string()),
+                        format!("显式维度验证失败：{error}"),
+                    );
+                }
+                let config = match VectorProviderConfig::new_requested(
                     endpoint,
-                    value.clone(),
-                    vector.len(),
+                    model,
+                    dimensions,
                     unix_millis().unwrap_or_default(),
                 ) {
                     Ok(config) => config,
@@ -1289,33 +1494,19 @@ impl AppBackend {
                         return Self::response_error(error);
                     }
                 };
-                if let Err(error) = config.save(&self.vector_config_path) {
-                    restore_vector_credential(store.as_ref(), previous_secret);
-                    return Self::response_error(error);
+                self.finish_vector_setup(config, store.as_ref(), previous_secret)
+            }
+            (SetupState::VectorClear { confirmation }, "vector-clear") => {
+                if value != confirmation {
+                    return self.retry_setup_input(
+                        SetupState::VectorClear { confirmation },
+                        "vector-clear",
+                        "确认清除全局 Vector Provider",
+                        Some("输入显示的完整确认短语".to_owned()),
+                        "确认短语不匹配",
+                    );
                 }
-                BackendResponse {
-                    lines: vec![
-                        format!(
-                            "{} · {}={}",
-                            self.language().pack().vector_verified,
-                            self.language().pack().model_label,
-                            config.model
-                        ),
-                        format!(
-                            "{} {} · endpoint={}",
-                            self.language().pack().dimensions_label,
-                            config.dimensions,
-                            config.endpoint
-                        ),
-                        format!(
-                            "{} · {}",
-                            self.vector_config_path.display(),
-                            self.language().pack().vector_saved_restart
-                        ),
-                    ],
-                    clear_view: true,
-                    ..BackendResponse::default()
-                }
+                self.clear_vector_provider()
             }
             (SetupState::SessionSwitch, "session-switch") => self.switch_session_response(&value),
             (SetupState::PermissionElevation { mode, confirmation }, "permission-elevation") => {
@@ -1398,7 +1589,7 @@ impl AppBackend {
             (SetupState::ProviderKey { mut definition }, request)
                 if request == format!("provider-add-key:{}", definition.id) =>
             {
-                if secret.trim().is_empty() {
+                if is_setup_cancel_value(&secret) {
                     return Some(self.cancel_setup(SetupState::ProviderKey { definition }));
                 }
                 let credential_id = definition
@@ -1454,7 +1645,7 @@ impl AppBackend {
                 })
             }
             (SetupState::VectorKey { endpoint }, "vector-key") => {
-                if secret.trim().is_empty() {
+                if is_setup_cancel_value(&secret) {
                     return Some(self.cancel_setup(SetupState::VectorKey { endpoint }));
                 }
                 let store = match OsCredentialStore::new("dev.openai.harness") {
@@ -1510,9 +1701,11 @@ impl AppBackend {
             let _ = store.delete(&CredentialId::new(DEFAULT_VECTOR_CREDENTIAL_ID));
         }
         let _ = self.application.purge_vectors();
+        self.vector_health = VectorHealth::Missing;
         BackendResponse {
             lines: vec![
-                "Vector Provider 配置、凭证引用和投影已清除；恢复 lexical-only。".to_owned(),
+                "全局 Vector Provider 配置与凭证已清除；当前项目投影已清除并恢复 lexical-only。"
+                    .to_owned(),
             ],
             ..BackendResponse::default()
         }
@@ -2171,6 +2364,7 @@ impl AppBackend {
         let memory = self.application.memory_view()?;
         let repository = self.application.repository_view()?;
         let mut lines = Self::config_lines(&self.application.config(), Some("vector"), false);
+        lines.push(format!("Vector {:?}", memory.semantic));
         let (embedding_model, backend, hybrid, reranking) = match &memory.semantic {
             SemanticCapability::Absent { reason } => (
                 format!("<none> ({reason})"),
@@ -2213,6 +2407,9 @@ impl AppBackend {
             ),
         };
         lines.extend([
+            "Provider Scope    global · reused by every project".to_owned(),
+            format!("Config Path       {}", self.vector_config_path.display()),
+            format!("Startup Health    {}", self.vector_health.summary()),
             format!("Backend          {backend}"),
             format!("Embedding Model  {embedding_model}"),
             format!("Storage Path     {}", memory.database_path.display()),
@@ -3292,7 +3489,8 @@ impl AppBackend {
 
 impl TerminalBackend for AppBackend {
     fn initial_history(&self) -> Vec<String> {
-        self.application
+        let mut history = self
+            .application
             .conversation_history(200)
             .unwrap_or_default()
             .into_iter()
@@ -3303,7 +3501,19 @@ impl TerminalBackend for AppBackend {
                     format!("You: {}", entry.text)
                 }
             })
-            .collect()
+            .collect::<Vec<_>>();
+        match &self.vector_health {
+            VectorHealth::Healthy { .. } => history.push(format!(
+                "[DONE] Global vector health · {}",
+                self.vector_health.summary()
+            )),
+            VectorHealth::Unhealthy { .. } => history.push(format!(
+                "[WARN] Global vector health · {} · use /vector setup to repair",
+                self.vector_health.summary()
+            )),
+            VectorHealth::Missing => {}
+        }
+        history
     }
 
     fn cycle_permission_mode(&mut self) -> BackendResponse {
@@ -4883,12 +5093,8 @@ impl TerminalBackend for AppBackend {
                                 }
                                 let mut lines = self.status_lines(&status);
                                 lines.push(format!(
-                                    "Vector · {}",
-                                    if self.vector_config_path.is_file() {
-                                        "已配置（项目私有）"
-                                    } else {
-                                        "未配置 · 使用 /vector setup"
-                                    }
+                                    "Vector global · {}",
+                                    self.vector_health.summary()
                                 ));
                                 BackendResponse {
                                     lines,
@@ -5047,12 +5253,9 @@ impl TerminalBackend for AppBackend {
                     Err(error) => Self::response_error(error),
                 },
                 SlashCommand::Vector { operation } => match operation {
-                    VectorCommand::Status => match self.application.memory_view() {
-                        Ok(view) => BackendResponse {
-                            lines: vec![format!(
-                                "Vector {:?} · schemaPresent={}",
-                                view.semantic, view.vector_schema_present
-                            )],
+                    VectorCommand::Status => match self.vector_settings_lines() {
+                        Ok(lines) => BackendResponse {
+                            lines,
                             ..Default::default()
                         },
                         Err(error) => Self::response_error(error),
@@ -5068,7 +5271,25 @@ impl TerminalBackend for AppBackend {
                         Err(error) => Self::response_error(error),
                     },
                     VectorCommand::Setup => self.start_vector_setup(),
-                    VectorCommand::Clear => self.clear_vector_provider(),
+                    VectorCommand::Clear => {
+                        let confirmation = "I UNDERSTAND GLOBAL VECTOR CLEAR".to_owned();
+                        self.pending_setup = Some(SetupState::VectorClear {
+                            confirmation: confirmation.clone(),
+                        });
+                        BackendResponse {
+                            lines: vec![
+                                "这会清除所有项目共用的 Vector Provider 和凭证；项目本地 Memory 数据不会跨项目删除。"
+                                    .to_owned(),
+                                format!("输入确认短语：{confirmation}"),
+                            ],
+                            input_prompt: Some(InputPrompt {
+                                request_id: "vector-clear".to_owned(),
+                                prompt: "确认清除全局 Vector Provider".to_owned(),
+                                placeholder: Some(confirmation),
+                            }),
+                            ..BackendResponse::default()
+                        }
+                    }
                     VectorCommand::Mode { mode } => match self.application.set_setting(
                         "vector.mode",
                         &mode,
@@ -5151,7 +5372,7 @@ impl TerminalBackend for AppBackend {
         let cache = self.application.cache();
         let language = UiLanguage::parse(&self.application.config().settings.ui_language)
             .unwrap_or(UiLanguage::ZhCn);
-        let vector_configured = self.vector_config_path.is_file();
+        let vector_configured = self.vector_health.is_healthy();
         match status {
             Ok(status) => TerminalSnapshot {
                 session_title: status
@@ -5249,7 +5470,7 @@ impl TerminalBackend for AppBackend {
             self.pending_credential = Some(pending);
             return Self::response_error("secure credential request ID 不匹配");
         }
-        if secret.is_empty() {
+        if is_setup_cancel_value(&secret) {
             return BackendResponse {
                 lines: vec![format!("{} credential 输入已取消", pending.display_name)],
                 ..BackendResponse::default()
@@ -6174,17 +6395,35 @@ fn build_backend(
         Arc::new(OsCredentialStore::new("dev.openai.harness")?);
     let provider_config_path = configured_path(project_root, "KERNARY_PROVIDER_CONFIG")
         .unwrap_or_else(|| default_project_catalog_path(project_root));
-    let vector_config_path = state_directory.join("vector.toml");
-    let legacy_vector_config_path = project_root.join("kernary.vector.toml");
-    if !vector_config_path.exists()
-        && legacy_vector_config_path.is_file()
-        && let Some(config) = VectorProviderConfig::load(&legacy_vector_config_path)?
-    {
-        config.save(&vector_config_path)?;
-        eprintln!(
-            "[WARN] 已把旧向量配置迁移到项目私有路径 {}；旧文件已加入本地 Git exclude，可手动删除",
-            vector_config_path.display()
-        );
+    let vector_config_path = default_global_vector_config_path()
+        .ok_or("无法确定全局 Vector 配置目录；可设置 KERNARY_GLOBAL_VECTOR_CONFIG")?;
+    if !vector_config_path.is_absolute() {
+        return Err("KERNARY_GLOBAL_VECTOR_CONFIG 必须是绝对路径".into());
+    }
+    if !vector_config_path.exists() {
+        for legacy_path in [
+            state_directory.join("vector.toml"),
+            project_root.join("kernary.vector.toml"),
+        ] {
+            if !legacy_path.is_file() {
+                continue;
+            }
+            match VectorProviderConfig::load(&legacy_path) {
+                Ok(Some(config)) => {
+                    config.save(&vector_config_path)?;
+                    eprintln!(
+                        "[WARN] 已把旧项目向量配置迁移为全局配置 {}；旧项目文件不再读取，可手动删除",
+                        vector_config_path.display()
+                    );
+                    break;
+                }
+                Ok(None) => {}
+                Err(error) => eprintln!(
+                    "[WARN] 旧项目 Vector 配置迁移失败 · {} · {error}",
+                    legacy_path.display()
+                ),
+            }
+        }
     }
     let mut provider_catalog = load_provider_catalog(project_root)?;
     for (provider_id, model_id) in requested_selection.iter().chain(persisted_selection.iter()) {
@@ -6312,19 +6551,107 @@ fn build_backend(
     )?);
     let recovery_time = harness_types::Clock::now_unix_millis(&clock);
     let reconciled_patches = patch_store.reconcile_prepared(recovery_time)?;
-    let vector_file = match VectorProviderConfig::load(&vector_config_path) {
-        Ok(config) => config,
+    let (mut vector_file, mut vector_health) = match VectorProviderConfig::load(&vector_config_path)
+    {
+        Ok(Some(config)) => (
+            Some(config),
+            VectorHealth::Unhealthy {
+                reason: "尚未执行本项目启动检查".to_owned(),
+            },
+        ),
+        Ok(None) => (None, VectorHealth::Missing),
         Err(error) => {
             eprintln!(
                 "[WARN] Vector config isolated · {} · {error}",
                 vector_config_path.display()
             );
-            None
+            (
+                None,
+                VectorHealth::Unhealthy {
+                    reason: error.to_string(),
+                },
+            )
         }
     };
     let embedding_model_raw = compat_env_var("HARNESS_EMBEDDING_MODEL")
         .ok()
         .filter(|value| !value.trim().is_empty());
+    let mut verified_global_factory: Option<Arc<HttpEmbeddingFactory>> = None;
+    if embedding_model_raw.is_none()
+        && let Some(global_config) = vector_file.as_mut()
+    {
+        match HttpEmbeddingFactory::new(
+            HttpEmbeddingConfig {
+                provider: DEFAULT_VECTOR_PROVIDER.to_owned(),
+                endpoint: global_config.endpoint.clone(),
+                credential_id: Some(global_config.credential_id.clone()),
+                send_dimensions: global_config.sends_dimensions(),
+                allow_remote_project_private: true,
+                timeout_millis: Some(30_000),
+            },
+            credentials.clone(),
+            Arc::new(UreqStreamingTransport::default()),
+        ) {
+            Ok(factory) => {
+                let probe = if global_config.sends_dimensions() {
+                    factory.probe_with_dimensions(
+                        &global_config.model,
+                        global_config.dimensions,
+                        "Kernary project startup embedding health check",
+                    )
+                } else {
+                    factory.probe(
+                        &global_config.model,
+                        "Kernary project startup embedding health check",
+                    )
+                };
+                match probe {
+                    Ok(vector) => {
+                        if !global_config.sends_dimensions()
+                            && vector.len() != global_config.dimensions
+                        {
+                            if let Err(error) = global_config
+                                .refresh_detected_dimensions(vector.len(), recovery_time)
+                                .and_then(|()| global_config.save(&vector_config_path))
+                            {
+                                vector_health = VectorHealth::Unhealthy {
+                                    reason: format!("维度更新失败：{error}"),
+                                };
+                            } else {
+                                vector_health = VectorHealth::Healthy {
+                                    dimensions: vector.len(),
+                                    dimension_mode: global_config.dimension_mode,
+                                };
+                                verified_global_factory = Some(Arc::new(factory));
+                            }
+                        } else {
+                            vector_health = VectorHealth::Healthy {
+                                dimensions: vector.len(),
+                                dimension_mode: global_config.dimension_mode,
+                            };
+                            verified_global_factory = Some(Arc::new(factory));
+                        }
+                    }
+                    Err(error) => {
+                        vector_health = VectorHealth::Unhealthy {
+                            reason: error.to_string(),
+                        };
+                    }
+                }
+            }
+            Err(error) => {
+                vector_health = VectorHealth::Unhealthy {
+                    reason: error.to_string(),
+                };
+            }
+        }
+    }
+    if vector_file.is_some() {
+        eprintln!(
+            "[INFO] Global Vector startup health · {}",
+            vector_health.summary()
+        );
+    }
     let (embedding_provider, embedding_model, embedding_dimensions) =
         embedding_model_raw.as_deref().map_or_else(
             || {
@@ -6362,15 +6689,15 @@ fn build_backend(
         state_directory.join("memory.sqlite"),
         embedding_config,
     )?;
-    if let SemanticCapability::Ready { provider, .. } = memory.view()?.semantic {
+    if embedding_model_raw.is_none() {
+        if let Some(factory) = verified_global_factory {
+            memory.attach_embedding_factory(factory)?;
+        } else if let VectorHealth::Unhealthy { reason } = &vector_health {
+            memory.block_semantic(format!("startup-health-check: {reason}"));
+        }
+    } else if let SemanticCapability::Ready { provider, .. } = memory.view()?.semantic {
         let endpoint = compat_env_var("HARNESS_EMBEDDING_ENDPOINT")
             .ok()
-            .or_else(|| {
-                embedding_model_raw
-                    .is_none()
-                    .then(|| vector_file.as_ref().map(|config| config.endpoint.clone()))
-                    .flatten()
-            })
             .unwrap_or_else(|| {
                 if provider == "openai" {
                     "https://api.openai.com/v1/embeddings".to_owned()
@@ -6378,35 +6705,52 @@ fn build_backend(
                     "http://127.0.0.1:11434/v1/embeddings".to_owned()
                 }
             });
-        let credential_id = vector_file
-            .as_ref()
-            .filter(|_| embedding_model_raw.is_none())
-            .map(|config| config.credential_id.clone())
-            .or_else(|| {
-                (provider == "openai").then(|| {
-                    compat_env_var("HARNESS_EMBEDDING_CREDENTIAL_ID")
-                        .unwrap_or_else(|_| OPENAI_API_KEY_CREDENTIAL_ID.to_owned())
-                })
-            });
+        let credential_id = (provider == "openai").then(|| {
+            compat_env_var("HARNESS_EMBEDDING_CREDENTIAL_ID")
+                .unwrap_or_else(|_| OPENAI_API_KEY_CREDENTIAL_ID.to_owned())
+        });
         match HttpEmbeddingFactory::new(
             HttpEmbeddingConfig {
                 provider: provider.clone(),
                 endpoint,
                 credential_id,
-                allow_remote_project_private: (embedding_model_raw.is_none()
-                    && vector_file.is_some())
-                    || compat_env_var("HARNESS_EMBEDDING_ALLOW_REMOTE")
-                        .ok()
-                        .as_deref()
-                        == Some("1"),
+                send_dimensions: embedding_dimensions.is_some(),
+                allow_remote_project_private: compat_env_var("HARNESS_EMBEDDING_ALLOW_REMOTE")
+                    .ok()
+                    .as_deref()
+                    == Some("1"),
                 timeout_millis: Some(30_000),
             },
             credentials.clone(),
             Arc::new(UreqStreamingTransport::default()),
         ) {
-            Ok(factory) => memory.attach_embedding_factory(Arc::new(factory))?,
-            Err(error) => memory.block_semantic(error.code),
+            Ok(factory) => {
+                memory.attach_embedding_factory(Arc::new(factory))?;
+                if let SemanticCapability::Ready { dimensions, .. } = memory.view()?.semantic {
+                    vector_health = VectorHealth::Healthy {
+                        dimensions,
+                        dimension_mode: if embedding_dimensions.is_some() {
+                            VectorDimensionMode::Requested
+                        } else {
+                            VectorDimensionMode::AutoDetected
+                        },
+                    };
+                }
+            }
+            Err(error) => {
+                vector_health = VectorHealth::Unhealthy {
+                    reason: error.to_string(),
+                };
+                memory.block_semantic(error.code);
+            }
         }
+    }
+    if embedding_model_raw.is_some()
+        && matches!(vector_health, VectorHealth::Missing)
+        && let SemanticCapability::Blocked { reason } | SemanticCapability::Degraded { reason } =
+            memory.view()?.semantic
+    {
+        vector_health = VectorHealth::Unhealthy { reason };
     }
     let repository =
         RepositoryIndex::open(project_root, state_directory.join("repository.sqlite"))?;
@@ -6641,6 +6985,7 @@ fn build_backend(
             model_ready,
             test_model_enabled,
             process_sandbox,
+            vector_health,
             _project_lock: project_lock,
         },
         subscription,
@@ -6751,6 +7096,22 @@ fn default_global_config_path() -> Option<PathBuf> {
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
                 .map(|root| root.join(".config").join("kernary").join("config.toml"))
+        })
+}
+
+fn default_global_vector_config_path() -> Option<PathBuf> {
+    compat_env_var_os("HARNESS_GLOBAL_VECTOR_CONFIG")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            compat_env_var_os("HARNESS_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .map(|root| root.join("vector.toml"))
+        })
+        .or_else(|| {
+            default_global_config_path()
+                .and_then(|config| config.parent().map(|parent| parent.join("vector.toml")))
         })
 }
 
@@ -7434,17 +7795,13 @@ fn doctor(
     let capabilities =
         TerminalCapabilities::detect(io::stdout().is_terminal(), force_ascii, force_no_color);
     let store = SqliteKernelStore::open_in_memory()?;
+    let global_vector_config = default_global_vector_config_path();
     let embedding_model_configured = compat_env_var("HARNESS_EMBEDDING_MODEL")
         .ok()
         .is_some_and(|value| !value.trim().is_empty())
-        || VectorProviderConfig::load(project_root.join(".harness/vector.toml"))
-            .ok()
-            .flatten()
-            .is_some()
-        || VectorProviderConfig::load(project_root.join("kernary.vector.toml"))
-            .ok()
-            .flatten()
-            .is_some();
+        || global_vector_config
+            .as_ref()
+            .is_some_and(|path| VectorProviderConfig::load(path).ok().flatten().is_some());
     let browser_configured = compat_env_var_os("HARNESS_BROWSER_PYTHON").is_some()
         && compat_env_var_os("HARNESS_BROWSER_EXECUTABLE").is_some()
         && compat_env_var("HARNESS_BROWSER_ALLOWED_ORIGINS")
@@ -7535,7 +7892,9 @@ fn doctor(
         },
         "vector": {
             "activationRule": "requires-non-empty-embedding-model",
-            "configured": embedding_model_configured
+            "configured": embedding_model_configured,
+            "scope": "global-provider-project-local-data",
+            "configPath": global_vector_config
         },
         "browser": {
             "configured": browser_configured,
@@ -7551,8 +7910,8 @@ fn doctor(
             "repositoryFusion": "file-hash-bound-symbols-diagnostics-evidence",
             "patchPreview": "rename-codeaction-preview-second-approval-recoverable-set"
         },
-        "stage": 21,
-        "stageTrack": "25-platform-native-subprocess-sandbox",
+        "stage": 22,
+        "stageTrack": "26-global-vector-health-and-setup-navigation",
     });
     if json {
         println!("{report}");

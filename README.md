@@ -43,13 +43,15 @@ Kernary 不会在未配置模型时用测试模型伪造结果。第一次进入
 /provider remove <id>   # 删除项目级 Provider 与凭证引用
 ```
 
-单一向量模型提供商使用独立向导：
+全局唯一的向量模型提供商使用独立向导：
 
 ```text
 /vector setup
 ```
 
-依次输入 Embedding Base URL、Secure Key 和手写模型名。Kernary 不拉取向量模型目录，只发送一次真实 Embedding 请求；成功后记录返回维度并保存到项目私有 `.harness/vector.toml`。向量配置、投影与数据库都只存在当前项目的 `.harness/`，使用 `/vector clear` 可恢复 lexical-only。
+依次输入 Embedding Base URL、Secure Key 和手写模型名。Kernary 不拉取向量模型目录：先发送不带 `dimensions` 的验证请求并从返回向量自动识别维度；如果 Provider 必须显式指定维度，则进入手动维度步骤并再次验证。固定维度模型后续不发送 `dimensions`，可变维度模型使用验证过的用户维度。
+
+Provider 配置保存在全局 Kernary 配置目录的 `vector.toml`（Windows 默认 `%APPDATA%\Kernary\vector.toml`；Linux 默认 `$XDG_CONFIG_HOME/kernary/vector.toml` 或 `~/.config/kernary/vector.toml`），也可用 `KERNARY_HOME` 或 `KERNARY_GLOBAL_VECTOR_CONFIG` 指定。Key 只进入 OS Credential Store；所有项目复用这一份 Provider。每次进入项目都会发送固定、无项目内容的健康检查，并在 `/vector status` 显示结果。Memory、Repository 和向量投影仍只位于当前项目 `.harness/`，不会跨项目混存。`/vector clear` 需要二次确认，因为它会移除全局 Provider；当前项目投影会同时清除。
 
 界面语言支持高度定制的命令目录、快捷键提示和设置向导：
 
@@ -155,7 +157,7 @@ Kernary 使用本机辅助指令文件 `agent.md`：项目私有 `.harness/agent
 /agentmd init-global
 ```
 
-Kernary 会把 `/.harness/`、旧 `/kernary.vector.toml` 和 `/agent.md` 写入当前仓库的 `.git/info/exclude`，这些文件默认不属于项目产物。
+Kernary 会把 `/.harness/`、旧项目向量配置 `/kernary.vector.toml` 和 `/agent.md` 写入当前仓库的 `.git/info/exclude`。旧 `.harness/vector.toml` 会在全局配置不存在时自动迁移，但项目 Memory/Vector 数据始终留在 `.harness/`。
 
 ## 内置 Agent 与 Adaptive 工作流
 
@@ -199,7 +201,7 @@ Requirements 与 Explorer 首波并行，Architect 和 Planner 依赖其压缩�
 
 ## Optional Vector 硬门
 
-未配置非空 `KERNARY_EMBEDDING_MODEL` 时，Kernary 不构造 Embedding Provider/Vector Backend，不创建向量表、目录、generation 或 job。配置有效模型后也只进入 Ready；第一次 semantic/hybrid 请求才惰性激活。
+未配置全局 `vector.toml`（或兼容环境变量 `KERNARY_EMBEDDING_MODEL`）时，Kernary 不构造 Embedding Provider/Vector Backend，不创建向量表、generation 或 job。全局 Provider 通过项目启动健康检查后进入 Ready；第一次 semantic/hybrid 请求才惰性激活当前项目投影。检查失败时项目仍可启动，并明确降级为 lexical-only。
 
 ## 从源码构建
 
