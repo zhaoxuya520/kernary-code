@@ -3812,11 +3812,25 @@ fn ensure_selection_credential(
         .credential_id
         .as_deref()
         .ok_or("Provider 缺少 credential_id")?;
+    let interactive = allow_interactive && io::stdin().is_terminal();
+    // Headless Linux CI 往往没有 Secret Service。非交互选择模型时，
+    // 凭证库不可用等价于“当前没有可用凭证”，应返回稳定的连接指引，
+    // 而不是把平台 keyring 的实现错误暴露给用户。
+    if let Err(error) = OsCredentialStore::available() {
+        if !interactive {
+            return Err(format!(
+                "CredentialRequired: {}；先运行 `kernary connect {}`",
+                provider.display_name, provider.id
+            )
+            .into());
+        }
+        return Err(error.into());
+    }
     let store = OsCredentialStore::new("dev.openai.harness")?;
     if store.get(&CredentialId::new(credential_id))?.is_some() {
         return Ok(());
     }
-    if !allow_interactive || !io::stdin().is_terminal() {
+    if !interactive {
         return Err(format!(
             "CredentialRequired: {}；先运行 `kernary connect {}`",
             provider.display_name, provider.id
