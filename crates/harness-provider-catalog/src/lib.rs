@@ -111,6 +111,8 @@ pub struct ProviderDefinition {
     pub credential_required: bool,
     pub routes: Vec<ProviderRouteDefinition>,
     #[serde(default)]
+    pub default_model: Option<ModelId>,
+    #[serde(default)]
     pub discovery: Option<ProviderDiscoveryDefinition>,
     #[serde(default = "built_in_source")]
     pub source: ProviderSource,
@@ -268,6 +270,69 @@ impl ProviderCatalog {
         }
         self.providers.insert(provider.id.clone(), provider);
         Ok(())
+    }
+
+    /// 新增或替换一个项目级 Provider；内置 Provider 永远不能被覆盖。
+    pub fn upsert_project(
+        &mut self,
+        mut provider: ProviderDefinition,
+    ) -> Result<(), ProviderCatalogError> {
+        provider.source = ProviderSource::Project;
+        validate_provider(&mut provider)?;
+        if self
+            .providers
+            .get(&provider.id)
+            .is_some_and(|current| current.source == ProviderSource::BuiltIn)
+        {
+            return Err(ProviderCatalogError::new(
+                "provider-builtin-override-denied",
+                provider.id.to_string(),
+            ));
+        }
+        self.providers.insert(provider.id.clone(), provider);
+        Ok(())
+    }
+
+    /// 原子保存全部项目级 Provider；Key 只保存 credential reference。
+    pub fn save_project_file(&self, path: impl AsRef<Path>) -> Result<(), ProviderCatalogError> {
+        let providers = self
+            .providers
+            .values()
+            .filter(|provider| provider.source == ProviderSource::Project)
+            .cloned()
+            .collect::<Vec<_>>();
+        let file = ProviderCatalogFile {
+            schema_version: CATALOG_SCHEMA_VERSION,
+            providers,
+        };
+        let mut bytes = toml::to_string_pretty(&file)
+            .map_err(|error| ProviderCatalogError::new("provider-config-toml", error.to_string()))?
+            .into_bytes();
+        bytes.push(b'\n');
+        if bytes.len() as u64 > MAX_CONFIG_BYTES {
+            return Err(ProviderCatalogError::new(
+                "provider-config-too-large",
+                bytes.len().to_string(),
+            ));
+        }
+        atomic_write(path.as_ref(), &bytes)
+    }
+
+    pub fn remove_project(
+        &mut self,
+        provider_id: &ProviderId,
+    ) -> Result<Option<ProviderDefinition>, ProviderCatalogError> {
+        if self
+            .providers
+            .get(provider_id)
+            .is_some_and(|provider| provider.source == ProviderSource::BuiltIn)
+        {
+            return Err(ProviderCatalogError::new(
+                "provider-builtin-remove-denied",
+                provider_id.to_string(),
+            ));
+        }
+        Ok(self.providers.remove(provider_id))
     }
 
     #[must_use]
@@ -676,6 +741,14 @@ fn validate_provider(provider: &mut ProviderDefinition) -> Result<(), ProviderCa
                 route.reasoning_field.clone().unwrap_or_default(),
             ));
         }
+    }
+    if let Some(default_model) = &provider.default_model
+        && !models.contains(default_model)
+    {
+        return Err(ProviderCatalogError::new(
+            "provider-default-model-not-routable",
+            format!("{}/{}", provider.id, default_model),
+        ));
     }
     if let Some(discovery) = &provider.discovery {
         validate_discovery(provider, discovery)?;
@@ -1188,6 +1261,7 @@ fn provider(
         credential_id: credential_id.map(str::to_owned),
         credential_required,
         routes,
+        default_model: None,
         discovery: None,
         source: ProviderSource::BuiltIn,
     }
@@ -1316,6 +1390,48 @@ models = ["gpt"]
     }
 
     #[test]
+    fn project_provider_upsert_and_save_preserve_default_without_secret() {
+        let temporary = tempdir().expect("tempdir");
+        let path = temporary.path().join("kernary.providers.toml");
+        let mut catalog = ProviderCatalog::built_in().expect("builtins");
+        let mut custom = provider(
+            "custom-relay",
+            "Custom Relay",
+            None,
+            true,
+            vec![route(
+                ProviderProtocol::OpenaiChat,
+                "https://relay.example/v1/chat/completions",
+                &["model-a", "model-b"],
+            )],
+        );
+        custom.source = ProviderSource::Project;
+        custom.default_model = Some(ModelId::from("model-b"));
+        custom.discovery = Some(ProviderDiscoveryDefinition {
+            format: ProviderDiscoveryFormat::OpenaiModels,
+            endpoint: "https://relay.example/v1/models".to_owned(),
+            auth: ProviderDiscoveryAuth::Bearer,
+            routing: ProviderDiscoveryRouting::SingleRouteAdditive,
+        });
+        catalog.upsert_project(custom).expect("upsert");
+        catalog.save_project_file(&path).expect("save");
+        let mut restored = ProviderCatalog::built_in().expect("builtins");
+        restored.load_project_file(&path).expect("load");
+        let provider = restored
+            .get(&ProviderId::from("custom-relay"))
+            .expect("provider");
+        assert_eq!(provider.default_model, Some(ModelId::from("model-b")));
+        assert!(
+            provider
+                .credential_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("provider:custom-relay:"))
+        );
+        let source = fs::read_to_string(path).expect("source");
+        assert!(!source.to_ascii_lowercase().contains("api_key"));
+    }
+
+    #[test]
     fn endpoint_and_model_route_validation_fail_closed() {
         let mut catalog = ProviderCatalog::default();
         let error = catalog
@@ -1344,6 +1460,7 @@ models = ["gpt"]
                     "https://relay.example.com/v1/chat/completions",
                     &["model"],
                 )],
+                default_model: None,
                 discovery: None,
                 source: ProviderSource::Project,
             })

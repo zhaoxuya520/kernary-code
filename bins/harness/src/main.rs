@@ -48,8 +48,9 @@ use harness_mcp::{
     McpTransportConfig, load_config_file as load_mcp_config_file, save_config_file_atomic,
 };
 use harness_memory::{
-    EmbeddingConfig, HttpEmbeddingConfig, HttpEmbeddingFactory, MemoryKind, ProjectMemory,
-    RepositoryIndex, RetrievalMode, SemanticCapability,
+    DEFAULT_VECTOR_CREDENTIAL_ID, DEFAULT_VECTOR_PROVIDER, EmbeddingConfig, HttpEmbeddingConfig,
+    HttpEmbeddingFactory, MemoryKind, ProjectMemory, RepositoryIndex, RetrievalMode,
+    SemanticCapability, VectorProviderConfig,
 };
 #[cfg(debug_assertions)]
 use harness_model::FakeModelProvider;
@@ -63,7 +64,10 @@ use harness_permission::{
 };
 use harness_plugin::PluginManager;
 use harness_provider_catalog::{
-    ProviderCatalog, ProviderModelCache, default_model_cache_path, default_project_catalog_path,
+    ProviderCatalog, ProviderDefinition, ProviderDiscoveryAuth, ProviderDiscoveryDefinition,
+    ProviderDiscoveryFormat, ProviderDiscoveryRouting, ProviderModelCache, ProviderProtocol,
+    ProviderRouteDefinition, ProviderSource, default_model_cache_path,
+    default_project_catalog_path,
 };
 use harness_provider_compatible::{
     CompatibleProvider, CompatibleProviderConfig, CompatibleReasoningField,
@@ -73,17 +77,18 @@ use harness_skill::{SkillRegistry, SkillSource};
 use harness_storage::{ProjectMaintenance, ProjectStateLock, SqliteKernelStore};
 use harness_terminal::{
     AgentDisplayMode, BackendResponse, BrowserCommand as BrowserCliCommand, BudgetCommand,
-    CommandRegistry, CompactCommandMode, FailoverCommand, GitCommand, IndexCommand,
+    CommandRegistry, CompactCommandMode, FailoverCommand, GitCommand, IndexCommand, InputPrompt,
     InputSuggestion, JsonRenderer, LspCommand, MASCOT_NAME, McpCommand, MemoryCommand,
     PRODUCT_NAME, PRODUCT_SHORT_NAME, ParsedInput, PermissionCommand, PlainRenderer, PluginCommand,
-    QueueCommand, RenderStyle, SecretPrompt, SettingLayer, SettingsCommand, SkillCommand,
-    SlashCommand, TAGLINE, TeamCommand, TerminalBackend, TerminalCapabilities, TerminalSnapshot,
-    TraceCommand, TuiOptions, VectorCommand, run_tui,
+    ProviderCommand, QueueCommand, RenderStyle, SecretPrompt, SettingLayer, SettingsCommand,
+    SkillCommand, SlashCommand, TAGLINE, TeamCommand, TerminalBackend, TerminalCapabilities,
+    TerminalSnapshot, TraceCommand, TuiOptions, UiLanguage, VectorCommand, run_tui,
 };
 use harness_tool::{ToolInvocationJournal, ToolInvocationStatus, ToolRegistry, ToolRuntime};
 use harness_types::{
     BrowserSessionId, ModelId, ProjectId, ProviderId, SessionId, TaskId, ToolInvocationId,
 };
+use url::Url;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum UiMode {
@@ -300,10 +305,105 @@ fn slash_requires_ready_model(command: &SlashCommand) -> bool {
     )
 }
 
+fn normalize_openai_base_url(value: &str) -> Result<(String, String, String), String> {
+    let mut url = Url::parse(value.trim()).map_err(|error| format!("URL 无效：{error}"))?;
+    let loopback = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"));
+    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+        return Err("远端 Provider 必须使用 HTTPS；HTTP 只允许 loopback".to_owned());
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.query().is_some()
+    {
+        return Err("URL 不能包含凭证、query 或 fragment".to_owned());
+    }
+    let mut path = url.path().trim_end_matches('/').to_owned();
+    for suffix in ["/chat/completions", "/responses", "/models", "/embeddings"] {
+        if path.ends_with(suffix) {
+            path.truncate(path.len() - suffix.len());
+            break;
+        }
+    }
+    if path.is_empty() {
+        path = "/v1".to_owned();
+    }
+    url.set_path(&path);
+    let base = url.as_str().trim_end_matches('/').to_owned();
+    Ok((
+        base.clone(),
+        format!("{base}/chat/completions"),
+        format!("{base}/models"),
+    ))
+}
+
+fn provider_id_from_url(catalog: &ProviderCatalog, url: &str) -> Result<ProviderId, String> {
+    let parsed = Url::parse(url).map_err(|error| error.to_string())?;
+    let host = parsed.host_str().ok_or("URL 缺少 host")?;
+    let slug = host
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .chars()
+        .take(56)
+        .collect::<String>();
+    if slug.is_empty() {
+        return Err("无法从 URL 生成 Provider ID".to_owned());
+    }
+    let base = format!("custom-{slug}");
+    for index in 1..=999 {
+        let candidate = if index == 1 {
+            base.clone()
+        } else {
+            format!("{base}-{index}")
+        };
+        let id = ProviderId::from(candidate);
+        if catalog.get(&id).is_none() {
+            return Ok(id);
+        }
+    }
+    Err("同一 host 的自定义 Provider 数量过多".to_owned())
+}
+
+fn default_model_for_provider(
+    application: &Application,
+    definition: &ProviderDefinition,
+) -> Option<ModelId> {
+    if let Some(model) = &definition.default_model {
+        return Some(model.clone());
+    }
+    let mut models = application
+        .models()
+        .into_iter()
+        .filter(|model| model.provider_id == definition.id)
+        .map(|model| model.model_id)
+        .collect::<Vec<_>>();
+    models.sort();
+    models.into_iter().next()
+}
+
+fn restore_vector_credential(store: &dyn CredentialStore, previous: Option<SecretString>) {
+    if let Some(previous) = previous {
+        let _ = store.put(&CredentialId::new(DEFAULT_VECTOR_CREDENTIAL_ID), previous);
+    } else {
+        let _ = store.delete(&CredentialId::new(DEFAULT_VECTOR_CREDENTIAL_ID));
+    }
+}
+
 struct AppBackend {
     application: Application,
     registry: CommandRegistry,
     project_root: String,
+    provider_config_path: PathBuf,
+    vector_config_path: PathBuf,
     mcp_config_path: PathBuf,
     mcp_configs: BTreeMap<String, McpServerConfig>,
     permission_rules_path: PathBuf,
@@ -312,6 +412,7 @@ struct AppBackend {
     event_log: VecDeque<EventEnvelope>,
     background_team: Option<BackgroundTeam>,
     pending_credential: Option<PendingCredential>,
+    pending_setup: Option<SetupState>,
     model_ready: bool,
     test_model_enabled: bool,
     /// 最后释放，保证 Application 与后台 Worker 都已停止。
@@ -325,6 +426,26 @@ struct PendingCredential {
     credential_id: String,
 }
 
+enum SetupState {
+    ProviderUrl,
+    ProviderKey {
+        definition: ProviderDefinition,
+    },
+    ProviderDefault {
+        definition: ProviderDefinition,
+        models: Vec<ModelId>,
+    },
+    ProviderSwitch,
+    VectorUrl,
+    VectorKey {
+        endpoint: String,
+    },
+    VectorModel {
+        endpoint: String,
+        previous_secret: Option<SecretString>,
+    },
+}
+
 struct BackgroundTeam {
     receiver: Receiver<Result<Vec<AgentExecutionOutcome>, ApplicationError>>,
     continuation: AgentTeamContinuation,
@@ -335,6 +456,11 @@ struct BackgroundTeam {
 }
 
 impl AppBackend {
+    fn language(&self) -> UiLanguage {
+        UiLanguage::parse(&self.application.config().settings.ui_language)
+            .unwrap_or(UiLanguage::ZhCn)
+    }
+
     fn response_error(error: impl std::fmt::Display) -> BackendResponse {
         BackendResponse {
             lines: vec![format!("! {error}")],
@@ -401,11 +527,80 @@ impl AppBackend {
     }
 
     fn input_suggestions(&self, input: &str) -> Vec<InputSuggestion> {
+        if let Some(SetupState::ProviderDefault { models, .. }) = &self.pending_setup {
+            let prefix = input.trim();
+            let pack = self.language().pack();
+            return models
+                .iter()
+                .filter(|model| model.as_str().starts_with(prefix))
+                .map(|model| {
+                    InputSuggestion::new(
+                        model.to_string(),
+                        model.to_string(),
+                        pack.choose_as_default,
+                    )
+                })
+                .collect();
+        }
+        if matches!(self.pending_setup, Some(SetupState::ProviderSwitch)) {
+            let prefix = input.trim();
+            let pack = self.language().pack();
+            let available = self
+                .application
+                .models()
+                .into_iter()
+                .map(|model| model.provider_id)
+                .collect::<BTreeSet<_>>();
+            let Ok(catalog) = load_provider_catalog(Path::new(&self.project_root)) else {
+                return Vec::new();
+            };
+            return catalog
+                .list()
+                .into_iter()
+                .filter(|provider| {
+                    available.contains(&provider.id) && provider.id.as_str().starts_with(prefix)
+                })
+                .map(|provider| {
+                    InputSuggestion::new(
+                        provider.id.to_string(),
+                        format!("{} · {}", provider.id, provider.display_name),
+                        provider
+                            .default_model
+                            .as_ref()
+                            .map_or(pack.first_model_hint.to_owned(), |model| {
+                                format!("{} {model}", pack.default_model_label)
+                            }),
+                    )
+                })
+                .collect();
+        }
         let normalized = input.trim_start();
         let Some((command, remainder)) = normalized.split_once(char::is_whitespace) else {
             return Vec::new();
         };
         let prefix = remainder.trim_start();
+        if command == "/provider" && prefix.starts_with("remove ") {
+            let provider_prefix = prefix.trim_start_matches("remove ").trim();
+            let pack = self.language().pack();
+            let Ok(catalog) = load_provider_catalog(Path::new(&self.project_root)) else {
+                return Vec::new();
+            };
+            return catalog
+                .list()
+                .into_iter()
+                .filter(|provider| {
+                    provider.source == ProviderSource::Project
+                        && provider.id.as_str().starts_with(provider_prefix)
+                })
+                .map(|provider| {
+                    InputSuggestion::new(
+                        format!("/provider remove {}", provider.id),
+                        format!("{} · {}", provider.id, provider.display_name),
+                        pack.remove_provider_hint,
+                    )
+                })
+                .collect();
+        }
         if matches!(command, "/connect" | "/logout")
             || (command == "/models" && prefix.starts_with("refresh "))
         {
@@ -449,6 +644,12 @@ impl AppBackend {
             return Vec::new();
         }
         let catalog = load_provider_catalog(Path::new(&self.project_root)).ok();
+        let current_provider = self
+            .application
+            .model()
+            .ok()
+            .filter(|model| !is_hidden_internal_model(&model.provider_id, &model.model_id))
+            .map(|model| model.provider_id);
         self.application
             .models()
             .into_iter()
@@ -457,22 +658,48 @@ impl AppBackend {
                     && (self.test_model_enabled
                         || !is_internal_test_model(&capability.provider_id, &capability.model_id))
             })
+            .filter(|capability| {
+                prefix.contains('/')
+                    || current_provider
+                        .as_ref()
+                        .is_none_or(|provider| capability.provider_id == *provider)
+            })
             .filter_map(|capability| {
                 let selection = format!("{}/{}", capability.provider_id, capability.model_id);
-                selection.starts_with(prefix).then(|| {
-                    let credential = catalog
-                        .as_ref()
-                        .and_then(|catalog| catalog.get(&capability.provider_id))
-                        .map_or("custom route", |provider| {
-                            if provider.credential_required {
-                                "use /connect before selection"
-                            } else {
-                                "local/keyless route"
-                            }
-                        });
+                let matches = if prefix.contains('/') {
+                    selection.starts_with(prefix)
+                } else {
+                    capability.model_id.as_str().starts_with(prefix)
+                };
+                matches.then(|| {
+                    let pack = self.language().pack();
+                    let credential = if self.model_ready
+                        && current_provider.as_ref() == Some(&capability.provider_id)
+                    {
+                        pack.model_ready
+                    } else {
+                        catalog
+                            .as_ref()
+                            .and_then(|catalog| catalog.get(&capability.provider_id))
+                            .map_or("custom route", |provider| {
+                                if provider.credential_required {
+                                    pack.connect_first
+                                } else {
+                                    pack.model_ready
+                                }
+                            })
+                    };
                     InputSuggestion::new(
-                        format!("/model {selection}"),
-                        selection,
+                        if prefix.contains('/') {
+                            format!("/model {selection}")
+                        } else {
+                            format!("/model {}", capability.model_id)
+                        },
+                        if prefix.contains('/') {
+                            selection
+                        } else {
+                            capability.model_id.to_string()
+                        },
                         format!(
                             "ctx {} · output {} · tools {} · {credential}",
                             capability.context_window_tokens,
@@ -483,6 +710,597 @@ impl AppBackend {
                 })
             })
             .collect()
+    }
+
+    fn start_provider_add(&mut self) -> BackendResponse {
+        if self.background_team.is_some() {
+            return Self::response_error("Agent Team 运行期间不能修改 Provider");
+        }
+        let pack = self.language().pack();
+        self.pending_setup = Some(SetupState::ProviderUrl);
+        BackendResponse {
+            lines: vec![pack.provider_add_title.to_owned()],
+            clear_view: true,
+            input_prompt: Some(InputPrompt {
+                request_id: "provider-add-url".to_owned(),
+                prompt: pack.provider_url_prompt.to_owned(),
+                placeholder: Some("https://gateway.example/v1".to_owned()),
+            }),
+            ..BackendResponse::default()
+        }
+    }
+
+    fn delete_provider_credential(definition: &ProviderDefinition) {
+        if let Some(credential_id) = definition.credential_id.as_deref()
+            && let Ok(store) = OsCredentialStore::new("dev.openai.harness")
+        {
+            let _ = store.delete(&CredentialId::new(credential_id));
+        }
+    }
+
+    fn rollback_provider_setup(&self, previous: &ProviderCatalog, definition: &ProviderDefinition) {
+        let _ = previous.save_project_file(&self.provider_config_path);
+        Self::delete_provider_credential(definition);
+    }
+
+    fn retry_setup_input(
+        &mut self,
+        state: SetupState,
+        request_id: &str,
+        prompt: impl Into<String>,
+        placeholder: Option<String>,
+        error: impl std::fmt::Display,
+    ) -> BackendResponse {
+        self.pending_setup = Some(state);
+        BackendResponse {
+            lines: vec![format!("! {error}")],
+            input_prompt: Some(InputPrompt {
+                request_id: request_id.to_owned(),
+                prompt: prompt.into(),
+                placeholder,
+            }),
+            ..BackendResponse::default()
+        }
+    }
+
+    fn start_provider_switch(&mut self) -> BackendResponse {
+        let pack = self.language().pack();
+        self.pending_setup = Some(SetupState::ProviderSwitch);
+        BackendResponse {
+            lines: vec![pack.provider_switch_prompt.to_owned()],
+            clear_view: true,
+            input_prompt: Some(InputPrompt {
+                request_id: "provider-switch".to_owned(),
+                prompt: pack.provider_switch_prompt.to_owned(),
+                placeholder: Some(pack.select_confirm.to_owned()),
+            }),
+            ..BackendResponse::default()
+        }
+    }
+
+    fn start_vector_setup(&mut self) -> BackendResponse {
+        if self.background_team.is_some() {
+            return Self::response_error("Agent Team 运行期间不能修改向量模型");
+        }
+        let pack = self.language().pack();
+        self.pending_setup = Some(SetupState::VectorUrl);
+        BackendResponse {
+            lines: vec![
+                pack.vector_setup_title.to_owned(),
+                pack.vector_setup_description.to_owned(),
+            ],
+            clear_view: true,
+            input_prompt: Some(InputPrompt {
+                request_id: "vector-url".to_owned(),
+                prompt: pack.vector_url_prompt.to_owned(),
+                placeholder: Some("https://gateway.example/v1".to_owned()),
+            }),
+            ..BackendResponse::default()
+        }
+    }
+
+    fn cancel_setup(&mut self, state: SetupState) -> BackendResponse {
+        match state {
+            SetupState::ProviderDefault { definition, .. } => {
+                if let Some(credential_id) = definition.credential_id
+                    && let Ok(store) = OsCredentialStore::new("dev.openai.harness")
+                {
+                    let _ = store.delete(&CredentialId::new(credential_id));
+                }
+            }
+            SetupState::VectorModel {
+                previous_secret, ..
+            } => {
+                if let Ok(store) = OsCredentialStore::new("dev.openai.harness") {
+                    if let Some(previous_secret) = previous_secret {
+                        let _ = store.put(
+                            &CredentialId::new(DEFAULT_VECTOR_CREDENTIAL_ID),
+                            previous_secret,
+                        );
+                    } else {
+                        let _ = store.delete(&CredentialId::new(DEFAULT_VECTOR_CREDENTIAL_ID));
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.pending_setup = None;
+        BackendResponse {
+            lines: vec![self.language().pack().cancelled.to_owned()],
+            ..BackendResponse::default()
+        }
+    }
+
+    fn submit_setup_input(&mut self, request_id: &str, value: String) -> BackendResponse {
+        let Some(state) = self.pending_setup.take() else {
+            return Self::response_error("没有等待中的设置向导");
+        };
+        let value = value.trim().to_owned();
+        if value.is_empty() {
+            return self.cancel_setup(state);
+        }
+        match (state, request_id) {
+            (SetupState::ProviderUrl, "provider-add-url") => {
+                let (base, route_endpoint, discovery_endpoint) =
+                    match normalize_openai_base_url(&value) {
+                        Ok(endpoints) => endpoints,
+                        Err(error) => {
+                            return self.retry_setup_input(
+                                SetupState::ProviderUrl,
+                                "provider-add-url",
+                                self.language().pack().provider_url_prompt,
+                                Some("https://gateway.example/v1".to_owned()),
+                                error,
+                            );
+                        }
+                    };
+                let mut catalog = match load_provider_catalog(Path::new(&self.project_root)) {
+                    Ok(catalog) => catalog,
+                    Err(error) => return Self::response_error(error),
+                };
+                let provider_id = match provider_id_from_url(&catalog, &base) {
+                    Ok(provider_id) => provider_id,
+                    Err(error) => return Self::response_error(error),
+                };
+                let display_name = Url::parse(&base)
+                    .ok()
+                    .and_then(|url| url.host_str().map(str::to_owned))
+                    .map_or_else(|| provider_id.to_string(), |host| format!("Custom {host}"));
+                let definition = ProviderDefinition {
+                    id: provider_id.clone(),
+                    display_name,
+                    credential_id: None,
+                    credential_required: true,
+                    routes: vec![ProviderRouteDefinition {
+                        protocol: ProviderProtocol::OpenaiChat,
+                        endpoint: route_endpoint,
+                        models: vec![ModelId::from("pending-model")],
+                        reasoning_field: None,
+                    }],
+                    default_model: None,
+                    discovery: Some(ProviderDiscoveryDefinition {
+                        format: ProviderDiscoveryFormat::OpenaiModels,
+                        endpoint: discovery_endpoint,
+                        auth: ProviderDiscoveryAuth::Bearer,
+                        routing: ProviderDiscoveryRouting::SingleRouteAdditive,
+                    }),
+                    source: ProviderSource::Project,
+                };
+                if let Err(error) = catalog.upsert_project(definition) {
+                    return Self::response_error(error);
+                }
+                let definition = catalog
+                    .get(&provider_id)
+                    .expect("刚 upsert 的 Provider 必须存在")
+                    .clone();
+                self.pending_setup = Some(SetupState::ProviderKey {
+                    definition: definition.clone(),
+                });
+                BackendResponse {
+                    lines: vec![format!("Provider {} · base={base}", definition.id)],
+                    secret_prompt: Some(SecretPrompt {
+                        request_id: format!("provider-add-key:{}", definition.id),
+                        prompt: format!(
+                            "{} · {}",
+                            definition.display_name,
+                            self.language().pack().secure_key_prompt
+                        ),
+                    }),
+                    ..BackendResponse::default()
+                }
+            }
+            (
+                SetupState::ProviderDefault {
+                    mut definition,
+                    models,
+                },
+                "provider-default",
+            ) => {
+                let model = ModelId::from(value);
+                if !models.contains(&model) {
+                    return self.retry_setup_input(
+                        SetupState::ProviderDefault { definition, models },
+                        "provider-default",
+                        self.language().pack().provider_default_prompt,
+                        Some(self.language().pack().select_confirm.to_owned()),
+                        "选择的模型不在刚获取的目录中",
+                    );
+                }
+                definition.default_model = Some(model.clone());
+                definition.routes[0].models.clone_from(&models);
+                let previous = match load_provider_catalog(Path::new(&self.project_root)) {
+                    Ok(catalog) => catalog,
+                    Err(error) => {
+                        Self::delete_provider_credential(&definition);
+                        return Self::response_error(error);
+                    }
+                };
+                let mut candidate = previous.clone();
+                if let Err(error) = candidate.upsert_project(definition.clone()) {
+                    Self::delete_provider_credential(&definition);
+                    return Self::response_error(error);
+                }
+                if let Err(error) = candidate.save_project_file(&self.provider_config_path) {
+                    Self::delete_provider_credential(&definition);
+                    return Self::response_error(error);
+                }
+                let credentials: Arc<dyn CredentialStore> =
+                    match OsCredentialStore::new("dev.openai.harness") {
+                        Ok(store) => Arc::new(store),
+                        Err(error) => {
+                            self.rollback_provider_setup(&previous, &definition);
+                            return Self::response_error(error);
+                        }
+                    };
+                let runtime = match CatalogProviderRuntime::with_ureq(
+                    default_model_cache_path(Path::new(&self.project_root)),
+                    credentials,
+                ) {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        self.rollback_provider_setup(&previous, &definition);
+                        return Self::response_error(error);
+                    }
+                };
+                let provider = match runtime.build(definition.clone()) {
+                    Ok(provider) => provider,
+                    Err(error) => {
+                        self.rollback_provider_setup(&previous, &definition);
+                        return Self::response_error(error);
+                    }
+                };
+                match self.application.register_and_select_provider(
+                    provider,
+                    definition.id.clone(),
+                    model.clone(),
+                ) {
+                    Ok(view) => {
+                        self.model_ready = true;
+                        BackendResponse {
+                            lines: vec![
+                                format!("Provider {} 已验证并保存", definition.id),
+                                format!("Default model {}/{}", definition.id, model),
+                            ]
+                            .into_iter()
+                            .chain(Self::model_lines(&view))
+                            .collect(),
+                            clear_view: true,
+                            ..BackendResponse::default()
+                        }
+                    }
+                    Err(error) => {
+                        self.rollback_provider_setup(&previous, &definition);
+                        Self::response_error(error)
+                    }
+                }
+            }
+            (SetupState::ProviderSwitch, "provider-switch") => {
+                let provider_id = ProviderId::from(value);
+                let catalog = match load_provider_catalog(Path::new(&self.project_root)) {
+                    Ok(catalog) => catalog,
+                    Err(error) => return Self::response_error(error),
+                };
+                let Some(definition) = catalog.get(&provider_id) else {
+                    return self.retry_setup_input(
+                        SetupState::ProviderSwitch,
+                        "provider-switch",
+                        self.language().pack().provider_switch_prompt,
+                        Some(self.language().pack().select_confirm.to_owned()),
+                        "Provider 不存在",
+                    );
+                };
+                match self.provider_credential_ready(&provider_id) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Self::response_error(format!(
+                            "CredentialRequired: 先输入 /connect {provider_id}"
+                        ));
+                    }
+                    Err(error) => return Self::response_error(error),
+                }
+                let Some(model) = default_model_for_provider(&self.application, definition) else {
+                    return Self::response_error("Provider 没有可切换模型");
+                };
+                match self
+                    .application
+                    .select_model(provider_id.clone(), model.clone())
+                {
+                    Ok(view) => {
+                        self.model_ready = true;
+                        BackendResponse {
+                            lines: vec![format!("Provider switched: {provider_id}/{model}")]
+                                .into_iter()
+                                .chain(Self::model_lines(&view))
+                                .collect(),
+                            ..BackendResponse::default()
+                        }
+                    }
+                    Err(error) => Self::response_error(error),
+                }
+            }
+            (SetupState::VectorUrl, "vector-url") => {
+                let (base, _, _) = match normalize_openai_base_url(&value) {
+                    Ok(endpoints) => endpoints,
+                    Err(error) => {
+                        return self.retry_setup_input(
+                            SetupState::VectorUrl,
+                            "vector-url",
+                            self.language().pack().vector_url_prompt,
+                            Some("https://gateway.example/v1".to_owned()),
+                            error,
+                        );
+                    }
+                };
+                let endpoint = format!("{base}/embeddings");
+                self.pending_setup = Some(SetupState::VectorKey {
+                    endpoint: endpoint.clone(),
+                });
+                BackendResponse {
+                    lines: vec![format!("Embedding endpoint: {endpoint}")],
+                    secret_prompt: Some(SecretPrompt {
+                        request_id: "vector-key".to_owned(),
+                        prompt: format!("Embedding · {}", self.language().pack().secure_key_prompt),
+                    }),
+                    ..BackendResponse::default()
+                }
+            }
+            (
+                SetupState::VectorModel {
+                    endpoint,
+                    previous_secret,
+                },
+                "vector-model",
+            ) => {
+                let store = match OsCredentialStore::new("dev.openai.harness") {
+                    Ok(store) => Arc::new(store),
+                    Err(error) => return Self::response_error(error),
+                };
+                let factory = match HttpEmbeddingFactory::new(
+                    HttpEmbeddingConfig {
+                        provider: DEFAULT_VECTOR_PROVIDER.to_owned(),
+                        endpoint: endpoint.clone(),
+                        credential_id: Some(DEFAULT_VECTOR_CREDENTIAL_ID.to_owned()),
+                        allow_remote_project_private: true,
+                        timeout_millis: Some(30_000),
+                    },
+                    store.clone(),
+                    Arc::new(UreqStreamingTransport::default()),
+                ) {
+                    Ok(factory) => factory,
+                    Err(error) => {
+                        restore_vector_credential(store.as_ref(), previous_secret);
+                        return Self::response_error(error);
+                    }
+                };
+                let vector = match factory.probe(&value, "Kernary embedding validation") {
+                    Ok(vector) => vector,
+                    Err(error) => {
+                        restore_vector_credential(store.as_ref(), previous_secret);
+                        return Self::response_error(format!("Embedding 验证失败：{error}"));
+                    }
+                };
+                let config = match VectorProviderConfig::new(
+                    endpoint,
+                    value.clone(),
+                    vector.len(),
+                    unix_millis().unwrap_or_default(),
+                ) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        restore_vector_credential(store.as_ref(), previous_secret);
+                        return Self::response_error(error);
+                    }
+                };
+                if let Err(error) = config.save(&self.vector_config_path) {
+                    restore_vector_credential(store.as_ref(), previous_secret);
+                    return Self::response_error(error);
+                }
+                BackendResponse {
+                    lines: vec![
+                        format!("Vector provider verified · model={}", config.model),
+                        format!(
+                            "Dimensions {} · endpoint={}",
+                            config.dimensions, config.endpoint
+                        ),
+                        format!(
+                            "Saved {} · 重启后进入 Ready，首次语义检索再惰性激活",
+                            self.vector_config_path.display()
+                        ),
+                    ],
+                    clear_view: true,
+                    ..BackendResponse::default()
+                }
+            }
+            (state, _) => {
+                self.pending_setup = Some(state);
+                Self::response_error("设置向导 request ID 不匹配")
+            }
+        }
+    }
+
+    fn submit_setup_secret(&mut self, request_id: &str, secret: String) -> Option<BackendResponse> {
+        let state = self.pending_setup.take()?;
+        match (state, request_id) {
+            (SetupState::ProviderKey { mut definition }, request)
+                if request == format!("provider-add-key:{}", definition.id) =>
+            {
+                if secret.trim().is_empty() {
+                    return Some(self.cancel_setup(SetupState::ProviderKey { definition }));
+                }
+                let credential_id = definition
+                    .credential_id
+                    .clone()
+                    .expect("项目 Provider 验证后必须有 credential_id");
+                let store = match OsCredentialStore::new("dev.openai.harness") {
+                    Ok(store) => Arc::new(store),
+                    Err(error) => return Some(Self::response_error(error)),
+                };
+                if let Err(error) = store.put(
+                    &CredentialId::new(&credential_id),
+                    SecretString::new(secret),
+                ) {
+                    return Some(Self::response_error(error));
+                }
+                let runtime = match CatalogProviderRuntime::with_ureq(
+                    default_model_cache_path(Path::new(&self.project_root)),
+                    store.clone(),
+                ) {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = store.delete(&CredentialId::new(credential_id));
+                        return Some(Self::response_error(error));
+                    }
+                };
+                let mut models = match runtime.discover_models(&definition) {
+                    Ok(models) => models,
+                    Err(error) => {
+                        let _ = store.delete(&CredentialId::new(credential_id));
+                        return Some(Self::response_error(format!("模型目录验证失败：{error}")));
+                    }
+                };
+                models.sort();
+                models.dedup();
+                definition.routes[0].models.clone_from(&models);
+                self.pending_setup = Some(SetupState::ProviderDefault {
+                    definition,
+                    models: models.clone(),
+                });
+                Some(BackendResponse {
+                    lines: vec![format!("已获取 {} 个模型；请选择默认模型。", models.len())],
+                    input_prompt: Some(InputPrompt {
+                        request_id: "provider-default".to_owned(),
+                        prompt: self.language().pack().provider_default_prompt.to_owned(),
+                        placeholder: Some(self.language().pack().select_confirm.to_owned()),
+                    }),
+                    ..BackendResponse::default()
+                })
+            }
+            (SetupState::VectorKey { endpoint }, "vector-key") => {
+                if secret.trim().is_empty() {
+                    return Some(self.cancel_setup(SetupState::VectorKey { endpoint }));
+                }
+                let store = match OsCredentialStore::new("dev.openai.harness") {
+                    Ok(store) => store,
+                    Err(error) => return Some(Self::response_error(error)),
+                };
+                let previous_secret =
+                    match store.get(&CredentialId::new(DEFAULT_VECTOR_CREDENTIAL_ID)) {
+                        Ok(secret) => secret,
+                        Err(error) => return Some(Self::response_error(error)),
+                    };
+                if let Err(error) = store.put(
+                    &CredentialId::new(DEFAULT_VECTOR_CREDENTIAL_ID),
+                    SecretString::new(secret),
+                ) {
+                    return Some(Self::response_error(error));
+                }
+                self.pending_setup = Some(SetupState::VectorModel {
+                    endpoint,
+                    previous_secret,
+                });
+                Some(BackendResponse {
+                    lines: vec![
+                        "Key 已进入 OS Credential Store；不会拉取向量模型目录。".to_owned(),
+                    ],
+                    input_prompt: Some(InputPrompt {
+                        request_id: "vector-model".to_owned(),
+                        prompt: self.language().pack().vector_model_prompt.to_owned(),
+                        placeholder: Some("text-embedding-3-small".to_owned()),
+                    }),
+                    ..BackendResponse::default()
+                })
+            }
+            (state, _) => {
+                self.pending_setup = Some(state);
+                None
+            }
+        }
+    }
+
+    fn clear_vector_provider(&mut self) -> BackendResponse {
+        if self.vector_config_path.exists() {
+            let metadata = match fs::symlink_metadata(&self.vector_config_path) {
+                Ok(metadata) => metadata,
+                Err(error) => return Self::response_error(error),
+            };
+            if !metadata.file_type().is_file() {
+                return Self::response_error("Vector config 不是普通文件，拒绝删除");
+            }
+            if let Err(error) = fs::remove_file(&self.vector_config_path) {
+                return Self::response_error(error);
+            }
+        }
+        if let Ok(store) = OsCredentialStore::new("dev.openai.harness") {
+            let _ = store.delete(&CredentialId::new(DEFAULT_VECTOR_CREDENTIAL_ID));
+        }
+        let _ = self.application.purge_vectors();
+        BackendResponse {
+            lines: vec![
+                "Vector Provider 配置、凭证引用和投影已清除；恢复 lexical-only。".to_owned(),
+            ],
+            ..BackendResponse::default()
+        }
+    }
+
+    fn remove_project_provider(&mut self, provider_id: &str) -> BackendResponse {
+        let provider_id = ProviderId::from(provider_id.to_owned());
+        let mut catalog = match load_provider_catalog(Path::new(&self.project_root)) {
+            Ok(catalog) => catalog,
+            Err(error) => return Self::response_error(error),
+        };
+        let removed = match catalog.remove_project(&provider_id) {
+            Ok(Some(provider)) => provider,
+            Ok(None) => return Self::response_error("项目级 Provider 不存在"),
+            Err(error) => return Self::response_error(error),
+        };
+        if let Err(error) = catalog.save_project_file(&self.provider_config_path) {
+            return Self::response_error(error);
+        }
+        Self::delete_provider_credential(&removed);
+        let was_current = self
+            .application
+            .model()
+            .is_ok_and(|model| model.provider_id == provider_id);
+        if was_current {
+            if let Err(error) = self.application.select_model(
+                ProviderId::from(UNCONFIGURED_PROVIDER_ID),
+                ModelId::from(UNCONFIGURED_MODEL_ID),
+            ) {
+                return Self::response_error(error);
+            }
+            self.model_ready = false;
+        }
+        BackendResponse {
+            lines: vec![format!(
+                "Project Provider removed: {provider_id}{}",
+                if was_current {
+                    " · current model is now unconfigured"
+                } else {
+                    ""
+                }
+            )],
+            ..BackendResponse::default()
+        }
     }
 
     fn persist_mcp_configs(
@@ -2799,6 +3617,22 @@ impl TerminalBackend for AppBackend {
                 SlashCommand::ModelSelect { provider, model } => {
                     self.select_model(provider, model)
                 }
+                SlashCommand::ModelSelectCurrent { model } => {
+                    let current = match self.application.model() {
+                        Ok(current)
+                            if !is_hidden_internal_model(
+                                &current.provider_id,
+                                &current.model_id,
+                            ) => current,
+                        Ok(_) => {
+                            return Self::response_error(
+                                "尚未选择 Provider；先使用 /provider switch",
+                            );
+                        }
+                        Err(error) => return Self::response_error(error),
+                    };
+                    self.select_model(current.provider_id.to_string(), model)
+                }
                 SlashCommand::Models { refresh, provider } => {
                     let refreshed_provider = provider.clone();
                     let mut models = if refresh {
@@ -3093,19 +3927,26 @@ impl TerminalBackend for AppBackend {
                         self.remove_permission_rule(&rule_id)
                     }
                 },
-                SlashCommand::Provider => match self.application.model() {
-                    Ok(model) => BackendResponse {
-                        lines: vec![if is_hidden_internal_model(
-                            &model.provider_id,
-                            &model.model_id,
-                        ) {
-                            "Provider: 未配置".to_owned()
-                        } else {
-                            format!("Provider: {}", model.provider_id)
-                        }],
-                        ..BackendResponse::default()
+                SlashCommand::Provider { operation } => match operation {
+                    ProviderCommand::Show => match self.application.model() {
+                        Ok(model) => BackendResponse {
+                            lines: vec![if is_hidden_internal_model(
+                                &model.provider_id,
+                                &model.model_id,
+                            ) {
+                                "Provider: 未配置".to_owned()
+                            } else {
+                                format!("Provider: {}", model.provider_id)
+                            }],
+                            ..BackendResponse::default()
+                        },
+                        Err(error) => Self::response_error(error),
                     },
-                    Err(error) => Self::response_error(error),
+                    ProviderCommand::Add => self.start_provider_add(),
+                    ProviderCommand::Switch => self.start_provider_switch(),
+                    ProviderCommand::Remove { provider_id } => {
+                        self.remove_project_provider(&provider_id)
+                    }
                 },
                 SlashCommand::Providers => match self.provider_catalog_lines() {
                     Ok(lines) => BackendResponse {
@@ -3485,6 +4326,8 @@ impl TerminalBackend for AppBackend {
                 SlashCommand::Vector { operation } => match operation {
                     VectorCommand::Status=>match self.application.memory_view(){Ok(view)=>BackendResponse{lines:vec![format!("Vector {:?} · schemaPresent={}",view.semantic,view.vector_schema_present)],..Default::default()},Err(error)=>Self::response_error(error)},
                     VectorCommand::Purge=>match self.application.purge_vectors(){Ok(view)=>BackendResponse{lines:vec![format!("Vector projection purged · schemaPresent={}",view.vector_schema_present)],..Default::default()},Err(error)=>Self::response_error(error)},
+                    VectorCommand::Setup => self.start_vector_setup(),
+                    VectorCommand::Clear => self.clear_vector_provider(),
                     VectorCommand::Mode { mode } => match self.application.set_setting(
                         "vector.mode",
                         &mode,
@@ -3504,6 +4347,37 @@ impl TerminalBackend for AppBackend {
                     },
                     Err(error) => Self::response_error(error),
                 },
+                SlashCommand::Language { language } => {
+                    if let Some(language) = language {
+                        match self.application.set_setting(
+                            "ui.language",
+                            language.code(),
+                            ConfigLayer::Session,
+                        ) {
+                            Ok(_) => {
+                                self.registry = CommandRegistry::with_language(language);
+                                BackendResponse {
+                                    lines: vec![format!(
+                                        "{}: {}",
+                                        language.pack().configured_language,
+                                        language.code()
+                                    )],
+                                    ..BackendResponse::default()
+                                }
+                            }
+                            Err(error) => Self::response_error(error),
+                        }
+                    } else {
+                        let current = self.application.config().settings.ui_language;
+                        BackendResponse {
+                            lines: vec![
+                                format!("Language: {current}"),
+                                "Available: en · zh-CN · zh-TW · ja".to_owned(),
+                            ],
+                            ..BackendResponse::default()
+                        }
+                    }
+                }
                 SlashCommand::Clear => BackendResponse {
                     clear_view: true,
                     ..BackendResponse::default()
@@ -3534,16 +4408,19 @@ impl TerminalBackend for AppBackend {
         let plan = self.application.plan();
         let context = self.application.context().ok();
         let cache = self.application.cache();
+        let language = UiLanguage::parse(&self.application.config().settings.ui_language)
+            .unwrap_or(UiLanguage::ZhCn);
         match status {
             Ok(status) => TerminalSnapshot {
                 model: if self.model_ready {
                     status.model
                 } else if is_hidden_internal_model_name(&status.model) {
-                    "未配置".to_owned()
+                    language.pack().model_unconfigured.to_owned()
                 } else {
                     format!("{} [未连接]", status.model)
                 },
                 model_configured: self.model_ready,
+                language,
                 mode: status.mode,
                 reasoning: status.reasoning,
                 context_percent: context.as_ref().map_or(0, |context| context.percent),
@@ -3556,6 +4433,7 @@ impl TerminalBackend for AppBackend {
             Err(_) => TerminalSnapshot {
                 model: "unavailable".to_owned(),
                 model_configured: false,
+                language,
                 mode: "lite".to_owned(),
                 reasoning: "off".to_owned(),
                 context_percent: context.as_ref().map_or(0, |context| context.percent),
@@ -3596,6 +4474,11 @@ impl TerminalBackend for AppBackend {
     }
 
     fn submit_secret(&mut self, request_id: &str, secret: String) -> BackendResponse {
+        if request_id.starts_with("provider-add-key:") || request_id == "vector-key" {
+            return self
+                .submit_setup_secret(request_id, secret)
+                .unwrap_or_else(|| Self::response_error("设置向导 secret request 不匹配"));
+        }
         let Some(pending) = self.pending_credential.take() else {
             return Self::response_error("没有等待中的 secure credential request");
         };
@@ -3644,6 +4527,10 @@ impl TerminalBackend for AppBackend {
 
     fn complete_input(&self, input: &str) -> Vec<InputSuggestion> {
         self.input_suggestions(input)
+    }
+
+    fn submit_input_prompt(&mut self, request_id: &str, value: String) -> BackendResponse {
+        self.submit_setup_input(request_id, value)
     }
 
     fn poll(&mut self) -> BackendResponse {
@@ -4168,6 +5055,9 @@ fn build_backend(
 
     let credentials: Arc<dyn CredentialStore> =
         Arc::new(OsCredentialStore::new("dev.openai.harness")?);
+    let provider_config_path = configured_path(project_root, "KERNARY_PROVIDER_CONFIG")
+        .unwrap_or_else(|| default_project_catalog_path(project_root));
+    let vector_config_path = project_root.join("kernary.vector.toml");
     let mut provider_catalog = load_provider_catalog(project_root)?;
     for (provider_id, model_id) in requested_selection.iter().chain(persisted_selection.iter()) {
         if provider_catalog.get(provider_id).is_some() {
@@ -4288,14 +5178,32 @@ fn build_backend(
     )?);
     let recovery_time = harness_types::Clock::now_unix_millis(&clock);
     let reconciled_patches = patch_store.reconcile_prepared(recovery_time)?;
+    let vector_file = match VectorProviderConfig::load(&vector_config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!(
+                "[WARN] Vector config isolated · {} · {error}",
+                vector_config_path.display()
+            );
+            None
+        }
+    };
     let embedding_model_raw = compat_env_var("HARNESS_EMBEDDING_MODEL")
         .ok()
         .filter(|value| !value.trim().is_empty());
-    let (embedding_provider, embedding_model) =
-        embedding_model_raw
-            .as_deref()
-            .map_or((None, None), |value| {
-                value.split_once('/').map_or_else(
+    let (embedding_provider, embedding_model, embedding_dimensions) =
+        embedding_model_raw.as_deref().map_or_else(
+            || {
+                vector_file.as_ref().map_or((None, None, None), |config| {
+                    (
+                        Some(DEFAULT_VECTOR_PROVIDER.to_owned()),
+                        Some(config.model.clone()),
+                        Some(config.dimensions),
+                    )
+                })
+            },
+            |value| {
+                let (provider, model) = value.split_once('/').map_or_else(
                     || {
                         (
                             compat_env_var("HARNESS_EMBEDDING_PROVIDER").ok(),
@@ -4303,11 +5211,13 @@ fn build_backend(
                         )
                     },
                     |(provider, model)| (Some(provider.to_owned()), Some(model.to_owned())),
-                )
-            });
-    let embedding_dimensions = compat_env_var("HARNESS_EMBEDDING_DIMENSIONS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok());
+                );
+                let dimensions = compat_env_var("HARNESS_EMBEDDING_DIMENSIONS")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok());
+                (provider, model, dimensions)
+            },
+        );
     let embedding_config = EmbeddingConfig {
         model: embedding_model,
         provider: embedding_provider,
@@ -4319,25 +5229,42 @@ fn build_backend(
         embedding_config,
     )?;
     if let SemanticCapability::Ready { provider, .. } = memory.view()?.semantic {
-        let endpoint = compat_env_var("HARNESS_EMBEDDING_ENDPOINT").unwrap_or_else(|_| {
-            if provider == "openai" {
-                "https://api.openai.com/v1/embeddings".to_owned()
-            } else {
-                "http://127.0.0.1:11434/v1/embeddings".to_owned()
-            }
-        });
+        let endpoint = compat_env_var("HARNESS_EMBEDDING_ENDPOINT")
+            .ok()
+            .or_else(|| {
+                embedding_model_raw
+                    .is_none()
+                    .then(|| vector_file.as_ref().map(|config| config.endpoint.clone()))
+                    .flatten()
+            })
+            .unwrap_or_else(|| {
+                if provider == "openai" {
+                    "https://api.openai.com/v1/embeddings".to_owned()
+                } else {
+                    "http://127.0.0.1:11434/v1/embeddings".to_owned()
+                }
+            });
+        let credential_id = vector_file
+            .as_ref()
+            .filter(|_| embedding_model_raw.is_none())
+            .map(|config| config.credential_id.clone())
+            .or_else(|| {
+                (provider == "openai").then(|| {
+                    compat_env_var("HARNESS_EMBEDDING_CREDENTIAL_ID")
+                        .unwrap_or_else(|_| OPENAI_API_KEY_CREDENTIAL_ID.to_owned())
+                })
+            });
         match HttpEmbeddingFactory::new(
             HttpEmbeddingConfig {
                 provider: provider.clone(),
                 endpoint,
-                credential_id: (provider == "openai").then(|| {
-                    compat_env_var("HARNESS_EMBEDDING_CREDENTIAL_ID")
-                        .unwrap_or_else(|_| OPENAI_API_KEY_CREDENTIAL_ID.to_owned())
-                }),
-                allow_remote_project_private: compat_env_var("HARNESS_EMBEDDING_ALLOW_REMOTE")
-                    .ok()
-                    .as_deref()
-                    == Some("1"),
+                credential_id,
+                allow_remote_project_private: (embedding_model_raw.is_none()
+                    && vector_file.is_some())
+                    || compat_env_var("HARNESS_EMBEDDING_ALLOW_REMOTE")
+                        .ok()
+                        .as_deref()
+                        == Some("1"),
                 timeout_millis: Some(30_000),
             },
             credentials.clone(),
@@ -4555,11 +5482,15 @@ fn build_backend(
     application.record_startup_millis(
         u64::try_from(startup_started.elapsed().as_millis()).unwrap_or(u64::MAX),
     );
+    let language =
+        UiLanguage::parse(&application.config().settings.ui_language).unwrap_or(UiLanguage::ZhCn);
     Ok((
         AppBackend {
             application,
-            registry: CommandRegistry::new(),
+            registry: CommandRegistry::with_language(language),
             project_root: project_root.display().to_string(),
+            provider_config_path,
+            vector_config_path,
             mcp_config_path,
             mcp_configs,
             permission_rules_path,
@@ -4568,6 +5499,7 @@ fn build_backend(
             event_log: VecDeque::new(),
             background_team: None,
             pending_credential: None,
+            pending_setup: None,
             model_ready,
             test_model_enabled,
             _project_lock: project_lock,
@@ -5275,17 +6207,27 @@ fn run_plain_loop(
     let renderer = PlainRenderer::new(style);
     let stdin = io::stdin();
     let mut stdout = io::stdout();
+    let mut pending_input_prompt: Option<InputPrompt> = None;
     loop {
         let mut input = String::new();
         if stdin.read_line(&mut input)? == 0 {
             break;
         }
         let input = input.trim_end_matches(['\r', '\n']).to_owned();
-        let mut response = backend.handle_input(&input);
+        let mut response = match pending_input_prompt.take() {
+            Some(prompt) => backend.submit_input_prompt(&prompt.request_id, input),
+            None => backend.handle_input(&input),
+        };
         let background = backend.poll();
         response.lines.extend(background.lines);
         response.clear_view |= background.clear_view;
         response.should_exit |= background.should_exit;
+        if response.input_prompt.is_none() {
+            response.input_prompt = background.input_prompt;
+        }
+        if response.secret_prompt.is_none() {
+            response.secret_prompt = background.secret_prompt;
+        }
         while let Ok(envelope) = subscription.try_recv() {
             writeln!(stdout, "{}", renderer.render_event(&envelope))?;
         }
@@ -5305,6 +6247,7 @@ fn run_plain_loop(
                 for line in cancelled.lines {
                     writeln!(stdout, "{}", renderer.sanitize(&line))?;
                 }
+                pending_input_prompt = cancelled.input_prompt;
             } else {
                 let secret = read_secret(&format!("{}: ", prompt.prompt))?;
                 let submitted =
@@ -5312,7 +6255,12 @@ fn run_plain_loop(
                 for line in submitted.lines {
                     writeln!(stdout, "{}", renderer.sanitize(&line))?;
                 }
+                pending_input_prompt = submitted.input_prompt;
             }
+        }
+        if let Some(prompt) = response.input_prompt {
+            writeln!(stdout, "Setup: {}", renderer.sanitize(&prompt.prompt))?;
+            pending_input_prompt = Some(prompt);
         }
         if response.should_exit {
             break;
@@ -5346,7 +6294,11 @@ fn doctor(
     let store = SqliteKernelStore::open_in_memory()?;
     let embedding_model_configured = compat_env_var("HARNESS_EMBEDDING_MODEL")
         .ok()
-        .is_some_and(|value| !value.trim().is_empty());
+        .is_some_and(|value| !value.trim().is_empty())
+        || VectorProviderConfig::load(project_root.join("kernary.vector.toml"))
+            .ok()
+            .flatten()
+            .is_some();
     let browser_configured = compat_env_var_os("HARNESS_BROWSER_PYTHON").is_some()
         && compat_env_var_os("HARNESS_BROWSER_EXECUTABLE").is_some()
         && compat_env_var("HARNESS_BROWSER_ALLOWED_ORIGINS")

@@ -28,6 +28,38 @@ Kernary 不会在未配置模型时用测试模型伪造结果。第一次进入
 /model
 ```
 
+添加自定义 OpenAI-compatible 中转站时使用：
+
+```text
+/provider add
+```
+
+向导依次要求 API Base URL、Secure Key，随后自动请求同源 `/models`，让用户选择默认模型，并原子保存到 `kernary.providers.toml`。切换分为两层：
+
+```text
+/provider switch       # 切换提供商并采用其默认模型
+/model                  # 只列当前提供商的模型
+/model <model-id>       # 当前提供商内快速切换
+/provider remove <id>   # 删除项目级 Provider 与凭证引用
+```
+
+单一向量模型提供商使用独立向导：
+
+```text
+/vector setup
+```
+
+依次输入 Embedding Base URL、Secure Key 和手写模型名。Kernary 不拉取向量模型目录，只发送一次真实 Embedding 请求；成功后记录返回维度并保存 `kernary.vector.toml`。使用 `/vector clear` 可恢复 lexical-only。
+
+界面语言支持高度定制的命令目录、快捷键提示和设置向导：
+
+```text
+/language en
+/language zh-CN
+/language zh-TW
+/language ja
+```
+
 `/connect` 使用不回显的安全输入通道保存 Provider Key；`/model` 只选择真实或本地模型。完成后即可提交普通任务，或运行：
 
 ```bash

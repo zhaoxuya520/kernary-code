@@ -25,6 +25,12 @@ bin/harness --version
 /model
 ```
 
+自定义文本模型提供商使用 `/provider add`，向导完成 URL、Key、自动模型发现与默认模型选择。`/provider switch` 切换提供商，`/model` 只切换当前提供商内的模型。
+
+向量模型使用 `/vector setup` 单独配置：只允许一个 Provider，模型名手写且不做目录发现，保存前必须通过一次真实 Embedding 验证。`/vector clear` 删除项目配置、凭证引用与向量投影。
+
+`/language en|zh-CN|zh-TW|ja` 可切换并持久化英语、简体中文、繁体中文和日语语言包。
+
 方向键选择候选，Tab 补全；API Key 通过独立 Secure Lane 输入并进入 OS Credential Store。终端编辑支持左右光标、Home/End、Delete/Backspace、Ctrl+A/E/U/K/W、Ctrl+Left/Right 和安全 Bracketed Paste。
 
 `doctor`、`--help`、completion 和 man 生成不会创建项目 `.harness` 状态。

@@ -50,6 +50,7 @@ harness-terminal = { path = "../../crates/harness-terminal" }
 harness-types = { path = "../../crates/harness-types" }
 harness-tool = { path = "../../crates/harness-tool" }
 serde_json.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 rusqlite.workspace = true

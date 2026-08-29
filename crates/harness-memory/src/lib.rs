@@ -4,8 +4,10 @@
 
 mod embedding_http;
 mod repository;
+mod vector_config;
 pub use embedding_http::*;
 pub use repository::*;
+pub use vector_config::*;
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};

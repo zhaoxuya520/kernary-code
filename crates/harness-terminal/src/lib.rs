@@ -4,6 +4,7 @@
 
 mod brand;
 mod command;
+mod language;
 mod render;
 mod tui;
 
@@ -13,11 +14,13 @@ pub use brand::{
 pub use command::{
     AgentDisplayMode, BrowserCommand, BudgetCommand, CommandRegistry, CompactCommandMode,
     FailoverCommand, GitCommand, IndexCommand, InputSuggestion, LspCommand, McpCommand,
-    MemoryCommand, ParsedInput, PermissionCommand, PluginCommand, QueueCommand, SettingLayer,
-    SettingsCommand, SkillCommand, SlashCommand, TeamCommand, TraceCommand, VectorCommand,
+    MemoryCommand, ParsedInput, PermissionCommand, PluginCommand, ProviderCommand, QueueCommand,
+    SettingLayer, SettingsCommand, SkillCommand, SlashCommand, TeamCommand, TraceCommand,
+    VectorCommand,
 };
+pub use language::{LanguagePack, UiLanguage};
 pub use render::{ActivityIcon, JsonRenderer, PlainRenderer, RenderStyle, TerminalCapabilities};
 pub use tui::{
-    BackendResponse, CancelAction, CancelController, SecretPrompt, TerminalBackend,
+    BackendResponse, CancelAction, CancelController, InputPrompt, SecretPrompt, TerminalBackend,
     TerminalSnapshot, TuiOptions, run_tui,
 };

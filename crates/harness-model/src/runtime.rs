@@ -1,11 +1,12 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 
 use harness_types::{ModelId, ProviderId};
 
 use crate::{
-    CancellationToken, ModelCapability, ModelEventStream, ModelRegistry, ModelRequest, ModelRouter,
-    ReasoningLevel, ReasoningMapping,
+    CancellationToken, ModelCapability, ModelEventStream, ModelProvider, ModelRegistry,
+    ModelRequest, ModelRouter, ReasoningLevel, ReasoningMapping,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -151,6 +152,45 @@ impl ModelRuntime {
                 false,
             )
             .map_err(runtime_router_error)?;
+        self.registry = candidate;
+        Ok(())
+    }
+
+    /// 原子加入一个运行时 Provider；失败时不污染现有 Registry。
+    pub fn register_provider(
+        &mut self,
+        provider: Arc<dyn ModelProvider>,
+    ) -> Result<(), ModelRuntimeError> {
+        let mut candidate = self.registry.clone();
+        candidate
+            .register(provider)
+            .map_err(|error| ModelRuntimeError {
+                code: error.code.to_owned(),
+                message: error.message,
+            })?;
+        // 新 Provider 不能破坏当前选择或 Failover allowlist。
+        ModelRouter
+            .resolve(
+                &candidate,
+                &self.provider_id,
+                &self.model_id,
+                self.reasoning,
+                false,
+                false,
+            )
+            .map_err(runtime_router_error)?;
+        for target in &self.failover_policy.allowlist {
+            ModelRouter
+                .resolve(
+                    &candidate,
+                    &target.provider_id,
+                    &target.model_id,
+                    self.reasoning,
+                    false,
+                    false,
+                )
+                .map_err(runtime_router_error)?;
+        }
         self.registry = candidate;
         Ok(())
     }
@@ -314,6 +354,39 @@ mod tests {
                 "offline",
             ))
         }
+    }
+
+    #[test]
+    fn runtime_provider_registration_is_atomic_and_preserves_selection() {
+        let mut registry = ModelRegistry::new();
+        registry
+            .register(Arc::new(FakeModelProvider::echo()))
+            .expect("fake");
+        let mut runtime = ModelRuntime::new(
+            registry,
+            ProviderId::from("fake"),
+            ModelId::from("deterministic"),
+            ReasoningLevel::Off,
+        )
+        .expect("runtime");
+        runtime
+            .register_provider(Arc::new(ImmediateFailure))
+            .expect("register");
+        assert!(runtime.models().iter().any(|model| {
+            model.provider_id.as_str() == "failing" && model.model_id.as_str() == "primary"
+        }));
+        assert_eq!(
+            runtime.view().expect("view").provider_id,
+            ProviderId::from("fake")
+        );
+        let error = runtime
+            .register_provider(Arc::new(ImmediateFailure))
+            .expect_err("duplicate rejected");
+        assert_eq!(error.code, "provider-conflict");
+        assert_eq!(
+            runtime.view().expect("unchanged").provider_id,
+            ProviderId::from("fake")
+        );
     }
 
     fn request() -> ModelRequest {

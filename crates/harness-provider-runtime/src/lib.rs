@@ -129,6 +129,22 @@ impl CatalogProviderRuntime {
         }))
     }
 
+    /// 向导专用的一次性模型目录验证；不修改缓存或 Registry。
+    pub fn discover_models(
+        &self,
+        provider: &ProviderDefinition,
+    ) -> Result<Vec<ModelId>, ModelError> {
+        let discovery = provider.discovery.as_ref().ok_or_else(|| {
+            model_error(
+                ModelErrorKind::InvalidRequest,
+                "provider-discovery-not-configured",
+                provider.id.to_string(),
+            )
+        })?;
+        self.discover(provider, discovery)
+            .map(|response| response.models)
+    }
+
     fn refresh_provider(
         &self,
         snapshot: &ProviderDefinition,
@@ -689,6 +705,7 @@ mod tests {
                 models: vec![ModelId::from("snapshot-model")],
                 reasoning_field: None,
             }],
+            default_model: Some(ModelId::from("snapshot-model")),
             discovery: Some(ProviderDiscoveryDefinition {
                 format,
                 endpoint: "https://relay.example/v1/models".to_owned(),

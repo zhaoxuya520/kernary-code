@@ -12,6 +12,8 @@ On first launch, use `/connect` and `/model`. Kernary refuses normal and non-int
 
 The interactive editor supports Unicode cursor movement, Home/End, Delete/Backspace, common Ctrl line-editing shortcuts, bracketed paste, and a scrollable `/` command palette with Provider/Model completion.
 
+Use `/provider add` for a custom OpenAI-compatible endpoint (URL → secure key → model discovery → default selection), `/provider switch` to switch providers, and `/model` to switch within the current provider. `/vector setup` configures one independently validated embedding endpoint with a user-entered model name. `/language en|zh-CN|zh-TW|ja` switches the customized language pack.
+
 The package installs a native binary selected by npm for Windows x64 or Linux x64 glibc. It does not download executables during `postinstall`.
 
 Source, documentation and checksums: https://github.com/zhaoxuya520/kernary-code

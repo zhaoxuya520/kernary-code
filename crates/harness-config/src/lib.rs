@@ -127,6 +127,7 @@ impl Display for LogLevel {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct UiPatch {
     pub statusbar: Option<bool>,
+    pub language: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +226,7 @@ pub struct SettingsPatch {
 pub struct EffectiveSettings {
     pub mode: RuntimeMode,
     pub ui_statusbar: bool,
+    pub ui_language: String,
     pub vector_mode: VectorMode,
     pub trace_enabled: bool,
     pub log_level: LogLevel,
@@ -242,6 +244,7 @@ impl Default for EffectiveSettings {
         Self {
             mode: RuntimeMode::Balanced,
             ui_statusbar: true,
+            ui_language: "zh-CN".to_owned(),
             vector_mode: VectorMode::Auto,
             trace_enabled: false,
             log_level: LogLevel::Info,
@@ -395,6 +398,7 @@ impl EffectiveConfigView {
                 "ui.statusbar".to_owned(),
                 self.settings.ui_statusbar.to_string(),
             ),
+            ("ui.language".to_owned(), self.settings.ui_language.clone()),
             (
                 "vector.mode".to_owned(),
                 self.settings.vector_mode.to_string(),
@@ -680,6 +684,7 @@ pub fn supported_setting_keys() -> &'static [&'static str] {
     &[
         "mode",
         "ui.statusbar",
+        "ui.language",
         "vector.mode",
         "trace.enabled",
         "logging.level",
@@ -704,6 +709,12 @@ fn set_patch_value(patch: &mut SettingsPatch, key: &str, value: &str) -> Result<
     match key {
         "mode" => patch.mode = Some(parse_mode(value)?),
         "ui.statusbar" => patch.ui.statusbar = Some(parse_bool(value)?),
+        "ui.language" => {
+            if !matches!(value, "en" | "zh-CN" | "zh-TW" | "ja") {
+                return Err(ConfigError::new("config-language-invalid", value));
+            }
+            patch.ui.language = Some(value.to_owned());
+        }
         "vector.mode" => patch.vector.mode = Some(parse_vector_mode(value)?),
         "trace.enabled" => patch.trace.enabled = Some(parse_bool(value)?),
         "logging.level" => patch.logging.level = Some(parse_log_level(value)?),
@@ -747,6 +758,7 @@ fn clear_patch_value(patch: &mut SettingsPatch, key: &str) -> Result<(), ConfigE
     match key {
         "mode" => patch.mode = None,
         "ui.statusbar" => patch.ui.statusbar = None,
+        "ui.language" => patch.ui.language = None,
         "vector.mode" => patch.vector.mode = None,
         "trace.enabled" => patch.trace.enabled = None,
         "logging.level" => patch.logging.level = None,
@@ -793,6 +805,10 @@ fn apply_patch(
     }
     apply!(patch.mode, settings.mode, "mode");
     apply!(patch.ui.statusbar, settings.ui_statusbar, "ui.statusbar");
+    if let Some(value) = &patch.ui.language {
+        settings.ui_language.clone_from(value);
+        provenance.insert("ui.language".to_owned(), layer);
+    }
     apply!(patch.vector.mode, settings.vector_mode, "vector.mode");
     apply!(patch.trace.enabled, settings.trace_enabled, "trace.enabled");
     apply!(patch.logging.level, settings.log_level, "logging.level");
@@ -984,6 +1000,7 @@ mod tests {
             .set_runtime("permissions.mode", "full")
             .expect("permissions");
         manager.set_runtime("agents.cost", "11").expect("cost");
+        manager.set_runtime("ui.language", "ja").expect("language");
         manager
             .set_runtime_many(&[
                 ("failover.targets", "fake/deterministic"),
@@ -996,6 +1013,7 @@ mod tests {
         assert_eq!(view.provenance["mode"], ConfigLayer::Runtime);
         assert_eq!(view.settings.permission_mode, PermissionMode::Full);
         assert!(view.settings.failover_enabled);
+        assert_eq!(view.settings.ui_language, "ja");
         let profile = ModeProfile::resolve(&view.settings);
         assert_eq!(profile.max_parallel_agents, 6);
         assert_eq!(profile.max_on_demand_tools, 12);
@@ -1032,6 +1050,13 @@ mod tests {
         assert_eq!(
             manager.effective().provenance["agents.parallel"],
             ConfigLayer::Default
+        );
+        assert_eq!(
+            manager
+                .set_runtime("ui.language", "fr")
+                .expect_err("invalid language")
+                .code,
+            "config-language-invalid"
         );
     }
 }

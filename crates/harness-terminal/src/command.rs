@@ -4,6 +4,9 @@ use std::fmt::{Display, Formatter};
 use harness_permission::GrantScope;
 use harness_types::ReasoningLevel;
 
+use crate::UiLanguage;
+use crate::language::command_description;
+
 /// 当前已真实接线的 Slash Commands；未实现的命令不能提前出现在 Registry。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SlashCommand {
@@ -95,6 +98,9 @@ pub enum SlashCommand {
         provider: String,
         model: String,
     },
+    ModelSelectCurrent {
+        model: String,
+    },
     Mode {
         mode: Option<String>,
     },
@@ -122,7 +128,9 @@ pub enum SlashCommand {
     Rollback {
         checkpoint_id: String,
     },
-    Provider,
+    Provider {
+        operation: ProviderCommand,
+    },
     Providers,
     Profile,
     Reasoning {
@@ -166,6 +174,9 @@ pub enum SlashCommand {
         operation: VectorCommand,
     },
     Why,
+    Language {
+        language: Option<UiLanguage>,
+    },
     Clear,
     Exit,
 }
@@ -351,6 +362,16 @@ pub enum VectorCommand {
     Status,
     Purge,
     Mode { mode: String },
+    Setup,
+    Clear,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderCommand {
+    Show,
+    Add,
+    Switch,
+    Remove { provider_id: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -635,6 +656,11 @@ const COMMANDS: &[CommandSpec] = &[
         description: "统一查看一个 Harness 子系统的当前只读状态",
     },
     CommandSpec {
+        name: "/language",
+        synopsis: "/language [en|zh-CN|zh-TW|ja]",
+        description: "切换高度定制的终端语言包并持久化到当前 Session",
+    },
+    CommandSpec {
         name: "/lsp",
         synopsis: "/lsp [start|stop|symbols|definition|references|diagnostics|rename|code-action|apply|undo] ...",
         description: "按需查询 LSP；写操作只能 preview 后二次审批应用",
@@ -706,8 +732,8 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/provider",
-        synopsis: "/provider",
-        description: "显示当前 Model Provider",
+        synopsis: "/provider [add|switch|remove <provider-id>]",
+        description: "显示、添加、切换或删除文本模型提供商",
     },
     CommandSpec {
         name: "/providers",
@@ -821,8 +847,8 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/vector",
-        synopsis: "/vector [status|on|off|auto|purge]",
-        description: "设置检索偏好或清除投影；没有 Embedding Model 时绝不创建向量设施",
+        synopsis: "/vector [status|setup|clear|on|off|auto|purge]",
+        description: "配置并验证单一 Embedding Provider，或管理向量检索偏好",
     },
     CommandSpec {
         name: "/why",
@@ -832,13 +858,28 @@ const COMMANDS: &[CommandSpec] = &[
 ];
 
 /// 统一 Command Registry；解析和补全不访问网络或 Runtime。
-#[derive(Clone, Copy, Debug, Default)]
-pub struct CommandRegistry;
+#[derive(Clone, Copy, Debug)]
+pub struct CommandRegistry {
+    language: UiLanguage,
+}
+
+impl Default for CommandRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl CommandRegistry {
     #[must_use]
     pub const fn new() -> Self {
-        Self
+        Self {
+            language: UiLanguage::ZhCn,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_language(language: UiLanguage) -> Self {
+        Self { language }
     }
 
     pub fn parse(&self, input: &str) -> Result<ParsedInput, CommandParseError> {
@@ -1024,21 +1065,21 @@ impl CommandRegistry {
             },
             "/model" if remainder.is_empty() => SlashCommand::ModelShow,
             "/model" => {
-                let Some((provider, model)) = remainder.split_once('/') else {
-                    return Err(CommandParseError {
-                        code: "invalid-model-selection",
-                        message: "Model 格式必须是 provider/model".to_owned(),
-                    });
-                };
-                if provider.trim().is_empty() || model.trim().is_empty() {
-                    return Err(CommandParseError {
-                        code: "invalid-model-selection",
-                        message: "Provider/Model 不能为空".to_owned(),
-                    });
-                }
-                SlashCommand::ModelSelect {
-                    provider: provider.to_owned(),
-                    model: model.to_owned(),
+                if let Some((provider, model)) = remainder.split_once('/') {
+                    if provider.trim().is_empty() || model.trim().is_empty() {
+                        return Err(CommandParseError {
+                            code: "invalid-model-selection",
+                            message: "Provider/Model 不能为空".to_owned(),
+                        });
+                    }
+                    SlashCommand::ModelSelect {
+                        provider: provider.to_owned(),
+                        model: model.to_owned(),
+                    }
+                } else {
+                    SlashCommand::ModelSelectCurrent {
+                        model: remainder.to_owned(),
+                    }
                 }
             }
             "/models" if remainder.is_empty() => SlashCommand::Models {
@@ -1097,7 +1138,20 @@ impl CommandRegistry {
             "/plugins" => SlashCommand::Plugins {
                 operation: parse_plugin(remainder)?,
             },
-            "/provider" if remainder.is_empty() => SlashCommand::Provider,
+            "/provider" if remainder.is_empty() => SlashCommand::Provider {
+                operation: ProviderCommand::Show,
+            },
+            "/provider" if remainder == "add" => SlashCommand::Provider {
+                operation: ProviderCommand::Add,
+            },
+            "/provider" if remainder == "switch" => SlashCommand::Provider {
+                operation: ProviderCommand::Switch,
+            },
+            "/provider" if remainder.starts_with("remove ") => SlashCommand::Provider {
+                operation: ProviderCommand::Remove {
+                    provider_id: remainder[7..].trim().to_owned(),
+                },
+            },
             "/providers" if remainder.is_empty() => SlashCommand::Providers,
             "/profile" if remainder.is_empty() => SlashCommand::Profile,
             "/queue" => SlashCommand::Queue {
@@ -1144,6 +1198,15 @@ impl CommandRegistry {
                 operation: parse_vector(remainder)?,
             },
             "/why" if remainder.is_empty() => SlashCommand::Why,
+            "/language" if remainder.is_empty() => SlashCommand::Language { language: None },
+            "/language" => SlashCommand::Language {
+                language: Some(
+                    UiLanguage::parse(remainder).ok_or_else(|| CommandParseError {
+                        code: "invalid-language",
+                        message: "Language 仅支持 en/zh-CN/zh-TW/ja".to_owned(),
+                    })?,
+                ),
+            },
             "/session" if remainder.is_empty() => SlashCommand::Session,
             "/sessions" if matches!(remainder, "" | "list") => SlashCommand::Sessions,
             "/settings" => SlashCommand::Settings {
@@ -1200,7 +1263,11 @@ impl CommandRegistry {
                 } else {
                     format!("{} ", spec.name)
                 };
-                InputSuggestion::new(replacement, spec.synopsis, spec.description)
+                InputSuggestion::new(
+                    replacement,
+                    spec.synopsis,
+                    command_description(self.language, spec.name, spec.description),
+                )
             })
             .collect()
     }
@@ -1218,15 +1285,23 @@ impl CommandRegistry {
                 .find(|spec| spec.name == normalized)
                 .map_or_else(
                     || vec![format!("未找到命令：{normalized}")],
-                    |spec| vec![spec.synopsis.to_owned(), spec.description.to_owned()],
+                    |spec| {
+                        vec![
+                            spec.synopsis.to_owned(),
+                            command_description(self.language, spec.name, spec.description)
+                                .to_owned(),
+                        ]
+                    },
                 );
         }
         let mut lines = vec!["Available commands".to_owned()];
-        lines.extend(
-            COMMANDS
-                .iter()
-                .map(|spec| format!("{:<12} {}", spec.name, spec.description)),
-        );
+        lines.extend(COMMANDS.iter().map(|spec| {
+            format!(
+                "{:<12} {}",
+                spec.name,
+                command_description(self.language, spec.name, spec.description)
+            )
+        }));
         lines
     }
 }
@@ -1270,6 +1345,8 @@ fn argument_suggestions(input: &str) -> Vec<InputSuggestion> {
         ],
         "/vector" => &[
             ("status", "显示向量硬门与后端状态"),
+            ("setup", "配置 URL、Key 与手填 Embedding 模型"),
+            ("clear", "移除单一 Embedding Provider 配置"),
             ("on", "有 Embedding Model 时允许语义检索"),
             ("off", "强制 lexical 路径"),
             ("auto", "按能力与模式自动选择"),
@@ -1309,6 +1386,17 @@ fn argument_suggestions(input: &str) -> Vec<InputSuggestion> {
             ("clear", "清除索引"),
             ("map", "显示代码地图"),
             ("search ", "搜索 Repository Index"),
+        ],
+        "/provider" => &[
+            ("add", "添加 OpenAI-compatible 自定义提供商"),
+            ("switch", "切换当前模型提供商及其默认模型"),
+            ("remove ", "删除项目级自定义提供商及其凭证"),
+        ],
+        "/language" => &[
+            ("en", "English"),
+            ("zh-CN", "简体中文"),
+            ("zh-TW", "繁體中文"),
+            ("ja", "日本語"),
         ],
         _ => return help_argument_suggestions(command, prefix),
     };
@@ -1797,13 +1885,15 @@ fn parse_index(value: &str) -> Result<IndexCommand, CommandParseError> {
 fn parse_vector(value: &str) -> Result<VectorCommand, CommandParseError> {
     match value {
         "" | "status" => Ok(VectorCommand::Status),
+        "setup" => Ok(VectorCommand::Setup),
+        "clear" => Ok(VectorCommand::Clear),
         "purge" => Ok(VectorCommand::Purge),
         "on" | "off" | "auto" => Ok(VectorCommand::Mode {
             mode: value.to_owned(),
         }),
         _ => Err(CommandParseError {
             code: "invalid-vector-command",
-            message: "用法：/vector [status|on|off|auto|purge]".to_owned(),
+            message: "用法：/vector [status|setup|clear|on|off|auto|purge]".to_owned(),
         }),
     }
 }
@@ -1962,6 +2052,16 @@ mod tests {
                 .iter()
                 .all(|suggestion| !suggestion.label.starts_with("/login"))
         );
+        for language in [UiLanguage::En, UiLanguage::ZhTw, UiLanguage::Ja] {
+            let localized = CommandRegistry::with_language(language).suggestions("/");
+            assert_eq!(localized.len(), suggestions.len());
+            assert!(
+                localized
+                    .iter()
+                    .zip(&suggestions)
+                    .all(|(candidate, zh_cn)| { candidate.description != zh_cn.description })
+            );
+        }
         assert_eq!(
             registry.suggestions("/mode b")[0].replacement,
             "/mode balanced"
@@ -2321,9 +2421,37 @@ mod tests {
             ParsedInput::Command(SlashCommand::Providers)
         );
         assert_eq!(
+            registry.parse("/provider add").expect("provider add"),
+            ParsedInput::Command(SlashCommand::Provider {
+                operation: ProviderCommand::Add
+            })
+        );
+        assert_eq!(
+            registry.parse("/provider switch").expect("provider switch"),
+            ParsedInput::Command(SlashCommand::Provider {
+                operation: ProviderCommand::Switch
+            })
+        );
+        assert_eq!(
+            registry
+                .parse("/provider remove custom-relay")
+                .expect("provider remove"),
+            ParsedInput::Command(SlashCommand::Provider {
+                operation: ProviderCommand::Remove {
+                    provider_id: "custom-relay".to_owned()
+                }
+            })
+        );
+        assert_eq!(
             registry.parse("/model openai/gpt-test").expect("model"),
             ParsedInput::Command(SlashCommand::ModelSelect {
                 provider: "openai".to_owned(),
+                model: "gpt-test".to_owned()
+            })
+        );
+        assert_eq!(
+            registry.parse("/model gpt-test").expect("current model"),
+            ParsedInput::Command(SlashCommand::ModelSelectCurrent {
                 model: "gpt-test".to_owned()
             })
         );
@@ -2412,6 +2540,18 @@ mod tests {
                 .expect_err("invalid")
                 .code,
             "invalid-reasoning-level"
+        );
+        assert_eq!(
+            registry.parse("/language ja").expect("language"),
+            ParsedInput::Command(SlashCommand::Language {
+                language: Some(UiLanguage::Ja)
+            })
+        );
+        assert_eq!(
+            registry.parse("/vector setup").expect("vector setup"),
+            ParsedInput::Command(SlashCommand::Vector {
+                operation: VectorCommand::Setup
+            })
         );
         assert_eq!(
             registry

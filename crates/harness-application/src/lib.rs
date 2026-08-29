@@ -59,7 +59,7 @@ use harness_memory::{
 };
 use harness_model::{
     CancellationToken, CompletionStatus, FailoverTarget, ModelCapability, ModelEvent,
-    ModelInputItem, ModelMessageRole, ModelRequest, ModelRoutePolicy, ModelRuntime,
+    ModelInputItem, ModelMessageRole, ModelProvider, ModelRequest, ModelRoutePolicy, ModelRuntime,
     ModelRuntimeView, ReasoningMapping, ResponseFormat, ToolDefinition,
 };
 use harness_permission::{
@@ -1387,6 +1387,30 @@ where
         }
         self.publish_model_changed(&selected)?;
         Ok(model_view(selected))
+    }
+
+    /// 原子注册新 Provider 并把当前 Session 切到其默认模型。
+    pub fn register_and_select_provider(
+        &mut self,
+        provider: Arc<dyn ModelProvider>,
+        provider_id: ProviderId,
+        model_id: ModelId,
+    ) -> Result<ModelView, ApplicationError> {
+        let previous = self.model_runtime.clone().ok_or_else(|| {
+            ApplicationError::new("model-runtime-missing", "Model Runtime 尚未注入")
+        })?;
+        self.model_runtime
+            .as_mut()
+            .expect("runtime 已检查")
+            .register_provider(provider)
+            .map_err(|error| ApplicationError::new(error.code, error.message))?;
+        match self.select_model(provider_id, model_id) {
+            Ok(view) => Ok(view),
+            Err(error) => {
+                self.model_runtime = Some(previous);
+                Err(error)
+            }
+        }
     }
 
     pub fn set_reasoning(

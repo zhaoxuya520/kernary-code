@@ -93,3 +93,34 @@ fn remote_embedding_requires_explicit_project_private_egress() {
         .is_err()
     );
 }
+
+#[test]
+fn setup_probe_infers_dimensions_without_sending_dimensions_override() {
+    let transport = Arc::new(MockTransport {
+        captured: Mutex::new(None),
+    });
+    let factory = HttpEmbeddingFactory::new(
+        HttpEmbeddingConfig {
+            provider: DEFAULT_VECTOR_PROVIDER.to_owned(),
+            endpoint: "https://relay.example/v1/embeddings".to_owned(),
+            credential_id: None,
+            allow_remote_project_private: true,
+            timeout_millis: Some(1_000),
+        },
+        Arc::new(MemoryCredentialStore::new()),
+        transport.clone(),
+    )
+    .expect("factory");
+    let vector = factory
+        .probe("custom-embedding-model", "validation")
+        .expect("probe");
+    assert_eq!(vector.len(), 3);
+    let body = transport
+        .captured
+        .lock()
+        .expect("captured")
+        .clone()
+        .expect("body");
+    assert_eq!(body["model"], "custom-embedding-model");
+    assert!(body.get("dimensions").is_none());
+}

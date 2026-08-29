@@ -18,7 +18,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::{CommandRegistry, InputSuggestion, PlainRenderer, RenderStyle, compact_mark};
+use crate::{
+    CommandRegistry, InputSuggestion, PlainRenderer, RenderStyle, UiLanguage, compact_mark,
+};
 
 const ASCII_BORDER: BorderSet = BorderSet {
     top_left: "+",
@@ -36,6 +38,7 @@ const ASCII_BORDER: BorderSet = BorderSet {
 pub struct TerminalSnapshot {
     pub model: String,
     pub model_configured: bool,
+    pub language: UiLanguage,
     pub mode: String,
     pub reasoning: String,
     pub context_percent: u8,
@@ -53,6 +56,7 @@ pub struct BackendResponse {
     pub should_exit: bool,
     pub clear_view: bool,
     pub secret_prompt: Option<SecretPrompt>,
+    pub input_prompt: Option<InputPrompt>,
 }
 
 /// 独立 secure input lane；request ID 和提示均不包含 secret。
@@ -62,12 +66,23 @@ pub struct SecretPrompt {
     pub prompt: String,
 }
 
+/// 普通文本向导输入；与任务输入隔离，不进入命令历史或 Agent Context。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputPrompt {
+    pub request_id: String,
+    pub prompt: String,
+    pub placeholder: Option<String>,
+}
+
 /// Terminal 只依赖该 Application interface。
 pub trait TerminalBackend {
     fn handle_input(&mut self, input: &str) -> BackendResponse;
     fn snapshot(&self) -> TerminalSnapshot;
     fn cancel_current(&mut self) -> BackendResponse;
     fn submit_secret(&mut self, request_id: &str, secret: String) -> BackendResponse;
+    fn submit_input_prompt(&mut self, _request_id: &str, _value: String) -> BackendResponse {
+        BackendResponse::default()
+    }
     fn complete_input(&self, _input: &str) -> Vec<InputSuggestion> {
         Vec::new()
     }
@@ -296,6 +311,26 @@ fn reset_edit_navigation(
     *suggestions_dismissed = false;
 }
 
+fn push_activity(history: &mut Vec<String>, line: String) {
+    if history.last() == Some(&line) {
+        return;
+    }
+    let replaceable =
+        line.starts_with("Context ") || line.contains(" Plan ·") || line.contains(" Plan |");
+    if replaceable
+        && let Some(index) = history.iter().rposition(|candidate| {
+            (line.starts_with("Context ") && candidate.starts_with("Context "))
+                || ((line.contains(" Plan ·") || line.contains(" Plan |"))
+                    && (candidate.contains(" Plan ·") || candidate.contains(" Plan |")))
+        })
+        && history.len().saturating_sub(index) <= 12
+    {
+        history[index] = line;
+        return;
+    }
+    history.push(line);
+}
+
 /// Ctrl+C 的纯状态机结果。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CancelAction {
@@ -349,7 +384,7 @@ pub struct TuiOptions {
 pub fn run_tui<B: TerminalBackend>(
     backend: &mut B,
     subscription: &EventSubscription,
-    registry: CommandRegistry,
+    _registry: CommandRegistry,
     options: TuiOptions,
 ) -> io::Result<()> {
     let mut terminal = setup_terminal()?;
@@ -369,33 +404,37 @@ pub fn run_tui<B: TerminalBackend>(
     let mut cancel = CancelController::default();
     let mut secret_prompt: Option<SecretPrompt> = None;
     let mut secret_input = LineEditor::default();
+    let mut input_prompt: Option<InputPrompt> = None;
 
-    if !backend.snapshot().model_configured {
+    let initial_snapshot = backend.snapshot();
+    if !initial_snapshot.model_configured {
+        let pack = initial_snapshot.language.pack();
         history.extend([
-            "Kernary 尚未配置真实模型；测试模型不会接管用户输入。".to_owned(),
-            "输入 /connect 并选择 Provider，再输入 /model 选择可用模型。".to_owned(),
-            "输入 / 可浏览全部命令；↑↓ 选择，Tab 补全，←→ 移动光标。".to_owned(),
+            pack.onboarding_title.to_owned(),
+            pack.onboarding_step_provider.to_owned(),
+            pack.onboarding_step_commands.to_owned(),
         ]);
     }
 
     loop {
         while let Ok(envelope) = subscription.try_recv() {
-            history.push(renderer.render_event(&envelope));
+            push_activity(&mut history, renderer.render_event(&envelope));
         }
         let background = backend.poll();
         if let Some(prompt) = background.secret_prompt.clone() {
             secret_prompt = Some(prompt);
             secret_input.clear();
         }
+        if let Some(prompt) = background.input_prompt.clone() {
+            input_prompt = Some(prompt);
+            input.clear();
+        }
         if background.clear_view {
             history.clear();
         } else {
-            history.extend(
-                background
-                    .lines
-                    .into_iter()
-                    .map(|line| renderer.sanitize(&line)),
-            );
+            for line in background.lines {
+                push_activity(&mut history, renderer.sanitize(&line));
+            }
         }
         if background.should_exit {
             break;
@@ -405,17 +444,20 @@ pub fn run_tui<B: TerminalBackend>(
         }
 
         let snapshot = backend.snapshot();
-        let mut suggestions =
-            if secret_prompt.is_none() && input.text().starts_with('/') && !suggestions_dismissed {
-                let dynamic = backend.complete_input(input.text());
-                if dynamic.is_empty() {
-                    registry.suggestions(input.text())
-                } else {
-                    dynamic
-                }
+        let pack = snapshot.language.pack();
+        let registry = CommandRegistry::with_language(snapshot.language);
+        let mut suggestions = if secret_prompt.is_none() && !suggestions_dismissed {
+            let dynamic = backend.complete_input(input.text());
+            if !dynamic.is_empty() {
+                dynamic
+            } else if input_prompt.is_none() && input.text().starts_with('/') {
+                registry.suggestions(input.text())
             } else {
                 Vec::new()
-            };
+            }
+        } else {
+            Vec::new()
+        };
         suggestions.sort_by(|left, right| left.label.cmp(&right.label));
         suggestions.dedup_by(|left, right| left.replacement == right.replacement);
         if suggestions.is_empty() {
@@ -433,7 +475,7 @@ pub fn run_tui<B: TerminalBackend>(
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(6),
+                    Constraint::Length(4),
                     Constraint::Min(5),
                     Constraint::Length(suggestion_height),
                     Constraint::Length(3),
@@ -460,15 +502,11 @@ pub fn run_tui<B: TerminalBackend>(
                     Span::raw(format!("   {}", snapshot.project)),
                 ]),
                 Line::from(format!(
-                    "Model {}  Mode {}  Reasoning {}",
-                    snapshot.model, snapshot.mode, snapshot.reasoning
-                )),
-                Line::from(format!(
-                    "Context {}%  Cache {}  Agents {}",
+                    "Model {}  ·  Mode {}  ·  Reasoning {}  ·  Context {}%  ·  Agents {}",
+                    snapshot.model,
+                    snapshot.mode,
+                    snapshot.reasoning,
                     snapshot.context_percent,
-                    snapshot
-                        .cache_percent
-                        .map_or_else(|| "n/a".to_owned(), |value| format!("{value}%")),
                     snapshot.agents
                 )),
             ];
@@ -493,7 +531,7 @@ pub fn run_tui<B: TerminalBackend>(
                     Block::default()
                         .borders(Borders::ALL)
                         .border_set(border_set)
-                        .title("Activity"),
+                        .title(pack.activity),
                 ),
                 chunks[1],
             );
@@ -523,9 +561,11 @@ pub fn run_tui<B: TerminalBackend>(
                     Style::default().add_modifier(Modifier::REVERSED)
                 };
                 let title = format!(
-                    "Commands {}/{} · ↑↓ select · Tab complete · Esc close",
+                    "{} {}/{} · {}",
+                    pack.command_palette,
                     suggestion_cursor + 1,
-                    suggestions.len()
+                    suggestions.len(),
+                    pack.command_hint,
                 );
                 frame.render_stateful_widget(
                     List::new(items)
@@ -551,7 +591,20 @@ pub fn run_tui<B: TerminalBackend>(
                     (
                         visible,
                         cursor,
-                        "Input · ←→ move · Home/End · ↑↓ history/commands".to_owned(),
+                        input_prompt.as_ref().map_or_else(
+                            || format!("{} · {}", pack.input, pack.editor_hint),
+                            |prompt| {
+                                format!(
+                                    "{} · {}{}",
+                                    pack.setup,
+                                    prompt.prompt,
+                                    prompt
+                                        .placeholder
+                                        .as_ref()
+                                        .map_or_else(String::new, |value| format!(" · {value}"))
+                                )
+                            },
+                        ),
                     )
                 },
                 |prompt| {
@@ -639,6 +692,7 @@ pub fn run_tui<B: TerminalBackend>(
                             .map(|line| renderer.sanitize(&line)),
                     );
                     secret_prompt = None;
+                    input_prompt = response.input_prompt;
                     secret_input.clear();
                 }
                 KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -680,6 +734,7 @@ pub fn run_tui<B: TerminalBackend>(
                             .map(|line| renderer.sanitize(&line)),
                     );
                     secret_prompt = None;
+                    input_prompt = response.input_prompt;
                     secret_input.clear();
                 }
                 KeyCode::Enter => {
@@ -692,12 +747,26 @@ pub fn run_tui<B: TerminalBackend>(
                             .map(|line| renderer.sanitize(&line)),
                     );
                     secret_prompt = response.secret_prompt;
+                    input_prompt = response.input_prompt;
                 }
                 _ => {}
             }
             continue;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if let Some(prompt) = input_prompt.take() {
+                let response = backend.submit_input_prompt(&prompt.request_id, String::new());
+                history.extend(
+                    response
+                        .lines
+                        .into_iter()
+                        .map(|line| renderer.sanitize(&line)),
+                );
+                input.clear();
+                input_prompt = response.input_prompt;
+                secret_prompt = response.secret_prompt;
+                continue;
+            }
             let now = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             match cancel.on_ctrl_c(now, !input.is_empty(), snapshot.agents > 0) {
                 CancelAction::ClearInput => input.clear(),
@@ -797,6 +866,19 @@ pub fn run_tui<B: TerminalBackend>(
             KeyCode::Right => input.move_right(),
             KeyCode::Home => input.move_home(),
             KeyCode::End => input.move_end(),
+            KeyCode::Esc if input_prompt.is_some() => {
+                let prompt = input_prompt.take().expect("checked");
+                let response = backend.submit_input_prompt(&prompt.request_id, String::new());
+                history.extend(
+                    response
+                        .lines
+                        .into_iter()
+                        .map(|line| renderer.sanitize(&line)),
+                );
+                input.clear();
+                input_prompt = response.input_prompt;
+                secret_prompt = response.secret_prompt;
+            }
             KeyCode::Esc if !suggestions.is_empty() => {
                 suggestions_dismissed = true;
             }
@@ -867,6 +949,31 @@ pub fn run_tui<B: TerminalBackend>(
                 suggestion_cursor = 0;
                 suggestions_dismissed = false;
                 if submitted.is_empty() {
+                    if let Some(prompt) = input_prompt.take() {
+                        let response =
+                            backend.submit_input_prompt(&prompt.request_id, String::new());
+                        history.extend(
+                            response
+                                .lines
+                                .into_iter()
+                                .map(|line| renderer.sanitize(&line)),
+                        );
+                        input_prompt = response.input_prompt;
+                        secret_prompt = response.secret_prompt;
+                    }
+                    continue;
+                }
+                if let Some(prompt) = input_prompt.take() {
+                    let response = backend.submit_input_prompt(&prompt.request_id, submitted);
+                    history.extend(
+                        response
+                            .lines
+                            .into_iter()
+                            .map(|line| renderer.sanitize(&line)),
+                    );
+                    input_prompt = response.input_prompt;
+                    secret_prompt = response.secret_prompt;
+                    secret_input.clear();
                     continue;
                 }
                 command_history.push(submitted.clone());
@@ -886,6 +993,7 @@ pub fn run_tui<B: TerminalBackend>(
                     break;
                 }
                 secret_prompt = response.secret_prompt;
+                input_prompt = response.input_prompt;
                 secret_input.clear();
             }
             _ => {}

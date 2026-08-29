@@ -6,6 +6,7 @@ mode = "balanced"
 
 [settings.ui]
 statusbar = true
+language = "zh-CN"
 
 [settings.vector]
 # 这里只控制检索偏好；没有 Embedding Model 时 on 也不会创建向量设施。

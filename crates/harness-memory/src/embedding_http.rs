@@ -43,6 +43,22 @@ impl HttpEmbeddingFactory {
             transport,
         })
     }
+
+    /// 配置向导的一次性可用性验证；不创建向量表或 generation。
+    pub fn probe(&self, model: &str, text: &str) -> Result<Vec<f32>, MemoryError> {
+        let model = model.trim();
+        if model.is_empty() {
+            return Err(MemoryError::new("embedding-model-empty", "model"));
+        }
+        request_embedding(
+            &self.config,
+            self.credentials.as_ref(),
+            self.transport.as_ref(),
+            model,
+            None,
+            text,
+        )
+    }
 }
 impl EmbeddingProviderFactory for HttpEmbeddingFactory {
     fn create(
@@ -74,71 +90,106 @@ impl EmbeddingProvider for HttpEmbeddingProvider {
         &self.profile
     }
     fn embed(&self, text: &str) -> Result<Vec<f32>, MemoryError> {
-        let input = text.trim();
-        if input.is_empty() {
-            return Err(MemoryError::new("embedding-input-empty", "input"));
-        }
-        let mut request=StreamingHttpRequest::json(self.config.endpoint.clone(),serde_json::json!({"input":input,"model":self.profile.model,"dimensions":self.profile.dimensions,"encoding_format":"float"}),Duration::from_millis(self.config.timeout_millis.unwrap_or(30_000))).with_header("Accept","application/json");
-        if let Some(id) = &self.config.credential_id {
-            let secret = self
-                .credentials
-                .get(&CredentialId::new(id.clone()))
-                .map_err(|e| MemoryError::new(e.code, e.message))?
-                .ok_or_else(|| MemoryError::new("embedding-credential-missing", id))?;
-            let bearer = secret
-                .expose_secret()
-                .map(|value| SecretString::new(format!("Bearer {value}")))
-                .map_err(|e| MemoryError::new(e.code, e.message))?;
-            request = request.with_sensitive_header("Authorization", bearer);
-        }
-        let response = self
-            .transport
-            .send(request)
-            .map_err(|e| MemoryError::new(e.code, e.message))?;
-        if !(200..300).contains(&response.status) {
-            return Err(MemoryError::new(
-                "embedding-http-status",
-                response.status.to_string(),
-            ));
-        }
-        let mut bytes = Vec::new();
-        response
-            .body
-            .take(16 * 1024 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| MemoryError::new("embedding-http-read", e.to_string()))?;
-        if bytes.len() > 16 * 1024 * 1024 {
-            return Err(MemoryError::new(
-                "embedding-response-too-large",
-                bytes.len().to_string(),
-            ));
-        }
-        let value: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| MemoryError::new("embedding-response-json", e.to_string()))?;
-        let data = value
-            .get("data")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| MemoryError::new("embedding-data-missing", "data"))?;
-        if data.len() != 1 {
-            return Err(MemoryError::new(
-                "embedding-data-count",
-                data.len().to_string(),
-            ));
-        }
-        let vector = data[0]
-            .get("embedding")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| MemoryError::new("embedding-vector-missing", "embedding"))?
-            .iter()
-            .map(|value| {
-                value
-                    .as_f64()
-                    .map(|v| v as f32)
-                    .ok_or_else(|| MemoryError::new("embedding-vector-value", value.to_string()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(vector)
+        request_embedding(
+            &self.config,
+            self.credentials.as_ref(),
+            self.transport.as_ref(),
+            &self.profile.model,
+            Some(self.profile.dimensions),
+            text,
+        )
     }
+}
+
+fn request_embedding(
+    config: &HttpEmbeddingConfig,
+    credentials: &dyn CredentialStore,
+    transport: &dyn StreamingHttpTransport,
+    model: &str,
+    dimensions: Option<usize>,
+    text: &str,
+) -> Result<Vec<f32>, MemoryError> {
+    let input = text.trim();
+    if input.is_empty() {
+        return Err(MemoryError::new("embedding-input-empty", "input"));
+    }
+    let mut body = serde_json::json!({
+        "input": input,
+        "model": model,
+        "encoding_format": "float"
+    });
+    if let Some(dimensions) = dimensions {
+        body["dimensions"] = serde_json::json!(dimensions);
+    }
+    let mut request = StreamingHttpRequest::json(
+        config.endpoint.clone(),
+        body,
+        Duration::from_millis(config.timeout_millis.unwrap_or(30_000)),
+    )
+    .with_header("Accept", "application/json");
+    if let Some(id) = &config.credential_id {
+        let secret = credentials
+            .get(&CredentialId::new(id.clone()))
+            .map_err(|e| MemoryError::new(e.code, e.message))?
+            .ok_or_else(|| MemoryError::new("embedding-credential-missing", id))?;
+        let bearer = secret
+            .expose_secret()
+            .map(|value| SecretString::new(format!("Bearer {value}")))
+            .map_err(|e| MemoryError::new(e.code, e.message))?;
+        request = request.with_sensitive_header("Authorization", bearer);
+    }
+    let response = transport
+        .send(request)
+        .map_err(|e| MemoryError::new(e.code, e.message))?;
+    if !(200..300).contains(&response.status) {
+        return Err(MemoryError::new(
+            "embedding-http-status",
+            response.status.to_string(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    response
+        .body
+        .take(16 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| MemoryError::new("embedding-http-read", e.to_string()))?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err(MemoryError::new(
+            "embedding-response-too-large",
+            bytes.len().to_string(),
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| MemoryError::new("embedding-response-json", e.to_string()))?;
+    let data = value
+        .get("data")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| MemoryError::new("embedding-data-missing", "data"))?;
+    if data.len() != 1 {
+        return Err(MemoryError::new(
+            "embedding-data-count",
+            data.len().to_string(),
+        ));
+    }
+    let vector = data[0]
+        .get("embedding")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| MemoryError::new("embedding-vector-missing", "embedding"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_f64()
+                .map(|v| v as f32)
+                .ok_or_else(|| MemoryError::new("embedding-vector-value", value.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if vector.is_empty() || vector.iter().any(|value| !value.is_finite()) {
+        return Err(MemoryError::new(
+            "embedding-vector-invalid",
+            vector.len().to_string(),
+        ));
+    }
+    Ok(vector)
 }
 fn validate_endpoint(endpoint: &str) -> Result<(), MemoryError> {
     if !(endpoint.starts_with("https://") || is_loopback(endpoint)) {

@@ -1051,6 +1051,104 @@ fn plain_mode_accepts_slash_commands_from_stdin() {
 }
 
 #[test]
+fn language_switch_persists_and_localizes_command_help() {
+    let temporary = tempdir().expect("tempdir");
+    let mut first = kernary()
+        .current_dir(temporary.path())
+        .args(["--ui", "plain", "--ascii"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("first");
+    first
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"/language en\n/help provider\n/exit\n")
+        .expect("commands");
+    let output = first.wait_with_output().expect("output");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("Interface language: en"), "stdout={stdout}");
+    assert!(
+        stdout.contains("Show, add, or switch text-model providers"),
+        "stdout={stdout}"
+    );
+
+    let mut second = kernary()
+        .current_dir(temporary.path())
+        .args(["--ui", "plain", "--ascii"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("second");
+    second
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"/language\n/help vector\n/exit\n")
+        .expect("commands");
+    let output = second.wait_with_output().expect("output");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("Language: en"), "stdout={stdout}");
+    assert!(
+        stdout.contains("Configure and validate the single embedding provider"),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
+fn provider_switch_uses_default_and_model_switch_stays_within_provider() {
+    let temporary = tempdir().expect("tempdir");
+    std::fs::write(
+        temporary.path().join("kernary.providers.toml"),
+        r#"schema_version = 1
+
+[[providers]]
+id = "custom-local"
+display_name = "Custom Local"
+credential_required = false
+default_model = "model-b"
+
+[[providers.routes]]
+protocol = "openai-chat"
+endpoint = "http://127.0.0.1:18888/v1/chat/completions"
+models = ["model-a", "model-b"]
+"#,
+    )
+    .expect("provider config");
+    let mut child = kernary_without_test_model()
+        .current_dir(temporary.path())
+        .args(["--ui", "plain", "--ascii"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("process");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"/provider switch\ncustom-local\n/status\n/model model-a\n/status\n/exit\n")
+        .expect("commands");
+    let output = child.wait_with_output().expect("output");
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(
+        stdout.contains("Provider switched: custom-local/model-b"),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("Model    custom-local/model-a"),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
 fn plain_mode_can_checkpoint_and_compact_real_context() {
     let temporary = tempdir().expect("tempdir");
     let mut child = harness()
