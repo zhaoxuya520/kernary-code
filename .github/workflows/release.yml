@@ -91,6 +91,7 @@ jobs:
 
   publish-npm:
     name: Publish npm packages
+    if: ${{ vars.NPM_PUBLISH_ENABLED == 'true' }}
     needs: package
     runs-on: ubuntu-latest
     permissions:
