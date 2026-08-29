@@ -168,7 +168,7 @@ impl ProcessSandbox {
         &self,
         executable: &Path,
         arguments: &[String],
-        cwd: &Path,
+        _cwd: &Path,
     ) -> Result<Command, SandboxError> {
         let policy = *self.policy.read().map_err(|_| {
             SandboxError::new("sandbox-policy-poisoned", "Sandbox policy lock poisoned")
@@ -190,7 +190,7 @@ impl ProcessSandbox {
                 .arg("--root")
                 .arg(&self.root)
                 .arg("--cwd")
-                .arg(cwd)
+                .arg(_cwd)
                 .arg("--")
                 .arg(executable)
                 .args(arguments);
@@ -224,12 +224,12 @@ impl ProcessSandbox {
                 .arg("--tmpfs")
                 .arg("/tmp")
                 .arg("--chdir")
-                .arg(cwd)
+                .arg(_cwd)
                 .arg("--")
                 .arg(executable)
                 .args(arguments);
             apply_offline_environment(&mut command, policy.network_access);
-            return Ok(command);
+            Ok(command)
         }
 
         #[cfg(not(any(windows, target_os = "linux")))]
