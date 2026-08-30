@@ -247,7 +247,8 @@ impl ModelProvider for OpenAiResponsesProvider {
     ) -> Result<ModelEventStream, ModelError> {
         let capability = self.capability(&request.model_id)?;
         let effective_reasoning = self.validate_request(&request, capability)?;
-        let body = build_responses_request(&request, effective_reasoning)?;
+        let body =
+            build_responses_request(&request, effective_reasoning, capability.reasoning_summary)?;
         let api_key = self.credential()?;
         if cancellation.is_cancelled() {
             return Err(ModelError::new(
@@ -470,6 +471,7 @@ mod tests {
             provider_compaction: true,
             context_window_tokens: 100_000,
             max_output_tokens: 8_192,
+            reasoning_summary: true,
             reasoning_levels: [ReasoningLevel::Low, ReasoningLevel::High]
                 .into_iter()
                 .collect::<BTreeSet<_>>(),

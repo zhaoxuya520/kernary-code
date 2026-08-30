@@ -31,6 +31,7 @@ impl ModelProvider for UnconfiguredModelProvider {
             provider_compaction: false,
             context_window_tokens: 8_192,
             max_output_tokens: 2_048,
+            reasoning_summary: false,
             reasoning_levels: [ReasoningLevel::Off].into_iter().collect(),
         }])
     }

@@ -283,6 +283,7 @@ mod tests {
                 provider_compaction: false,
                 context_window_tokens: 8_192,
                 max_output_tokens: 1_024,
+                reasoning_summary: false,
                 reasoning_levels: BTreeSet::new(),
             }])
         }

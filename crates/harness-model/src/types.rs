@@ -33,6 +33,10 @@ pub struct ModelCapability {
     pub provider_compaction: bool,
     pub context_window_tokens: u32,
     pub max_output_tokens: u32,
+    /// Provider 是否能像 Codex Responses/Claude 一样流式返回可公开的推理摘要。
+    /// 旧模型缓存缺少此字段时按 false 处理，绝不把私有思维链冒充摘要。
+    #[serde(default)]
+    pub reasoning_summary: bool,
     pub reasoning_levels: BTreeSet<ReasoningLevel>,
 }
 

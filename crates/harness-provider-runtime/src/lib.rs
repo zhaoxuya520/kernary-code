@@ -413,6 +413,9 @@ fn build_protocol_provider(
             .iter()
             .map(|model| catalog_capability(&adapter_id, model, route.protocol))
             .collect::<Vec<_>>();
+        let inferred_reasoning_effort = models
+            .iter()
+            .any(|capability| !capability.reasoning_levels.is_empty());
         let adapter: Arc<dyn ModelProvider> = match route.protocol {
             ProviderProtocol::OpenaiChat => Arc::new(CompatibleProvider::new(
                 CompatibleProviderConfig {
@@ -421,6 +424,7 @@ fn build_protocol_provider(
                     credential_id: provider.credential_id.as_deref().map(CredentialId::new),
                     models,
                     reasoning_field: if route.reasoning_field.as_deref() == Some("reasoning-effort")
+                        || inferred_reasoning_effort
                     {
                         CompatibleReasoningField::ReasoningEffort
                     } else {
@@ -498,12 +502,14 @@ fn catalog_capability(
         provider_compaction: false,
         context_window_tokens: 32_768,
         max_output_tokens: 4_096,
+        reasoning_summary: false,
         reasoning_levels: BTreeSet::new(),
     };
     match protocol {
         ProviderProtocol::OpenaiResponses => {
             capability.conversation_continuation = true;
             capability.provider_compaction = true;
+            capability.reasoning_summary = true;
             capability.reasoning_levels = [
                 ReasoningLevel::Off,
                 ReasoningLevel::Low,
@@ -517,12 +523,36 @@ fn catalog_capability(
         ProviderProtocol::AnthropicMessages => {
             capability.structured_output = false;
             capability.context_window_tokens = 100_000;
+            capability.reasoning_summary = true;
             capability.reasoning_levels = [ReasoningLevel::Off, ReasoningLevel::Medium]
                 .into_iter()
                 .collect();
         }
     }
+    apply_known_model_profile(&mut capability);
     capability
+}
+
+/// 自定义中转站的 `/models` 通常只返回 ID，不返回 Codex ModelInfo 中的上下文、
+/// 输出和推理能力。这里只为有厂商公开规格的模型补保守默认值；未知模型继续使用
+/// 通用上限，避免凭名称猜测能力。
+fn apply_known_model_profile(capability: &mut ModelCapability) {
+    let model = capability.model_id.as_str().to_ascii_lowercase();
+    if model == "glm-5.3-flash" || model.starts_with("glm-5.3-flash[") {
+        capability.context_window_tokens = 1_000_000;
+        // 官方默认 max_tokens 为 65,536；模型最大值更高，但不主动把一次请求推到上限。
+        capability.max_output_tokens = 65_536;
+        // Chat Completions 会通过 choices[].delta.reasoning_content 返回独立的
+        // Provider-visible reasoning stream；Responses 则使用标准 summary 事件。
+        capability.reasoning_summary = true;
+        capability.reasoning_levels = [
+            ReasoningLevel::Low,
+            ReasoningLevel::High,
+            ReasoningLevel::Max,
+        ]
+        .into_iter()
+        .collect();
+    }
 }
 
 fn required_credential(provider: &ProviderDefinition) -> Result<CredentialId, ModelError> {
@@ -714,6 +744,40 @@ mod tests {
             }),
             source: ProviderSource::BuiltIn,
         }
+    }
+
+    #[test]
+    fn glm_53_flash_uses_published_long_output_and_reasoning_capabilities() {
+        let model = ModelId::from("glm-5.3-flash");
+        let chat = catalog_capability(
+            &ProviderId::from("custom-bai"),
+            &model,
+            ProviderProtocol::OpenaiChat,
+        );
+        assert_eq!(chat.context_window_tokens, 1_000_000);
+        assert_eq!(chat.max_output_tokens, 65_536);
+        assert_eq!(
+            chat.reasoning_levels,
+            [
+                ReasoningLevel::Low,
+                ReasoningLevel::High,
+                ReasoningLevel::Max
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(
+            chat.reasoning_summary,
+            "GLM Chat 提供独立的 reasoning_content"
+        );
+
+        let responses = catalog_capability(
+            &ProviderId::from("custom-bai"),
+            &model,
+            ProviderProtocol::OpenaiResponses,
+        );
+        assert!(responses.reasoning_summary);
+        assert!(responses.conversation_continuation);
     }
 
     #[test]

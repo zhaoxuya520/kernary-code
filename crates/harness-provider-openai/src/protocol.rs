@@ -12,6 +12,7 @@ use crate::OpenAiHttpResponse;
 pub fn build_responses_request(
     request: &ModelRequest,
     effective_reasoning: Option<ReasoningLevel>,
+    include_reasoning_summary: bool,
 ) -> Result<serde_json::Value, ModelError> {
     let input = request
         .input
@@ -108,7 +109,15 @@ pub fn build_responses_request(
         "store": request.store
     });
     if let Some(reasoning) = effective_reasoning {
-        body["reasoning"] = serde_json::json!({"effort": reasoning_name(reasoning)});
+        body["reasoning"] = if include_reasoning_summary {
+            // 与 Codex 一致：明确请求 Provider 可公开的摘要，而不是暴露原始思维链。
+            serde_json::json!({
+                "effort": reasoning_name(reasoning),
+                "summary": "auto"
+            })
+        } else {
+            serde_json::json!({"effort": reasoning_name(reasoning)})
+        };
     }
     if let Some(previous_response_id) = &request.previous_response_id {
         body["previous_response_id"] = serde_json::json!(previous_response_id);
@@ -233,13 +242,23 @@ mod tests {
 
     #[test]
     fn request_uses_typed_items_and_off_maps_to_none() {
-        let body = build_responses_request(&request(), Some(ReasoningLevel::Off)).expect("body");
+        let body =
+            build_responses_request(&request(), Some(ReasoningLevel::Off), true).expect("body");
         assert_eq!(body["reasoning"]["effort"], "none");
+        assert_eq!(body["reasoning"]["summary"], "auto");
         assert_eq!(body["previous_response_id"], "response:1");
         assert_eq!(body["input"][1]["type"], "function_call_output");
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
+    }
+
+    #[test]
+    fn request_omits_summary_when_model_catalog_does_not_support_it() {
+        let body =
+            build_responses_request(&request(), Some(ReasoningLevel::High), false).expect("body");
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert!(body["reasoning"].get("summary").is_none());
     }
 
     #[test]
@@ -250,7 +269,8 @@ mod tests {
             PromptCachePolicy::for_request(&request.instructions, &request.tools)
                 .expect("cache policy"),
         );
-        let body = build_responses_request(&request, Some(ReasoningLevel::Off)).expect("body");
+        let body =
+            build_responses_request(&request, Some(ReasoningLevel::Off), true).expect("body");
         assert_eq!(
             body["prompt_cache_key"],
             request.prompt_cache.as_ref().expect("policy").key

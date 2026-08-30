@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/zhaoxuya520/kernary-code/actions/workflows/ci.yml"><img src="https://github.com/zhaoxuya520/kernary-code/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Apache-2.0"></a>
-  <img src="https://img.shields.io/badge/version-0.13.3-gold.svg" alt="0.13.3">
+  <img src="https://img.shields.io/badge/version-0.13.4-gold.svg" alt="0.13.4">
 </p>
 
 > [!IMPORTANT]

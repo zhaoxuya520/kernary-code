@@ -856,6 +856,7 @@ mod tests {
             provider_compaction: false,
             context_window_tokens: 100_000,
             max_output_tokens: 4_096,
+            reasoning_summary: true,
             reasoning_levels: [ReasoningLevel::Off, ReasoningLevel::Medium]
                 .into_iter()
                 .collect::<BTreeSet<_>>(),
@@ -908,6 +909,7 @@ mod tests {
                     provider_compaction: false,
                     context_window_tokens: 100_000,
                     max_output_tokens: 4_096,
+                    reasoning_summary: true,
                     reasoning_levels: [ReasoningLevel::Off, ReasoningLevel::Medium]
                         .into_iter()
                         .collect(),
@@ -960,6 +962,7 @@ mod tests {
                     provider_compaction: false,
                     context_window_tokens: 100_000,
                     max_output_tokens: 4_096,
+                    reasoning_summary: true,
                     reasoning_levels: BTreeSet::new(),
                 }],
             },

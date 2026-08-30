@@ -328,6 +328,7 @@ struct ModelLoopState {
     previous_response_id: Option<ResponseId>,
     output: String,
     next_turn: u8,
+    length_continuations: u8,
 }
 
 #[derive(Clone)]
@@ -7506,6 +7507,7 @@ where
                 previous_response_id: None,
                 output: String::new(),
                 next_turn: 0,
+                length_continuations: 0,
             }
         };
         while state.next_turn < 8 {
@@ -7539,7 +7541,16 @@ where
                 HarnessEvent::ReasoningSummary {
                     agent_id: agent_id.clone(),
                     summary: if turn == 0 {
-                        "分析任务、上下文与可用工具".to_owned()
+                        if state
+                            .view
+                            .reasoning_effective
+                            .is_some_and(|level| level != ReasoningLevel::Off)
+                            && !state.view.capability.reasoning_summary
+                        {
+                            "分析任务、上下文与可用工具 · 当前协议不提供公开推理摘要".to_owned()
+                        } else {
+                            "分析任务、上下文与可用工具".to_owned()
+                        }
                     } else {
                         format!("整合第 {turn} 轮工具结果并继续处理")
                     },
@@ -7560,7 +7571,10 @@ where
                 tools: state.tools.clone(),
                 reasoning: state.view.reasoning_requested,
                 response_format: ResponseFormat::Text,
-                max_output_tokens: state.view.capability.max_output_tokens.min(1_024),
+                // Codex 不会把正常 Agent 回答再硬裁成 1K。模型能力目录已经是
+                // Provider 边界，这里使用完整能力上限，避免推理模型把全部预算
+                // 消耗在 reasoning 后以 `length` 结束、一个正文 token 都来不及输出。
+                max_output_tokens: state.view.capability.max_output_tokens,
                 previous_response_id: state.previous_response_id.clone(),
                 prompt_cache,
                 store: false,
@@ -7570,6 +7584,7 @@ where
             let mut response_id = None;
             let mut tool_calls = Vec::<(ToolCallId, String, serde_json::Value)>::new();
             let mut completed = false;
+            let mut incomplete_reason = None;
             let stream = self
                 .model_runtime
                 .as_ref()
@@ -7632,14 +7647,66 @@ where
                     } => completed = true,
                     ModelEvent::Completed {
                         status: CompletionStatus::Incomplete,
-                        incomplete_reason,
+                        incomplete_reason: reason,
                     } => {
-                        return Err(ApplicationError::new(
-                            "model-response-incomplete",
-                            incomplete_reason.unwrap_or_else(|| "unknown".to_owned()),
-                        ));
+                        incomplete_reason = Some(reason.unwrap_or_else(|| "unknown".to_owned()));
                     }
                 }
+            }
+            if let Some(reason) = incomplete_reason {
+                const MAX_LENGTH_CONTINUATIONS: u8 = 2;
+                if !is_output_limit_reason(&reason) {
+                    return Err(ApplicationError::new("model-response-incomplete", reason));
+                }
+                if !tool_calls.is_empty() {
+                    return Err(ApplicationError::new(
+                        "model-tool-call-incomplete",
+                        "模型在 Tool Call 完成前达到输出上限；未执行半截参数",
+                    ));
+                }
+                if state.length_continuations >= MAX_LENGTH_CONTINUATIONS || turn == 7 {
+                    return Err(ApplicationError::new(
+                        "model-response-incomplete",
+                        format!(
+                            "{reason} · 已保留部分输出，自动续写达到 {MAX_LENGTH_CONTINUATIONS} 次上限"
+                        ),
+                    ));
+                }
+
+                state.length_continuations = state.length_continuations.saturating_add(1);
+                state.next_turn = turn.saturating_add(1);
+                let continuation = ModelInputItem::Message {
+                    role: ModelMessageRole::User,
+                    content: "[Output continuation]\n上一段只因输出上限而中断。请从中断处直接继续，不要复述已经输出的内容，不要重新开始；若任务要求修改文件，继续使用工具完成并验证。"
+                        .to_owned(),
+                };
+                if state.view.capability.conversation_continuation
+                    && let Some(response_id) = response_id
+                {
+                    state.previous_response_id = Some(response_id);
+                    state.next_input = vec![continuation];
+                } else {
+                    if !turn_output.is_empty() {
+                        state.transcript.push(ModelInputItem::Message {
+                            role: ModelMessageRole::Assistant,
+                            content: turn_output,
+                        });
+                    }
+                    state.transcript.push(continuation);
+                    state.next_input.clone_from(&state.transcript);
+                }
+                self.publish(
+                    HarnessEvent::ReasoningSummary {
+                        agent_id: agent_id.clone(),
+                        summary: format!(
+                            "输出达到模型上限，正在从断点继续 · {}/{}",
+                            state.length_continuations, MAX_LENGTH_CONTINUATIONS
+                        ),
+                    },
+                    self.mission_scope(mission_id),
+                    EventPriority::Normal,
+                )?;
+                continue;
             }
             if !completed {
                 return Err(ApplicationError::new(
@@ -9316,6 +9383,14 @@ const fn reasoning_mapping_name(mapping: ReasoningMapping) -> &'static str {
     }
 }
 
+fn is_output_limit_reason(reason: &str) -> bool {
+    let normalized = reason.trim().to_ascii_lowercase().replace('-', "_");
+    matches!(
+        normalized.as_str(),
+        "length" | "max_tokens" | "max_output_tokens" | "max_completion_tokens"
+    ) || normalized.contains("output_limit")
+}
+
 fn next_context_order(items: &[CompactionItem]) -> i32 {
     items
         .iter()
@@ -10444,6 +10519,109 @@ mod tests {
             ReasoningLevel::Off,
         )
         .expect("model runtime")
+    }
+
+    #[test]
+    fn interactive_agent_uses_catalog_output_budget_instead_of_legacy_one_k_cap() {
+        let temporary = tempdir().expect("tempdir");
+        let (application, _) = application(&temporary.path().join("output-budget.sqlite"));
+        let provider = Arc::new(FakeModelProvider::standard(vec![FakeScenario::text(
+            &["done"],
+            ModelUsage::default(),
+        )]));
+        let mut registry = ModelRegistry::new();
+        registry
+            .register(provider.clone())
+            .expect("register provider");
+        let runtime = ModelRuntime::new(
+            registry,
+            ProviderId::from("fake"),
+            ModelId::from("deterministic"),
+            ReasoningLevel::Off,
+        )
+        .expect("runtime");
+        let mut application = application.with_model_runtime(runtime);
+        application.boot().expect("boot");
+        let working_context = AgentWorkingContext {
+            stable_instructions: "stable".to_owned(),
+            dynamic_context: String::new(),
+            selected_item_ids: vec![],
+            excluded_item_ids: vec![],
+            token_cost: 1,
+            max_input_tokens: 1_024,
+            fingerprint: "context:test".to_owned(),
+        };
+        let output = application
+            .execute_model(
+                "build",
+                &MissionId::from("mission:test"),
+                None,
+                &AgentDefinitionId::from("agent:coder"),
+                &working_context,
+                CancellationToken::new(),
+            )
+            .expect("model output");
+        assert_eq!(output, "done");
+        let requests = provider.requests().expect("requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].max_output_tokens, 2_048);
+    }
+
+    #[test]
+    fn length_incomplete_keeps_partial_text_and_continues_from_response() {
+        let temporary = tempdir().expect("tempdir");
+        let (application, _) = application(&temporary.path().join("length-retry.sqlite"));
+        let provider = Arc::new(FakeModelProvider::standard(vec![
+            FakeScenario::incomplete(&["part one, "], "length", ModelUsage::default()),
+            FakeScenario::text(&["part two"], ModelUsage::default()),
+        ]));
+        let mut registry = ModelRegistry::new();
+        registry
+            .register(provider.clone())
+            .expect("register provider");
+        let runtime = ModelRuntime::new(
+            registry,
+            ProviderId::from("fake"),
+            ModelId::from("deterministic"),
+            ReasoningLevel::Off,
+        )
+        .expect("runtime");
+        let mut application = application.with_model_runtime(runtime);
+        application.boot().expect("boot");
+        let working_context = AgentWorkingContext {
+            stable_instructions: "stable".to_owned(),
+            dynamic_context: String::new(),
+            selected_item_ids: vec![],
+            excluded_item_ids: vec![],
+            token_cost: 1,
+            max_input_tokens: 1_024,
+            fingerprint: "context:length".to_owned(),
+        };
+        let output = application
+            .execute_model(
+                "build",
+                &MissionId::from("mission:length"),
+                None,
+                &AgentDefinitionId::from("agent:coder"),
+                &working_context,
+                CancellationToken::new(),
+            )
+            .expect("continued output");
+        assert_eq!(output, "part one, part two");
+        let requests = provider.requests().expect("requests");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1]
+                .previous_response_id
+                .as_ref()
+                .map(ResponseId::as_str),
+            Some("response:fake-incomplete")
+        );
+        assert!(requests[1].input.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message { role: ModelMessageRole::User, content }
+                if content.contains("Output continuation")
+        )));
     }
 
     #[test]

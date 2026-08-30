@@ -9,7 +9,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use harness_event::{EventEnvelope, EventSubscription, HarnessEvent};
+use harness_event::{EventEnvelope, EventPriority, EventSubscription, HarnessEvent};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -248,27 +248,170 @@ fn split_activity_detail(entry: &str) -> (&str, &str) {
         .unwrap_or((entry, ""))
 }
 
-fn live_progress_text(history: &[String]) -> Option<String> {
-    history.iter().rev().find_map(|entry| {
-        if let Some(reasoning) = entry
-            .strip_prefix("[THINK] ")
-            .or_else(|| entry.strip_prefix("◇ "))
-        {
-            return Some(reasoning.to_owned());
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveActivitySource {
+    /// Application-authored progress such as "analysing task and tools".
+    Stage,
+    /// Provider-authored, public reasoning-summary deltas.
+    ReasoningSummary,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LiveActivityCell {
+    agent_id: String,
+    text: String,
+    source: LiveActivitySource,
+}
+
+impl LiveActivityCell {
+    fn stage(agent_id: String, text: String) -> Self {
+        Self {
+            agent_id,
+            text,
+            source: LiveActivitySource::Stage,
         }
-        entry
+    }
+
+    fn reasoning_summary(agent_id: String, text: String) -> Self {
+        Self {
+            agent_id,
+            text,
+            source: LiveActivitySource::ReasoningSummary,
+        }
+    }
+
+    fn is_reasoning_summary(&self) -> bool {
+        self.source == LiveActivitySource::ReasoningSummary
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LiveActivityState {
+    active_cell: Option<LiveActivityCell>,
+}
+
+impl LiveActivityState {
+    fn update_reasoning(
+        &mut self,
+        agent_id: String,
+        summary: String,
+        priority: EventPriority,
+        history: &mut Vec<String>,
+    ) {
+        if summary.is_empty() {
+            return;
+        }
+        if priority != EventPriority::Delta {
+            self.commit(history);
+            self.active_cell = Some(LiveActivityCell::stage(agent_id, summary));
+            return;
+        }
+
+        if let Some(cell) = self.active_cell.as_mut()
+            && cell.is_reasoning_summary()
+            && cell.agent_id == agent_id
+        {
+            cell.text.push_str(&summary);
+            return;
+        }
+
+        // A model summary supersedes the application-authored placeholder. If another model
+        // summary was active (for example from a concurrent agent), commit it before switching.
+        self.commit(history);
+        self.active_cell = Some(LiveActivityCell::reasoning_summary(agent_id, summary));
+    }
+
+    fn commit(&mut self, history: &mut Vec<String>) {
+        let Some(cell) = self.active_cell.take() else {
+            return;
+        };
+        if !cell.is_reasoning_summary() || cell.text.trim().is_empty() {
+            return;
+        }
+        history.push(format!("[THINK] {}", cell.text.trim()));
+    }
+
+    fn active_cell(&self) -> Option<&LiveActivityCell> {
+        self.active_cell.as_ref()
+    }
+}
+
+fn pending_run_status(history: &[String]) -> Option<String> {
+    for entry in history.iter().rev() {
+        if let Some(agent) = entry
             .strip_prefix("[RUN] ")
             .or_else(|| entry.strip_prefix("◆ "))
-            .and_then(|agent| {
-                if agent.starts_with("已发送") {
-                    Some("正在连接模型".to_owned())
-                } else if agent.starts_with("coder [Coder]") && agent.contains("task:main") {
-                    Some("Coder 正在工作".to_owned())
-                } else {
-                    None
-                }
-            })
-    })
+        {
+            if agent.starts_with("已发送") {
+                return Some("正在连接模型".to_owned());
+            }
+            if agent.starts_with("coder [Coder]") && agent.contains("task:main") {
+                return Some("Coder 正在工作".to_owned());
+            }
+        }
+        if entry.starts_with("Kernary: ")
+            || entry.starts_with("[TOOL] ")
+            || entry.starts_with("◈ ")
+            || entry.starts_with("[DONE] ")
+            || entry.starts_with("✓ ")
+            || entry.starts_with("[FAIL] ")
+            || entry.starts_with("✕ ")
+            || entry.starts_with("[PERM] ")
+            || entry.starts_with("? ")
+            || entry.starts_with("You: ")
+        {
+            return None;
+        }
+    }
+    None
+}
+
+fn push_reasoning_summary(
+    lines: &mut Vec<Line<'static>>,
+    summary: &str,
+    theme: ProductTheme,
+    ascii: bool,
+    spinner: Option<&str>,
+) {
+    let summary = summary.trim();
+    if summary.is_empty() {
+        return;
+    }
+    let base_style = theme.muted.add_modifier(Modifier::ITALIC);
+    let mut first_content = true;
+    let mut last_was_blank = false;
+    for raw_line in summary.lines() {
+        let content = raw_line.trim();
+        if content.is_empty() {
+            if !first_content && !last_was_blank {
+                lines.push(Line::default());
+                last_was_blank = true;
+            }
+            continue;
+        }
+        let prefix = if first_content {
+            spinner.map_or_else(
+                || {
+                    if ascii {
+                        "- ".to_owned()
+                    } else {
+                        "• ".to_owned()
+                    }
+                },
+                |spinner| format!("{spinner} "),
+            )
+        } else {
+            "  ".to_owned()
+        };
+        let mut spans = vec![Span::styled(prefix, theme.muted)];
+        spans.extend(inline_markdown_spans(content, base_style, theme));
+        lines.push(Line::from(spans));
+        first_content = false;
+        last_was_blank = false;
+    }
+    while lines.last().is_some_and(|line| line.spans.is_empty()) {
+        lines.pop();
+    }
 }
 
 fn activity_lines(
@@ -297,7 +440,11 @@ fn activity_lines(
             continue;
         }
 
-        if entry.starts_with("[THINK] ") || entry.starts_with("◇ ") {
+        if let Some(summary) = entry
+            .strip_prefix("[THINK] ")
+            .or_else(|| entry.strip_prefix("◇ "))
+        {
+            push_reasoning_summary(&mut lines, summary, theme, ascii, None);
             continue;
         }
 
@@ -826,6 +973,17 @@ fn restore_background_draft(input: &mut LineEditor, restore_input: Option<String
     }
 }
 
+fn backend_response_finishes_live_activity(response: &BackendResponse) -> bool {
+    response.should_exit
+        || response.lines.iter().any(|line| {
+            line.starts_with("[DONE] ")
+                || line.starts_with("✓ ")
+                || line.starts_with("[FAIL] ")
+                || line.starts_with("✕ ")
+                || line.starts_with("! ")
+        })
+}
+
 // 这些参数共同组成 TUI 的一次原子状态迁移；拆成独立调用会产生半更新画面。
 #[allow(clippy::too_many_arguments)]
 fn apply_backend_response_to_tui(
@@ -1035,6 +1193,52 @@ fn render_transcript_event(
     renderer.sanitize(&rendered)
 }
 
+fn event_finishes_live_reasoning(event: &HarnessEvent) -> bool {
+    match event {
+        HarnessEvent::TextOutput { .. }
+        | HarnessEvent::ToolStatus { .. }
+        | HarnessEvent::BrowserStatus { .. }
+        | HarnessEvent::McpStatus { .. }
+        | HarnessEvent::PluginStatus { .. }
+        | HarnessEvent::SkillStatus { .. }
+        | HarnessEvent::PermissionRequested { .. }
+        | HarnessEvent::Error { .. }
+        | HarnessEvent::SystemShutdown { .. } => true,
+        HarnessEvent::AgentStatus { status, .. } => {
+            status.contains("complete")
+                || status.contains("fail")
+                || status.contains("block")
+                || status.contains("sleep")
+        }
+        _ => false,
+    }
+}
+
+fn ingest_transcript_event(
+    envelope: &EventEnvelope,
+    history: &mut Vec<String>,
+    live_activity: &mut LiveActivityState,
+    renderer: PlainRenderer,
+    ascii: bool,
+) {
+    if let HarnessEvent::ReasoningSummary { agent_id, summary } = &envelope.event {
+        live_activity.update_reasoning(
+            agent_id.to_string(),
+            renderer.sanitize(summary),
+            envelope.priority,
+            history,
+        );
+        return;
+    }
+
+    if event_finishes_live_reasoning(&envelope.event) {
+        live_activity.commit(history);
+    }
+    if event_is_transcript_worthy(&envelope.event) {
+        push_activity(history, render_transcript_event(envelope, renderer, ascii));
+    }
+}
+
 /// Ctrl+C 的纯状态机结果。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CancelAction {
@@ -1088,6 +1292,7 @@ struct TuiView<'a> {
     snapshot: &'a TerminalSnapshot,
     pack: &'a LanguagePack,
     history: &'a [String],
+    live_activity: Option<&'a LiveActivityCell>,
     input: &'a LineEditor,
     secret_prompt: Option<&'a SecretPrompt>,
     secret_input: &'a LineEditor,
@@ -1296,23 +1501,51 @@ fn render_product_tui(frame: &mut Frame<'_>, view: TuiView<'_>) -> usize {
     } else {
         activity_lines(view.history, theme, view.pack, view.options.ascii)
     };
-    let live_progress = (is_working && !setup_active)
-        .then(|| live_progress_text(view.history))
-        .flatten();
-    let progress_height = u16::from(live_progress.is_some() && chunks[1].height >= 2);
+    let transcript_padding: u16 = if area.width >= 72 { 3 } else { 1 };
+    let live_text_width = chunks[1]
+        .width
+        .saturating_sub(transcript_padding.saturating_mul(2));
+    let mut live_activity_lines = Vec::new();
+    if !setup_active
+        && !view.show_onboarding
+        && let Some(cell) = view.live_activity
+    {
+        push_reasoning_summary(
+            &mut live_activity_lines,
+            &cell.text,
+            theme,
+            view.options.ascii,
+            Some(spinner_frame(view.elapsed, view.options.ascii)),
+        );
+    } else if is_working
+        && !setup_active
+        && !view.show_onboarding
+        && let Some(status) = pending_run_status(view.history)
+    {
+        push_reasoning_summary(
+            &mut live_activity_lines,
+            &status,
+            theme,
+            view.options.ascii,
+            Some(spinner_frame(view.elapsed, view.options.ascii)),
+        );
+    }
+    let live_total_height = wrapped_line_count(&live_activity_lines, live_text_width);
+    let live_height = u16::try_from(live_total_height)
+        .unwrap_or(u16::MAX)
+        .min(chunks[1].height.saturating_sub(1).min(6));
     let transcript_area = Rect::new(
         chunks[1].x,
         chunks[1].y,
         chunks[1].width,
-        chunks[1].height.saturating_sub(progress_height),
+        chunks[1].height.saturating_sub(live_height),
     );
-    let progress_area = Rect::new(
+    let live_activity_area = Rect::new(
         chunks[1].x,
-        chunks[1].bottom().saturating_sub(progress_height),
+        chunks[1].bottom().saturating_sub(live_height),
         chunks[1].width,
-        progress_height,
+        live_height,
     );
-    let transcript_padding: u16 = if area.width >= 72 { 3 } else { 1 };
     let text_width = transcript_area
         .width
         .saturating_sub(transcript_padding.saturating_mul(2));
@@ -1348,20 +1581,14 @@ fn render_product_tui(frame: &mut Frame<'_>, view: TuiView<'_>) -> usize {
             indicator_area,
         );
     }
-    if let Some(progress) = live_progress {
+    if live_height > 0 {
+        let live_scroll = live_total_height.saturating_sub(usize::from(live_height));
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    format!("{} ", spinner_frame(view.elapsed, view.options.ascii)),
-                    theme.accent,
-                ),
-                Span::styled(
-                    middle_truncate(&progress, 88),
-                    theme.muted.add_modifier(Modifier::ITALIC),
-                ),
-            ]))
-            .block(Block::default().padding(Padding::horizontal(transcript_padding))),
-            progress_area,
+            Paragraph::new(Text::from(live_activity_lines))
+                .wrap(Wrap { trim: false })
+                .scroll((u16::try_from(live_scroll).unwrap_or(u16::MAX), 0))
+                .block(Block::default().padding(Padding::horizontal(transcript_padding))),
+            live_activity_area,
         );
     }
 
@@ -1677,6 +1904,7 @@ pub fn run_tui<B: TerminalBackend>(
     let mut input_prompt: Option<InputPrompt> = None;
     let mut setup_history_start: Option<usize> = None;
     let mut notice: Option<UiNotice> = None;
+    let mut live_activity = LiveActivityState::default();
 
     let mut show_onboarding = history.is_empty();
     let mut transcript_scroll = 0usize;
@@ -1690,15 +1918,19 @@ pub fn run_tui<B: TerminalBackend>(
             notice = None;
         }
         while let Ok(envelope) = subscription.try_recv() {
-            if event_is_transcript_worthy(&envelope.event) {
-                push_activity(
-                    &mut history,
-                    render_transcript_event(&envelope, renderer, options.ascii),
-                );
-            }
+            ingest_transcript_event(
+                &envelope,
+                &mut history,
+                &mut live_activity,
+                renderer,
+                options.ascii,
+            );
         }
         let background = backend.poll();
         if background != BackendResponse::default() {
+            if backend_response_finishes_live_activity(&background) {
+                live_activity.commit(&mut history);
+            }
             let restore_input = background.restore_input.clone();
             if apply_backend_response_to_tui(
                 background,
@@ -1720,6 +1952,9 @@ pub fn run_tui<B: TerminalBackend>(
         }
 
         let snapshot = backend.snapshot();
+        if snapshot.agents == 0 {
+            live_activity.commit(&mut history);
+        }
         let pack = snapshot.language.pack();
         let registry = CommandRegistry::with_language(snapshot.language);
         let mut suggestions = if secret_prompt.is_none() && !suggestions_dismissed {
@@ -1751,6 +1986,7 @@ pub fn run_tui<B: TerminalBackend>(
                     snapshot: &snapshot,
                     pack,
                     history: &history,
+                    live_activity: live_activity.active_cell(),
                     input: &input,
                     secret_prompt: secret_prompt.as_ref(),
                     secret_input: &secret_input,
@@ -1890,6 +2126,7 @@ pub fn run_tui<B: TerminalBackend>(
             match cancel.on_ctrl_c(now, !input.is_empty(), snapshot.agents > 0) {
                 CancelAction::ClearInput => input.clear(),
                 CancelAction::CancelCurrent => {
+                    live_activity.commit(&mut history);
                     history.extend(
                         backend
                             .cancel_current()
@@ -1902,6 +2139,7 @@ pub fn run_tui<B: TerminalBackend>(
                     push_activity(&mut history, pack.exit_hint.to_owned());
                 }
                 CancelAction::Exit => {
+                    live_activity.commit(&mut history);
                     let response = backend.handle_input("/exit");
                     history.extend(
                         response
@@ -2374,6 +2612,7 @@ mod tests {
                         snapshot: &snapshot,
                         pack: snapshot.language.pack(),
                         history: &["Kernary: working".to_owned()],
+                        live_activity: None,
                         input: &input,
                         secret_prompt: None,
                         secret_input: &secret_input,
@@ -2441,6 +2680,111 @@ mod tests {
         push_activity(&mut history, "[THINK] 分析".to_owned());
         push_activity(&mut history, "[THINK] 任务".to_owned());
         assert_eq!(history[1], "[THINK] 分析任务");
+
+        let mut waiting = vec![
+            "You: build".to_owned(),
+            "[RUN] 已发送 · 正在连接模型".to_owned(),
+        ];
+        assert_eq!(
+            pending_run_status(&waiting).as_deref(),
+            Some("正在连接模型")
+        );
+        waiting.push("Kernary: started".to_owned());
+        assert_eq!(pending_run_status(&waiting), None);
+    }
+
+    #[test]
+    fn reasoning_deltas_use_a_live_cell_then_commit_before_assistant_output() {
+        let renderer = PlainRenderer::new(RenderStyle {
+            ascii: false,
+            color: false,
+        });
+        let mut history = Vec::new();
+        let mut live_activity = LiveActivityState::default();
+        let envelope = |sequence, priority, event| EventEnvelope {
+            schema_version: 1,
+            sequence,
+            recorded_at_millis: 0,
+            scope: EventScope::default(),
+            priority,
+            event,
+        };
+
+        ingest_transcript_event(
+            &envelope(
+                1,
+                EventPriority::Normal,
+                HarnessEvent::ReasoningSummary {
+                    agent_id: harness_types::AgentDefinitionId::from("agent:coder"),
+                    summary: "分析任务、上下文与可用工具".to_owned(),
+                },
+            ),
+            &mut history,
+            &mut live_activity,
+            renderer,
+            false,
+        );
+        assert_eq!(
+            live_activity.active_cell().map(|cell| cell.source),
+            Some(LiveActivitySource::Stage)
+        );
+        assert!(history.is_empty());
+
+        ingest_transcript_event(
+            &envelope(
+                2,
+                EventPriority::Delta,
+                HarnessEvent::ReasoningSummary {
+                    agent_id: harness_types::AgentDefinitionId::from("agent:coder"),
+                    summary: "**检查项目**\n".to_owned(),
+                },
+            ),
+            &mut history,
+            &mut live_activity,
+            renderer,
+            false,
+        );
+        ingest_transcript_event(
+            &envelope(
+                3,
+                EventPriority::Delta,
+                HarnessEvent::ReasoningSummary {
+                    agent_id: harness_types::AgentDefinitionId::from("agent:coder"),
+                    summary: "已找到入口文件".to_owned(),
+                },
+            ),
+            &mut history,
+            &mut live_activity,
+            renderer,
+            false,
+        );
+        let active = live_activity.active_cell().expect("live reasoning cell");
+        assert_eq!(active.source, LiveActivitySource::ReasoningSummary);
+        assert_eq!(active.text, "**检查项目**\n已找到入口文件");
+        assert!(!active.text.contains("分析任务、上下文与可用工具"));
+        assert!(history.is_empty());
+
+        ingest_transcript_event(
+            &envelope(
+                4,
+                EventPriority::Delta,
+                HarnessEvent::TextOutput {
+                    text: "开始实现。".to_owned(),
+                },
+            ),
+            &mut history,
+            &mut live_activity,
+            renderer,
+            false,
+        );
+        assert!(live_activity.active_cell().is_none());
+        assert_eq!(
+            history,
+            [
+                "[THINK] **检查项目**\n已找到入口文件",
+                "Kernary: 开始实现。"
+            ]
+        );
     }
 
     #[test]
@@ -2470,16 +2814,15 @@ mod tests {
         .collect::<Vec<_>>()
         .join("\n");
         assert!(rendered.contains("› 你好"), "rendered={rendered}");
-        assert_eq!(
-            live_progress_text(&history).as_deref(),
-            Some("分析任务、上下文与可用工具")
+        assert!(rendered.contains("• 创建任务计划"), "rendered={rendered}");
+        assert!(
+            rendered.contains("• 分析任务、上下文与可用工具"),
+            "rendered={rendered}"
         );
         assert!(rendered.contains("• 你好！"), "rendered={rendered}");
         assert!(rendered.contains("  有什么我可以帮你的吗？"));
         assert!(rendered.contains("  - 读取文件"));
         assert!(!rendered.contains("KERNARY"));
-        assert!(!rendered.contains("创建任务计划"));
-        assert!(!rendered.contains("分析任务、上下文与可用工具"));
         assert!(!rendered.contains("accepted=1"));
         assert!(!rendered.contains("coder [Coder]"));
     }
@@ -2516,6 +2859,22 @@ mod tests {
     }
 
     #[test]
+    fn terminal_background_responses_finish_live_activity_only_at_terminal_states() {
+        assert!(backend_response_finishes_live_activity(&BackendResponse {
+            lines: vec!["[DONE] 任务完成".to_owned()],
+            ..BackendResponse::default()
+        }));
+        assert!(backend_response_finishes_live_activity(&BackendResponse {
+            lines: vec!["! model-response-incomplete: length".to_owned()],
+            ..BackendResponse::default()
+        }));
+        assert!(!backend_response_finishes_live_activity(&BackendResponse {
+            lines: vec!["[RUN] 已发送 · 正在连接模型".to_owned()],
+            ..BackendResponse::default()
+        }));
+    }
+
+    #[test]
     fn product_tui_renders_onboarding_without_debug_dashboard_boxes() {
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -2531,6 +2890,7 @@ mod tests {
                         snapshot: &snapshot,
                         pack: snapshot.language.pack(),
                         history: &["[DONE] Ready".to_owned()],
+                        live_activity: None,
                         input: &input,
                         secret_prompt: None,
                         secret_input: &secret_input,
@@ -2603,6 +2963,7 @@ mod tests {
                         snapshot: &snapshot,
                         pack: snapshot.language.pack(),
                         history: &[],
+                        live_activity: None,
                         input: &input,
                         secret_prompt: None,
                         secret_input: &secret_input,
@@ -2628,7 +2989,7 @@ mod tests {
     }
 
     #[test]
-    fn live_progress_is_pinned_above_composer_even_when_history_is_scrolled() {
+    fn live_reasoning_cell_is_pinned_above_composer_even_when_history_is_scrolled() {
         let backend = TestBackend::new(80, 14);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let mut snapshot = snapshot(true);
@@ -2639,7 +3000,10 @@ mod tests {
             .map(|index| format!("Kernary: 历史回答 {index}"))
             .collect::<Vec<_>>();
         history.push("[RUN] 已发送 · 正在连接模型".to_owned());
-        history.push("[THINK] 分析任务、上下文与可用工具".to_owned());
+        let live_activity = LiveActivityCell::reasoning_summary(
+            "agent:coder".to_owned(),
+            "**分析任务**\n正在检查上下文与可用工具".to_owned(),
+        );
         terminal
             .draw(|frame| {
                 render_product_tui(
@@ -2648,6 +3012,7 @@ mod tests {
                         snapshot: &snapshot,
                         pack: snapshot.language.pack(),
                         history: &history,
+                        live_activity: Some(&live_activity),
                         input: &input,
                         secret_prompt: None,
                         secret_input: &secret_input,
@@ -2668,8 +3033,9 @@ mod tests {
             })
             .expect("render pinned progress");
         let compact = screen_text(terminal.backend()).replace(' ', "");
+        assert!(compact.contains("分析任务"), "screen={compact}");
         assert!(
-            compact.contains("分析任务、上下文与可用工具"),
+            compact.contains("正在检查上下文与可用工具"),
             "screen={compact}"
         );
     }
@@ -2698,6 +3064,7 @@ mod tests {
                             "You: build a release".to_owned(),
                             "Kernary: working".to_owned(),
                         ],
+                        live_activity: None,
                         input: &input,
                         secret_prompt: None,
                         secret_input: &secret_input,
@@ -2745,6 +3112,7 @@ mod tests {
                         snapshot: &snapshot,
                         pack: snapshot.language.pack(),
                         history: &[],
+                        live_activity: None,
                         input: &input,
                         secret_prompt: None,
                         secret_input: &secret_input,
@@ -2799,6 +3167,7 @@ mod tests {
                         snapshot: &snapshot,
                         pack: snapshot.language.pack(),
                         history: &history,
+                        live_activity: None,
                         input: &input,
                         secret_prompt: None,
                         secret_input: &secret_input,

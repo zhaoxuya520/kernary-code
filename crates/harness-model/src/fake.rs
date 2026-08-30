@@ -36,6 +36,26 @@ impl FakeScenario {
         Self { events }
     }
 
+    /// 产生带部分文本的 `response.incomplete`，用于验证 Codex 风格的有界续跑。
+    #[must_use]
+    pub fn incomplete(chunks: &[&str], reason: &str, usage: ModelUsage) -> Self {
+        let mut events = vec![Ok(ModelEvent::Started {
+            response_id: ResponseId::from("response:fake-incomplete"),
+            model_id: ModelId::from("deterministic"),
+        })];
+        events.extend(chunks.iter().map(|chunk| {
+            Ok(ModelEvent::TextDelta {
+                delta: (*chunk).to_owned(),
+            })
+        }));
+        events.push(Ok(ModelEvent::Usage { usage }));
+        events.push(Ok(ModelEvent::Completed {
+            status: CompletionStatus::Incomplete,
+            incomplete_reason: Some(reason.to_owned()),
+        }));
+        Self { events }
+    }
+
     #[must_use]
     pub fn tool(name: &str, arguments: serde_json::Value, usage: ModelUsage) -> Self {
         Self {
@@ -103,6 +123,7 @@ impl FakeModelProvider {
                 provider_compaction: false,
                 context_window_tokens: 8_192,
                 max_output_tokens: 2_048,
+                reasoning_summary: true,
                 reasoning_levels: [
                     ReasoningLevel::Off,
                     ReasoningLevel::Low,

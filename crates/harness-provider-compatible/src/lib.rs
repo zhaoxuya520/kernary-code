@@ -540,6 +540,17 @@ impl ChatCompletionsSseStream {
         let Some(choice) = value.pointer("/choices/0") else {
             return;
         };
+        if let Some(reasoning) = choice
+            .pointer("/delta/reasoning_content")
+            .and_then(serde_json::Value::as_str)
+            && !reasoning.is_empty()
+        {
+            // DeepSeek/GLM 等 Chat 兼容模型会把用户可见的推理流放在独立字段。
+            // 它仍与最终正文隔离，交给 TUI 的 live reasoning cell，而不是混进回答。
+            self.queued.push_back(Ok(ModelEvent::ReasoningSummaryDelta {
+                delta: reasoning.to_owned(),
+            }));
+        }
         if let Some(content) = choice
             .pointer("/delta/content")
             .and_then(serde_json::Value::as_str)
@@ -821,6 +832,7 @@ mod tests {
             provider_compaction: false,
             context_window_tokens: 8_192,
             max_output_tokens: 1_024,
+            reasoning_summary: false,
             reasoning_levels: BTreeSet::new(),
         }
     }
@@ -867,6 +879,8 @@ mod tests {
     #[test]
     fn stream_accumulates_tool_arguments_and_usage() {
         let chunks = [
+            serde_json::json!({"id":"chat_1","model":"model","choices":[{"delta":{"reasoning_content":"checking "},"finish_reason":null}]}),
+            serde_json::json!({"id":"chat_1","model":"model","choices":[{"delta":{"reasoning_content":"facts"},"finish_reason":null}]}),
             serde_json::json!({"id":"chat_1","model":"model","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}),
             serde_json::json!({"id":"chat_1","model":"model","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}),
             serde_json::json!({"id":"chat_1","model":"model","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_","arguments":"{\"path\":"}}]},"finish_reason":null}]}),
@@ -885,6 +899,10 @@ mod tests {
         .collect::<Result<Vec<_>, _>>()
         .expect("events");
         validate_event_contract(&events).expect("shared contract");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ModelEvent::ReasoningSummaryDelta { delta } if delta == "checking "
+        )));
         assert!(events.iter().any(|event| matches!(
             event,
             ModelEvent::ToolCall { name, arguments, .. }

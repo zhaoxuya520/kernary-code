@@ -9536,6 +9536,7 @@ fn compatible_capability(provider_id: &ProviderId, model_id: &ModelId) -> ModelC
         provider_compaction: false,
         context_window_tokens: env_u32(&format!("HARNESS_{prefix}_CONTEXT_TOKENS"), 32_768),
         max_output_tokens: env_u32(&format!("HARNESS_{prefix}_MAX_OUTPUT_TOKENS"), 4_096),
+        reasoning_summary: false,
         reasoning_levels,
     }
 }
