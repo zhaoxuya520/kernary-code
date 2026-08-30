@@ -24,7 +24,8 @@ pub use runtime::{
 };
 pub use types::{
     CompletionStatus, ModelCapability, ModelError, ModelErrorKind, ModelEvent, ModelInputItem,
-    ModelMessageRole, ModelRequest, ModelUsage, ReasoningMapping, ResponseFormat, ToolDefinition,
+    ModelMessageRole, ModelRequest, ModelUsage, PromptCachePolicy, ReasoningMapping,
+    ResponseFormat, ToolDefinition,
 };
 pub use unconfigured::{
     UNCONFIGURED_MODEL_ID, UNCONFIGURED_PROVIDER_ID, UnconfiguredModelProvider,

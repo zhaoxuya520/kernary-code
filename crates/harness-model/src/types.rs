@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use harness_types::{ModelId, ProviderId, ReasoningLevel, ResponseId, ToolCallId};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 /// Reasoning capability 映射结果，降级必须可见。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +83,98 @@ pub enum ResponseFormat {
     },
 }
 
+/// Provider-neutral Prompt Cache 策略。
+///
+/// `stable_prefix` 必须是 `ModelRequest.instructions` 的完整前缀；动态任务数据只能放在
+/// 该边界之后。Provider 可以据此生成原生 cache breakpoint，而无需理解 Harness Prompt。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PromptCachePolicy {
+    /// 不含用户、Session 或 Run 明文的稳定散列；满足 OpenAI 64 字符上限。
+    pub key: String,
+    /// 可跨任务复用、字节级稳定的指令前缀。
+    pub stable_prefix: String,
+}
+
+impl PromptCachePolicy {
+    /// 从稳定指令和有序 Tool ABI 生成可跨 Session 复用的缓存身份。
+    pub fn for_request(
+        stable_prefix: impl Into<String>,
+        tools: &[ToolDefinition],
+    ) -> Result<Self, ModelError> {
+        let stable_prefix = stable_prefix.into();
+        if stable_prefix.trim().is_empty() {
+            return Err(ModelError::new(
+                ModelErrorKind::InvalidRequest,
+                "prompt-cache-prefix-empty",
+                "Prompt Cache 稳定前缀不能为空",
+            ));
+        }
+        let mut tools = tools.to_vec();
+        tools.sort_by(|left, right| left.name.cmp(&right.name));
+        let tools = tools
+            .into_iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "description": tool.description,
+                    "inputSchema": canonical_json(&tool.input_schema),
+                    "name": tool.name,
+                    "strict": tool.strict,
+                })
+            })
+            .collect::<Vec<_>>();
+        let abi = serde_json::to_vec(&serde_json::json!({
+            "schema": "kernary-prompt-cache-v2",
+            "stablePrefix": stable_prefix,
+            "tools": tools,
+        }))
+        .map_err(|error| {
+            ModelError::new(
+                ModelErrorKind::InvalidRequest,
+                "prompt-cache-key-json",
+                error.to_string(),
+            )
+        })?;
+        let key = format!("{:x}", Sha256::digest(abi));
+        Ok(Self { key, stable_prefix })
+    }
+
+    /// 验证缓存边界没有越过动态内容，并返回边界之后的尾部。
+    pub fn dynamic_tail<'a>(&self, instructions: &'a str) -> Result<&'a str, ModelError> {
+        if self.key.len() > 64 || self.key.is_empty() {
+            return Err(ModelError::new(
+                ModelErrorKind::InvalidRequest,
+                "prompt-cache-key-invalid",
+                "Prompt Cache key 必须为 1..64 字符",
+            ));
+        }
+        let Some(tail) = instructions.strip_prefix(&self.stable_prefix) else {
+            return Err(ModelError::new(
+                ModelErrorKind::InvalidRequest,
+                "prompt-cache-prefix-mismatch",
+                "Prompt Cache 稳定前缀与 instructions 不一致",
+            ));
+        };
+        Ok(tail.strip_prefix('\n').unwrap_or(tail))
+    }
+}
+
+fn canonical_json(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort();
+            let mut canonical = Map::new();
+            for key in keys {
+                canonical.insert(key.clone(), canonical_json(&object[key]));
+            }
+            Value::Object(canonical)
+        }
+        Value::Array(values) => Value::Array(values.iter().map(canonical_json).collect()),
+        _ => value.clone(),
+    }
+}
+
 /// 一次 Provider 调用的完整、可验证请求。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -93,6 +187,8 @@ pub struct ModelRequest {
     pub response_format: ResponseFormat,
     pub max_output_tokens: u32,
     pub previous_response_id: Option<ResponseId>,
+    /// `None` 表示禁用 Harness 主动缓存控制；Provider 自带的隐式缓存仍可工作。
+    pub prompt_cache: Option<PromptCachePolicy>,
     pub store: bool,
     #[serde(with = "duration_millis")]
     pub timeout: Duration,
@@ -111,6 +207,14 @@ pub struct ModelUsage {
 }
 
 impl ModelUsage {
+    #[must_use]
+    pub fn prompt_cache_hit_rate_percent(self) -> Option<u8> {
+        (self.input_tokens != 0).then(|| {
+            u8::try_from(self.cached_input_tokens.saturating_mul(100) / self.input_tokens)
+                .unwrap_or(100)
+        })
+    }
+
     pub fn validate(self) -> Result<Self, ModelError> {
         if self.cached_input_tokens > self.input_tokens {
             return Err(ModelError::new(
@@ -231,5 +335,63 @@ mod duration_millis {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
         u64::deserialize(deserializer).map(Duration::from_millis)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool(name: &str, schema: Value) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_owned(),
+            description: format!("{name} tool"),
+            input_schema: schema,
+            strict: true,
+        }
+    }
+
+    #[test]
+    fn prompt_cache_key_is_stable_across_tool_and_json_object_order() {
+        let first = PromptCachePolicy::for_request(
+            "stable",
+            &[
+                tool("z", serde_json::json!({"b":2,"a":1})),
+                tool("a", serde_json::json!({"type":"object"})),
+            ],
+        )
+        .expect("first");
+        let second = PromptCachePolicy::for_request(
+            "stable",
+            &[
+                tool("a", serde_json::json!({"type":"object"})),
+                tool("z", serde_json::json!({"a":1,"b":2})),
+            ],
+        )
+        .expect("second");
+        assert_eq!(first.key, second.key);
+        assert_eq!(first.key.len(), 64);
+    }
+
+    #[test]
+    fn prompt_cache_boundary_rejects_mismatch_and_returns_dynamic_tail() {
+        let policy = PromptCachePolicy::for_request("stable", &[]).expect("policy");
+        assert_eq!(
+            policy.dynamic_tail("stable\ndynamic").expect("tail"),
+            "dynamic"
+        );
+        let error = policy.dynamic_tail("changed").expect_err("mismatch");
+        assert_eq!(error.code, "prompt-cache-prefix-mismatch");
+    }
+
+    #[test]
+    fn prompt_cache_hit_rate_is_normalized() {
+        let usage = ModelUsage {
+            input_tokens: 200,
+            cached_input_tokens: 150,
+            ..ModelUsage::default()
+        };
+        assert_eq!(usage.prompt_cache_hit_rate_percent(), Some(75));
+        assert_eq!(ModelUsage::default().prompt_cache_hit_rate_percent(), None);
     }
 }

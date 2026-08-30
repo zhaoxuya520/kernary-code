@@ -257,6 +257,9 @@ pub enum Role {
     Planner,
     Staffing,
     Coder,
+    Debugger,
+    Researcher,
+    Merge,
     Reviewer,
     Security,
     Performance,
@@ -383,6 +386,45 @@ fn role_allows(role: Role, kind: ContextKind) -> bool {
                 | ContextKind::Decision
         ),
         Role::Coder => !matches!(kind, ContextKind::Agent),
+        Role::Debugger => matches!(
+            kind,
+            ContextKind::System
+                | ContextKind::Goal
+                | ContextKind::Task
+                | ContextKind::Repository
+                | ContextKind::Memory
+                | ContextKind::Tool
+                | ContextKind::Pinned
+                | ContextKind::Constraint
+                | ContextKind::Decision
+                | ContextKind::Error
+        ),
+        Role::Researcher => matches!(
+            kind,
+            ContextKind::System
+                | ContextKind::Goal
+                | ContextKind::Task
+                | ContextKind::Repository
+                | ContextKind::Memory
+                | ContextKind::Pinned
+                | ContextKind::Constraint
+                | ContextKind::Decision
+                | ContextKind::Error
+        ),
+        Role::Merge => matches!(
+            kind,
+            ContextKind::System
+                | ContextKind::Goal
+                | ContextKind::Task
+                | ContextKind::Repository
+                | ContextKind::Memory
+                | ContextKind::Tool
+                | ContextKind::Agent
+                | ContextKind::Pinned
+                | ContextKind::Constraint
+                | ContextKind::Decision
+                | ContextKind::Error
+        ),
         Role::Reviewer | Role::Tester => !matches!(
             kind,
             ContextKind::Conversation | ContextKind::Agent | ContextKind::Temporary
@@ -639,6 +681,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["goal", "repo"]
         );
+    }
+
+    #[test]
+    fn debugger_researcher_and_merge_have_distinct_context_boundaries() {
+        let items = || {
+            vec![
+                item("goal", ContextKind::Goal, Priority::Critical, 5),
+                item("chat", ContextKind::Conversation, Priority::High, 5),
+                item("tool", ContextKind::Tool, Priority::High, 5),
+                item("agents", ContextKind::Agent, Priority::High, 5),
+                item("repo", ContextKind::Repository, Priority::High, 5),
+            ]
+        };
+        let selected = |role| {
+            ContextBroker
+                .compile_for_role(role, items(), &budget(100), 0)
+                .expect("context")
+                .selected
+                .into_iter()
+                .map(|item| item.id.to_string())
+                .collect::<BTreeSet<_>>()
+        };
+        let debugger = selected(Role::Debugger);
+        assert!(debugger.contains("tool"));
+        assert!(!debugger.contains("chat"));
+        assert!(!debugger.contains("agents"));
+        let researcher = selected(Role::Researcher);
+        assert!(researcher.contains("repo"));
+        assert!(!researcher.contains("tool"));
+        assert!(!researcher.contains("agents"));
+        let merge = selected(Role::Merge);
+        assert!(merge.contains("tool"));
+        assert!(merge.contains("agents"));
+        assert!(!merge.contains("chat"));
     }
 
     #[test]

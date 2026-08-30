@@ -40,11 +40,26 @@ pub enum CompactionMode {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StructuredSummary {
+    pub method: String,
     pub summary: String,
     pub token_cost: u32,
+    #[serde(default)]
+    pub confirmed_requirements: Vec<String>,
+    #[serde(default)]
+    pub non_goals: Vec<String>,
+    #[serde(default)]
+    pub decisions: Vec<String>,
+    #[serde(default)]
+    pub history_digest: Vec<String>,
     pub active_assumptions: Vec<String>,
     pub unresolved_blockers: Vec<String>,
     pub completed_actions: Vec<String>,
+    #[serde(default)]
+    pub modified_files: Vec<String>,
+    #[serde(default)]
+    pub failed_approaches: Vec<String>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
     pub next_goal: String,
 }
 
@@ -82,6 +97,8 @@ pub struct ContextCheckpoint {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CompactionRecord {
     pub mode: CompactionMode,
+    #[serde(default)]
+    pub summary_method: String,
     pub source_item_ids: Vec<ContextItemId>,
     pub retained_item_ids: Vec<ContextItemId>,
     pub summary_item_id: ContextItemId,
@@ -90,9 +107,27 @@ pub struct CompactionRecord {
     pub previous_series_id: ContextSeriesId,
     pub next_series_id: ContextSeriesId,
     pub checkpoint_id: Option<CheckpointId>,
+    #[serde(default)]
+    pub semantic_anchor_ids: Vec<ContextItemId>,
+    #[serde(default)]
+    pub anchor_method: String,
+    #[serde(default)]
+    pub confirmed_requirements: Vec<String>,
+    #[serde(default)]
+    pub non_goals: Vec<String>,
+    #[serde(default)]
+    pub decisions: Vec<String>,
+    #[serde(default)]
+    pub history_digest: Vec<String>,
     pub active_assumptions: Vec<String>,
     pub unresolved_blockers: Vec<String>,
     pub completed_actions: Vec<String>,
+    #[serde(default)]
+    pub modified_files: Vec<String>,
+    #[serde(default)]
+    pub failed_approaches: Vec<String>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
     pub next_goal: String,
 }
 
@@ -142,12 +177,36 @@ impl<P: SummaryProvider> ContextCompactor<P> {
     pub fn compact(
         &self,
         mode: CompactionMode,
+        items: Vec<CompactionItem>,
+        recent_item_count: usize,
+        max_summary_tokens: u32,
+        previous_series_id: ContextSeriesId,
+        checkpoint: Option<ContextCheckpoint>,
+        now_millis: i64,
+    ) -> Result<CompactionResult, CompactionError> {
+        self.compact_with_protection(
+            mode,
+            items,
+            recent_item_count,
+            max_summary_tokens,
+            previous_series_id,
+            checkpoint,
+            now_millis,
+            &BTreeSet::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn compact_with_protection(
+        &self,
+        mode: CompactionMode,
         mut items: Vec<CompactionItem>,
         recent_item_count: usize,
         max_summary_tokens: u32,
         previous_series_id: ContextSeriesId,
         checkpoint: Option<ContextCheckpoint>,
         now_millis: i64,
+        protected_item_ids: &BTreeSet<ContextItemId>,
     ) -> Result<CompactionResult, CompactionError> {
         if items.is_empty() {
             return Err(CompactionError::new("empty-context", "空 Context 不能压缩"));
@@ -179,7 +238,10 @@ impl<P: SummaryProvider> ContextCompactor<P> {
         let mut retained = Vec::new();
         let mut summarized = Vec::new();
         for (index, item) in items.into_iter().enumerate() {
-            if index >= recent_start || retain_exact(&item, mode) {
+            if index >= recent_start
+                || retain_exact(&item, mode)
+                || protected_item_ids.contains(&item.context.id)
+            {
                 retained.push(item);
             } else {
                 summarized.push(item);
@@ -270,6 +332,7 @@ impl<P: SummaryProvider> ContextCompactor<P> {
             visible_items: retained,
             record: CompactionRecord {
                 mode,
+                summary_method: summary.method,
                 source_item_ids,
                 retained_item_ids,
                 summary_item_id: summary_item.context.id,
@@ -278,9 +341,22 @@ impl<P: SummaryProvider> ContextCompactor<P> {
                 previous_series_id,
                 next_series_id,
                 checkpoint_id: checkpoint.map(|checkpoint| checkpoint.id),
+                semantic_anchor_ids: protected_item_ids.iter().cloned().collect(),
+                anchor_method: if protected_item_ids.is_empty() {
+                    "none".to_owned()
+                } else {
+                    "explicit".to_owned()
+                },
+                confirmed_requirements: summary.confirmed_requirements,
+                non_goals: summary.non_goals,
+                decisions: summary.decisions,
+                history_digest: summary.history_digest,
                 active_assumptions: summary.active_assumptions,
                 unresolved_blockers: summary.unresolved_blockers,
                 completed_actions: summary.completed_actions,
+                modified_files: summary.modified_files,
+                failed_approaches: summary.failed_approaches,
+                evidence_refs: summary.evidence_refs,
                 next_goal: summary.next_goal,
             },
         })
@@ -396,6 +472,7 @@ mod tests {
             max_summary_tokens: u32,
         ) -> Result<StructuredSummary, CompactionError> {
             Ok(StructuredSummary {
+                method: "fake".to_owned(),
                 summary: format!(
                     "summarized:{}",
                     items
@@ -405,9 +482,16 @@ mod tests {
                         .join(",")
                 ),
                 token_cost: max_summary_tokens.min(10),
+                confirmed_requirements: vec![],
+                non_goals: vec![],
+                decisions: vec![],
+                history_digest: vec![],
                 active_assumptions: vec![],
                 unresolved_blockers: vec![],
                 completed_actions: vec!["old work".to_owned()],
+                modified_files: vec![],
+                failed_approaches: vec![],
+                evidence_refs: vec![],
                 next_goal: "continue".to_owned(),
             })
         }
@@ -539,6 +623,50 @@ mod tests {
             result.record.checkpoint_id,
             Some(CheckpointId::from("checkpoint:1"))
         );
+    }
+
+    #[test]
+    fn semantic_protection_retains_relevant_old_item_verbatim() {
+        let protected_id = ContextItemId::from("a-protected");
+        let items = vec![
+            CompactionItem {
+                context: context("a-protected", ContextKind::Conversation, 30),
+                pair_id: None,
+                tool_phase: None,
+                in_flight: false,
+            },
+            CompactionItem {
+                context: context("b-summary", ContextKind::Conversation, 30),
+                pair_id: None,
+                tool_phase: None,
+                in_flight: false,
+            },
+            CompactionItem {
+                context: context("z-recent", ContextKind::Conversation, 10),
+                pair_id: None,
+                tool_phase: None,
+                in_flight: false,
+            },
+        ];
+        let result = ContextCompactor::new(FakeSummary)
+            .compact_with_protection(
+                CompactionMode::Safe,
+                items,
+                1,
+                15,
+                ContextSeriesId::from("series:semantic"),
+                Some(checkpoint("series:semantic")),
+                200,
+                &[protected_id.clone()].into_iter().collect(),
+            )
+            .expect("semantic compaction");
+        assert!(
+            result
+                .visible_items
+                .iter()
+                .any(|item| item.context.id == protected_id)
+        );
+        assert_eq!(result.record.semantic_anchor_ids, vec![protected_id]);
     }
 
     #[test]

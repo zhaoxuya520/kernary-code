@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryError {
@@ -139,6 +140,10 @@ pub struct EmbeddingProfile {
 pub trait EmbeddingProvider: Send + Sync {
     fn profile(&self) -> &EmbeddingProfile;
     fn embed(&self, text: &str) -> Result<Vec<f32>, MemoryError>;
+
+    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemoryError> {
+        texts.iter().map(|text| self.embed(text)).collect()
+    }
 }
 
 pub trait EmbeddingProviderFactory: Send + Sync {
@@ -218,6 +223,34 @@ pub struct ProjectMemoryView {
     pub fts_indexed_count: usize,
     pub semantic: SemanticCapability,
     pub vector_schema_present: bool,
+    pub memory_embedding_count: usize,
+    pub query_embedding_count: usize,
+    pub repository_embedding_count: usize,
+    pub embedding_cache_hits: u64,
+    pub embedding_cache_writes: u64,
+    pub semantic_searches: u64,
+    pub semantic_reranks: u64,
+}
+
+/// 可由 ProjectMemory 复用当前 Embedding Provider 排序的外部项目文档。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SemanticDocument {
+    pub id: String,
+    pub content_hash: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SemanticDocumentScore {
+    pub document_id: String,
+    pub score: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SemanticRerankResponse {
+    pub results: Vec<SemanticDocumentScore>,
+    pub cache_hits: u64,
+    pub cache_writes: u64,
 }
 
 pub struct ProjectMemory {
@@ -228,6 +261,10 @@ pub struct ProjectMemory {
     embedding_factory: Option<Arc<dyn EmbeddingProviderFactory>>,
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     active_generation: Option<u64>,
+    embedding_cache_hits: u64,
+    embedding_cache_writes: u64,
+    semantic_searches: u64,
+    semantic_reranks: u64,
 }
 
 impl ProjectMemory {
@@ -271,6 +308,10 @@ impl ProjectMemory {
             embedding_factory: None,
             embedding_provider: None,
             active_generation: None,
+            embedding_cache_hits: 0,
+            embedding_cache_writes: 0,
+            semantic_searches: 0,
+            semantic_reranks: 0,
         })
     }
 
@@ -437,7 +478,7 @@ impl ProjectMemory {
                         executed_mode: ExecutedRetrievalMode::Hybrid,
                         degraded: false,
                         degradation_reason: None,
-                        results: rrf(lexical, semantic, limit),
+                        results: rrf(query, lexical, semantic, limit),
                     })
                 }
                 Err(error) => {
@@ -490,21 +531,20 @@ impl ProjectMemory {
     }
 
     fn lexical(&self, query: &str, limit: usize) -> Result<Vec<MemorySearchResult>, MemoryError> {
-        let escaped = query.replace('"', "\"\"");
+        let Some(expression) = fts_expression(query) else {
+            return self.metadata(query, limit);
+        };
         let mut statement = self.connection.prepare(
             "SELECT r.id,r.project_id,r.kind,r.title,r.content,r.tags_json,r.source_ref,r.status,r.created_at_millis,r.updated_at_millis,-bm25(memory_fts,0.0,5.0,1.0,2.0)
              FROM memory_fts JOIN memory_records r ON r.id=memory_fts.record_id
              WHERE memory_fts MATCH ?1 AND r.project_id=?2 ORDER BY bm25(memory_fts,0.0,5.0,1.0,2.0) LIMIT ?3"
         ).map_err(sql_error)?;
         let rows = statement
-            .query_map(
-                params![format!("\"{escaped}\""), self.project_id, limit],
-                |row| {
-                    let record = row_record(row)?;
-                    let score = row.get::<_, f64>(10)?;
-                    Ok((record, score))
-                },
-            )
+            .query_map(params![expression, self.project_id, limit], |row| {
+                let record = row_record(row)?;
+                let score = row.get::<_, f64>(10)?;
+                Ok((record, score))
+            })
             .map_err(sql_error)?;
         let results = rows.collect::<Result<Vec<_>, _>>().map_err(sql_error)?;
         if results.is_empty() {
@@ -579,9 +619,61 @@ impl ProjectMemory {
                    vector_json TEXT NOT NULL, updated_at_millis INTEGER NOT NULL,
                    PRIMARY KEY(generation,record_id),
                    FOREIGN KEY(record_id) REFERENCES memory_records(id) ON DELETE CASCADE
+                 );
+                 CREATE TABLE IF NOT EXISTS query_embeddings(
+                   generation INTEGER NOT NULL, query_hash TEXT NOT NULL,
+                   dimensions INTEGER NOT NULL, vector_json TEXT NOT NULL,
+                   updated_at_millis INTEGER NOT NULL,
+                   PRIMARY KEY(generation,query_hash)
+                 );
+                 CREATE TABLE IF NOT EXISTS semantic_document_embeddings(
+                   generation INTEGER NOT NULL, namespace TEXT NOT NULL,
+                   document_id TEXT NOT NULL, content_hash TEXT NOT NULL,
+                   dimensions INTEGER NOT NULL, vector_json TEXT NOT NULL,
+                   updated_at_millis INTEGER NOT NULL,
+                   PRIMARY KEY(generation,namespace,document_id)
                  );",
             )
             .map_err(sql_error)?;
+        let reusable_generation = self
+            .connection
+            .query_row(
+                "SELECT generation FROM vector_generations
+                 WHERE status='active' AND model=?1 AND provider=?2 AND dimensions=?3
+                 ORDER BY generation DESC LIMIT 1",
+                params![profile.model, profile.provider, profile.dimensions],
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        if let Some(generation) = reusable_generation {
+            let mut missing = Vec::new();
+            for record in self.all_records()? {
+                let indexed = self
+                    .connection
+                    .query_row(
+                        "SELECT 1 FROM memory_embeddings WHERE generation=?1 AND record_id=?2",
+                        params![generation, record.id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .map_err(sql_error)?
+                    .is_some();
+                if !indexed {
+                    missing.push(record);
+                }
+            }
+            self.index_records(&missing, runtime.as_ref(), generation)?;
+            self.embedding_provider = Some(runtime);
+            self.active_generation = Some(generation);
+            self.semantic = SemanticCapability::Active {
+                model: profile.model,
+                provider: profile.provider,
+                dimensions: profile.dimensions,
+                generation,
+            };
+            return Ok(());
+        }
         let generation: u64 = self
             .connection
             .query_row(
@@ -603,14 +695,12 @@ impl ProjectMemory {
             )
             .map_err(sql_error)?;
         let records = self.all_records()?;
-        for record in &records {
-            if let Err(error) = self.index_record(record, runtime.as_ref(), generation) {
-                let _ = self.connection.execute(
-                    "UPDATE vector_generations SET status='failed' WHERE generation=?1",
-                    [generation],
-                );
-                return Err(error);
-            }
+        if let Err(error) = self.index_records(&records, runtime.as_ref(), generation) {
+            let _ = self.connection.execute(
+                "UPDATE vector_generations SET status='failed' WHERE generation=?1",
+                [generation],
+            );
+            return Err(error);
         }
         let transaction = self.connection.transaction().map_err(sql_error)?;
         transaction
@@ -638,49 +728,270 @@ impl ProjectMemory {
     }
 
     fn index_record(
-        &self,
+        &mut self,
         record: &MemoryRecord,
         provider: &dyn EmbeddingProvider,
         generation: u64,
     ) -> Result<(), MemoryError> {
-        let input = format!(
-            "{:?}\n{}\n{}\n{}",
-            record.kind,
-            record.title,
-            record.content,
-            record.tags.join(" ")
-        );
-        let vector = provider.embed(&input)?;
+        self.index_records(std::slice::from_ref(record), provider, generation)
+    }
+
+    fn index_records(
+        &mut self,
+        records: &[MemoryRecord],
+        provider: &dyn EmbeddingProvider,
+        generation: u64,
+    ) -> Result<(), MemoryError> {
+        for records in records.chunks(32) {
+            let inputs = records
+                .iter()
+                .map(|record| {
+                    format!(
+                        "{:?}\n{}\n{}\n{}",
+                        record.kind,
+                        record.title,
+                        record.content,
+                        record.tags.join(" ")
+                    )
+                })
+                .collect::<Vec<_>>();
+            let vectors = provider.embed_batch(&inputs)?;
+            if vectors.len() != records.len() {
+                return Err(MemoryError::new(
+                    "embedding-batch-count",
+                    format!("expected={}, actual={}", records.len(), vectors.len()),
+                ));
+            }
+            for vector in &vectors {
+                validate_vector(vector, provider.profile().dimensions)?;
+            }
+            let transaction = self.connection.transaction().map_err(sql_error)?;
+            for (record, vector) in records.iter().zip(vectors) {
+                transaction
+                    .execute(
+                        "INSERT OR REPLACE INTO memory_embeddings VALUES(?1,?2,?3,?4,?5)",
+                        params![
+                            generation,
+                            record.id,
+                            vector.len(),
+                            serde_json::to_string(&vector).map_err(json_error)?,
+                            now_millis()
+                        ],
+                    )
+                    .map_err(sql_error)?;
+                self.embedding_cache_writes = self.embedding_cache_writes.saturating_add(1);
+            }
+            transaction.commit().map_err(sql_error)?;
+        }
+        Ok(())
+    }
+
+    fn query_embedding(&mut self, query: &str) -> Result<Vec<f32>, MemoryError> {
+        let provider = self
+            .embedding_provider
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| MemoryError::new("embedding-provider-not-active", "provider"))?;
+        let generation = self
+            .active_generation
+            .ok_or_else(|| MemoryError::new("vector-generation-not-active", "generation"))?;
+        let query_hash = format!("{:x}", Sha256::digest(query.as_bytes()));
+        let cached = self
+            .connection
+            .query_row(
+                "SELECT vector_json FROM query_embeddings WHERE generation=?1 AND query_hash=?2",
+                params![generation, query_hash],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        if let Some(json) = cached {
+            let vector: Vec<f32> = serde_json::from_str(&json).map_err(json_error)?;
+            validate_vector(&vector, provider.profile().dimensions)?;
+            self.embedding_cache_hits = self.embedding_cache_hits.saturating_add(1);
+            return Ok(vector);
+        }
+        let vector = provider.embed(query)?;
         validate_vector(&vector, provider.profile().dimensions)?;
         self.connection
             .execute(
-                "INSERT OR REPLACE INTO memory_embeddings VALUES(?1,?2,?3,?4,?5)",
+                "INSERT OR REPLACE INTO query_embeddings VALUES(?1,?2,?3,?4,?5)",
                 params![
                     generation,
-                    record.id,
+                    query_hash,
                     vector.len(),
                     serde_json::to_string(&vector).map_err(json_error)?,
                     now_millis()
                 ],
             )
             .map_err(sql_error)?;
-        Ok(())
+        self.embedding_cache_writes = self.embedding_cache_writes.saturating_add(1);
+        Ok(vector)
     }
 
-    fn semantic_search(
-        &self,
+    /// 使用项目的同一 Embedding generation 对 Repository/LSP 候选进行语义重排。
+    /// 文档向量以内容 hash 缓存；文件未变化时后续任务和重启都不重复计费。
+    pub fn rerank_documents(
+        &mut self,
+        namespace: &str,
         query: &str,
+        documents: &[SemanticDocument],
         limit: usize,
-    ) -> Result<Vec<MemorySearchResult>, MemoryError> {
+    ) -> Result<SemanticRerankResponse, MemoryError> {
+        if namespace.is_empty()
+            || namespace.len() > 64
+            || !namespace
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "-_:".contains(character))
+        {
+            return Err(MemoryError::new(
+                "semantic-document-namespace-invalid",
+                namespace,
+            ));
+        }
+        if matches!(self.semantic, SemanticCapability::Ready { .. }) {
+            self.activate_semantic(now_millis())?;
+        }
+        if !matches!(self.semantic, SemanticCapability::Active { .. }) {
+            return Err(MemoryError::new(
+                "semantic-document-capability-inactive",
+                format!("{:?}", self.semantic),
+            ));
+        }
+        if query.trim().is_empty() || documents.is_empty() {
+            return Ok(SemanticRerankResponse {
+                results: vec![],
+                cache_hits: 0,
+                cache_writes: 0,
+            });
+        }
+        if documents.len() > 32 {
+            return Err(MemoryError::new(
+                "semantic-document-limit",
+                documents.len().to_string(),
+            ));
+        }
+        let mut identities = std::collections::BTreeSet::new();
+        for document in documents {
+            if document.id.trim().is_empty()
+                || document.id.len() > 1024
+                || document.content_hash.trim().is_empty()
+                || document.content_hash.len() > 128
+                || document.text.trim().is_empty()
+                || document.text.len() > 64 * 1024
+                || !identities.insert(document.id.clone())
+            {
+                return Err(MemoryError::new(
+                    "semantic-document-invalid",
+                    document.id.clone(),
+                ));
+            }
+        }
+        self.semantic_reranks = self.semantic_reranks.saturating_add(1);
+        let hits_before = self.embedding_cache_hits;
+        let writes_before = self.embedding_cache_writes;
+        let query_vector = self.query_embedding(query.trim())?;
         let provider = self
             .embedding_provider
             .as_ref()
+            .cloned()
             .ok_or_else(|| MemoryError::new("embedding-provider-not-active", "provider"))?;
         let generation = self
             .active_generation
             .ok_or_else(|| MemoryError::new("vector-generation-not-active", "generation"))?;
-        let query_vector = provider.embed(query)?;
-        validate_vector(&query_vector, provider.profile().dimensions)?;
+        let mut vectors = std::collections::BTreeMap::<String, Vec<f32>>::new();
+        let mut missing = Vec::new();
+        for document in documents {
+            let cached = self
+                .connection
+                .query_row(
+                    "SELECT vector_json FROM semantic_document_embeddings
+                     WHERE generation=?1 AND namespace=?2 AND document_id=?3 AND content_hash=?4",
+                    params![generation, namespace, document.id, document.content_hash],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            if let Some(json) = cached {
+                let vector: Vec<f32> = serde_json::from_str(&json).map_err(json_error)?;
+                validate_vector(&vector, provider.profile().dimensions)?;
+                self.embedding_cache_hits = self.embedding_cache_hits.saturating_add(1);
+                vectors.insert(document.id.clone(), vector);
+            } else {
+                missing.push(document);
+            }
+        }
+        if !missing.is_empty() {
+            let texts = missing
+                .iter()
+                .map(|document| document.text.clone())
+                .collect::<Vec<_>>();
+            let embedded = provider.embed_batch(&texts)?;
+            if embedded.len() != missing.len() {
+                return Err(MemoryError::new(
+                    "embedding-batch-count",
+                    format!("expected={}, actual={}", missing.len(), embedded.len()),
+                ));
+            }
+            for vector in &embedded {
+                validate_vector(vector, provider.profile().dimensions)?;
+            }
+            let transaction = self.connection.transaction().map_err(sql_error)?;
+            for (document, vector) in missing.into_iter().zip(embedded) {
+                transaction
+                    .execute(
+                        "INSERT OR REPLACE INTO semantic_document_embeddings
+                         VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                        params![
+                            generation,
+                            namespace,
+                            document.id,
+                            document.content_hash,
+                            vector.len(),
+                            serde_json::to_string(&vector).map_err(json_error)?,
+                            now_millis()
+                        ],
+                    )
+                    .map_err(sql_error)?;
+                self.embedding_cache_writes = self.embedding_cache_writes.saturating_add(1);
+                vectors.insert(document.id.clone(), vector);
+            }
+            transaction.commit().map_err(sql_error)?;
+        }
+        let mut results = Vec::with_capacity(documents.len());
+        for document in documents {
+            let vector = vectors.get(&document.id).ok_or_else(|| {
+                MemoryError::new("semantic-document-vector-missing", &document.id)
+            })?;
+            results.push(SemanticDocumentScore {
+                document_id: document.id.clone(),
+                score: cosine(&query_vector, vector),
+            });
+        }
+        results.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.document_id.cmp(&right.document_id))
+        });
+        results.truncate(limit.clamp(1, documents.len()));
+        Ok(SemanticRerankResponse {
+            results,
+            cache_hits: self.embedding_cache_hits.saturating_sub(hits_before),
+            cache_writes: self.embedding_cache_writes.saturating_sub(writes_before),
+        })
+    }
+
+    fn semantic_search(
+        &mut self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MemorySearchResult>, MemoryError> {
+        self.semantic_searches = self.semantic_searches.saturating_add(1);
+        let generation = self
+            .active_generation
+            .ok_or_else(|| MemoryError::new("vector-generation-not-active", "generation"))?;
+        let query_vector = self.query_embedding(query)?;
         let mut statement = self.connection.prepare(
             "SELECT r.id,r.project_id,r.kind,r.title,r.content,r.tags_json,r.source_ref,r.status,
                     r.created_at_millis,r.updated_at_millis,e.vector_json
@@ -698,9 +1009,10 @@ impl ProjectMemory {
         for row in rows {
             let (record, json) = row.map_err(sql_error)?;
             let vector: Vec<f32> = serde_json::from_str(&json).map_err(json_error)?;
+            let score = memory_semantic_score(query, &record, cosine(&query_vector, &vector));
             results.push(MemorySearchResult {
                 record,
-                score: cosine(&query_vector, &vector),
+                score,
                 matched_by: "vector".to_owned(),
             });
         }
@@ -742,7 +1054,10 @@ impl ProjectMemory {
     pub fn purge_vectors(&mut self) -> Result<(), MemoryError> {
         self.connection
             .execute_batch(
-                "DROP TABLE IF EXISTS memory_embeddings; DROP TABLE IF EXISTS vector_generations;",
+                "DROP TABLE IF EXISTS semantic_document_embeddings;
+                 DROP TABLE IF EXISTS query_embeddings;
+                 DROP TABLE IF EXISTS memory_embeddings;
+                 DROP TABLE IF EXISTS vector_generations;",
             )
             .map_err(sql_error)?;
         self.embedding_provider = None;
@@ -781,6 +1096,35 @@ impl ProjectMemory {
             )
             .map_err(sql_error)?;
         let vector_schema_present = self.vector_schema_present()?;
+        let generation = self.active_generation;
+        let memory_embedding_count = generation.map_or(Ok(0_i64), |generation| {
+            self.connection
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_embeddings WHERE generation=?1",
+                    [generation],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)
+        })?;
+        let query_embedding_count = generation.map_or(Ok(0_i64), |generation| {
+            self.connection
+                .query_row(
+                    "SELECT COUNT(*) FROM query_embeddings WHERE generation=?1",
+                    [generation],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)
+        })?;
+        let repository_embedding_count = generation.map_or(Ok(0_i64), |generation| {
+            self.connection
+                .query_row(
+                    "SELECT COUNT(*) FROM semantic_document_embeddings
+                     WHERE generation=?1 AND namespace='repository'",
+                    [generation],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)
+        })?;
         Ok(ProjectMemoryView {
             project_id: self.project_id.clone(),
             database_path: self.database_path.clone(),
@@ -788,6 +1132,13 @@ impl ProjectMemory {
             fts_indexed_count: fts_indexed_count as usize,
             semantic: self.semantic.clone(),
             vector_schema_present,
+            memory_embedding_count: memory_embedding_count as usize,
+            query_embedding_count: query_embedding_count as usize,
+            repository_embedding_count: repository_embedding_count as usize,
+            embedding_cache_hits: self.embedding_cache_hits,
+            embedding_cache_writes: self.embedding_cache_writes,
+            semantic_searches: self.semantic_searches,
+            semantic_reranks: self.semantic_reranks,
         })
     }
 }
@@ -824,25 +1175,45 @@ fn cosine(left: &[f32], right: &[f32]) -> f64 {
 }
 
 fn rrf(
+    query: &str,
     lexical: Vec<MemorySearchResult>,
     semantic: Vec<MemorySearchResult>,
     limit: usize,
 ) -> Vec<MemorySearchResult> {
-    let mut merged = std::collections::BTreeMap::<String, (MemoryRecord, f64)>::new();
-    for results in [lexical, semantic] {
+    let mut merged = std::collections::BTreeMap::<
+        String,
+        (MemoryRecord, f64, std::collections::BTreeSet<String>),
+    >::new();
+    for (channel, weight, results) in [
+        ("lexical", 1.15_f64, lexical),
+        ("semantic", 1.0_f64, semantic),
+    ] {
         for (index, result) in results.into_iter().enumerate() {
-            let entry = merged
-                .entry(result.record.id.clone())
-                .or_insert((result.record, 0.0));
-            entry.1 += 1.0 / (61 + index) as f64;
+            let entry = merged.entry(result.record.id.clone()).or_insert((
+                result.record,
+                0.0,
+                std::collections::BTreeSet::new(),
+            ));
+            entry.1 += weight / (61 + index) as f64;
+            entry.1 += result.score.clamp(0.0, 1.0) * 0.002;
+            entry.2.insert(channel.to_owned());
         }
     }
     let mut output = merged
         .into_values()
-        .map(|(record, score)| MemorySearchResult {
+        .map(|(record, score, channels)| MemorySearchResult {
+            score: score
+                + if record.status == MemoryStatus::Verified {
+                    0.003
+                } else {
+                    0.0
+                }
+                + kind_affinity(query, record.kind) * 0.003,
+            matched_by: format!(
+                "hybrid:{}",
+                channels.into_iter().collect::<Vec<_>>().join("+")
+            ),
             record,
-            score,
-            matched_by: "hybrid".to_owned(),
         })
         .collect::<Vec<_>>();
     output.sort_by(|left, right| {
@@ -853,6 +1224,76 @@ fn rrf(
     });
     output.truncate(limit);
     output
+}
+
+fn fts_expression(query: &str) -> Option<String> {
+    let mut tokens = query
+        .split(|character: char| {
+            !(character.is_alphanumeric() || matches!(character, '_' | '-' | '.'))
+        })
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(|token| token.replace('"', "\"\""))
+        .collect::<Vec<_>>();
+    tokens.sort();
+    tokens.dedup();
+    tokens.truncate(16);
+    (!tokens.is_empty()).then(|| {
+        tokens
+            .into_iter()
+            .map(|token| format!("\"{token}\""))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    })
+}
+
+fn memory_semantic_score(query: &str, record: &MemoryRecord, cosine_score: f64) -> f64 {
+    let query_lower = query.to_lowercase();
+    let title_lower = record.title.to_lowercase();
+    let tag_overlap = record
+        .tags
+        .iter()
+        .filter(|tag| query_lower.contains(&tag.to_lowercase()))
+        .count()
+        .min(3) as f64;
+    cosine_score
+        + if record.status == MemoryStatus::Verified {
+            0.06
+        } else {
+            0.0
+        }
+        + kind_affinity(query, record.kind) * 0.05
+        + if query_lower
+            .split_whitespace()
+            .any(|token| title_lower.contains(token))
+        {
+            0.04
+        } else {
+            0.0
+        }
+        + tag_overlap * 0.02
+}
+
+fn kind_affinity(query: &str, kind: MemoryKind) -> f64 {
+    let query = query.to_lowercase();
+    let needles: &[&str] = match kind {
+        MemoryKind::Architecture => &["architecture", "design", "架构", "设计"],
+        MemoryKind::Decision => &["decision", "choose", "why", "决策", "选择", "原因"],
+        MemoryKind::Contract => &["requirement", "contract", "api", "需求", "接口", "验收"],
+        MemoryKind::Lesson => &["lesson", "pattern", "how", "经验", "方法", "注意"],
+        MemoryKind::Failure => &[
+            "failure", "error", "bug", "crash", "失败", "错误", "崩溃", "坑",
+        ],
+        MemoryKind::Verification => &["verify", "test", "review", "测试", "验证", "审查", "发布"],
+        MemoryKind::Meeting => &[
+            "meeting", "conflict", "merge", "会议", "冲突", "合并", "讨论",
+        ],
+    };
+    if needles.iter().any(|needle| query.contains(needle)) {
+        1.0
+    } else {
+        0.0
+    }
 }
 
 fn now_millis() -> i64 {

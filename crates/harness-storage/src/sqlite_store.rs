@@ -86,7 +86,7 @@ enum StoreCommand {
         reply: Reply<Option<ContextSeries>>,
     },
     CommitContextTransition {
-        transition: ContextTransition,
+        transition: Box<ContextTransition>,
         reply: Reply<()>,
     },
     SaveContextCheckpoint {
@@ -439,9 +439,12 @@ impl ContextStore for SqliteKernelStore {
         transition: ContextTransition,
     ) -> Result<(), ContextStoreError> {
         let (reply, receiver) = mpsc::sync_channel(1);
-        self.send(StoreCommand::CommitContextTransition { transition, reply })
-            .and_then(|()| receive(receiver))
-            .map_err(context_store_error)
+        self.send(StoreCommand::CommitContextTransition {
+            transition: Box::new(transition),
+            reply,
+        })
+        .and_then(|()| receive(receiver))
+        .map_err(context_store_error)
     }
 
     fn save_context_checkpoint(
@@ -659,7 +662,7 @@ fn run_worker(path: PathBuf, receiver: Receiver<StoreCommand>, ready: SyncSender
                 reply_result(reply, worker.load_context_series(&series_id));
             }
             StoreCommand::CommitContextTransition { transition, reply } => {
-                reply_result(reply, worker.commit_context_transition(transition));
+                reply_result(reply, worker.commit_context_transition(*transition));
             }
             StoreCommand::SaveContextCheckpoint {
                 expected_active_series_id,

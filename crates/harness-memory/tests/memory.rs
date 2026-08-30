@@ -267,3 +267,106 @@ fn embedding_failure_degrades_to_lexical_without_losing_records() {
         SemanticCapability::Degraded { .. }
     ));
 }
+
+#[test]
+fn repository_rerank_reuses_query_and_document_vectors_across_calls_and_restart() {
+    let temporary = tempdir().expect("tempdir");
+    let database = temporary.path().join("memory.sqlite");
+    let factory_calls = Arc::new(AtomicUsize::new(0));
+    let embedding_calls = Arc::new(AtomicUsize::new(0));
+    let factory = Arc::new(FakeFactory {
+        calls: factory_calls.clone(),
+        embeds: embedding_calls.clone(),
+        fail: false,
+    });
+    let config = EmbeddingConfig {
+        model: Some("fake".to_owned()),
+        provider: Some("local".to_owned()),
+        dimensions: Some(3),
+    };
+    let documents = vec![
+        SemanticDocument {
+            id: "src/cache.rs".to_owned(),
+            content_hash: "hash-cache".to_owned(),
+            text: "prompt cache stable prefix".to_owned(),
+        },
+        SemanticDocument {
+            id: "src/approval.rs".to_owned(),
+            content_hash: "hash-approval".to_owned(),
+            text: "approval permission boundary".to_owned(),
+        },
+    ];
+
+    let mut memory = ProjectMemory::open("project:test", &database, config.clone()).expect("open");
+    memory
+        .attach_embedding_factory(factory.clone())
+        .expect("factory");
+    let first = memory
+        .rerank_documents("repository", "how should cache work", &documents, 2)
+        .expect("first rerank");
+    assert_eq!(first.results[0].document_id, "src/cache.rs");
+    assert_eq!(first.cache_hits, 0);
+    assert_eq!(first.cache_writes, 3, "query + two documents");
+    assert_eq!(embedding_calls.load(Ordering::SeqCst), 3);
+
+    let second = memory
+        .rerank_documents("repository", "how should cache work", &documents, 2)
+        .expect("second rerank");
+    assert_eq!(second.cache_hits, 3);
+    assert_eq!(second.cache_writes, 0);
+    assert_eq!(embedding_calls.load(Ordering::SeqCst), 3);
+    let view = memory.view().expect("view");
+    assert_eq!(view.query_embedding_count, 1);
+    assert_eq!(view.repository_embedding_count, 2);
+    drop(memory);
+
+    let mut reopened = ProjectMemory::open("project:test", &database, config).expect("reopen");
+    reopened
+        .attach_embedding_factory(factory)
+        .expect("reopen factory");
+    let third = reopened
+        .rerank_documents("repository", "how should cache work", &documents, 2)
+        .expect("reopened rerank");
+    assert_eq!(third.cache_hits, 3);
+    assert_eq!(third.cache_writes, 0);
+    assert_eq!(embedding_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(factory_calls.load(Ordering::SeqCst), 2);
+    assert!(matches!(
+        reopened.view().expect("view").semantic,
+        SemanticCapability::Active { generation: 1, .. }
+    ));
+}
+
+#[test]
+fn lexical_search_uses_multiple_terms_instead_of_requiring_the_whole_phrase() {
+    let temporary = tempdir().expect("tempdir");
+    let mut memory = ProjectMemory::open(
+        "project:test",
+        temporary.path().join("memory.sqlite"),
+        EmbeddingConfig {
+            model: None,
+            provider: None,
+            dimensions: None,
+        },
+    )
+    .expect("open");
+    memory
+        .add(
+            NewMemoryRecord {
+                id: "m:cache".to_owned(),
+                kind: MemoryKind::Lesson,
+                title: "Prompt cache".to_owned(),
+                content: "Keep the stable prefix before dynamic task data".to_owned(),
+                tags: vec!["cache".to_owned()],
+                source_ref: None,
+                status: MemoryStatus::Verified,
+            },
+            1,
+        )
+        .expect("add");
+    let response = memory
+        .search("unrelated cache wording", RetrievalMode::Lexical, 8)
+        .expect("search");
+    assert_eq!(response.results[0].record.id, "m:cache");
+    assert_eq!(response.results[0].matched_by, "fts");
+}

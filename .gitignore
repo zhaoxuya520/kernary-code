@@ -10,7 +10,9 @@
 /target/
 /dist/
 /node_modules/
+/npm/kernary-code/node_modules/
 /npm/kernary-code-*/bin/
+/release/bin/
 /.harness/
 
 # 本地数据库、日志与临时文件。

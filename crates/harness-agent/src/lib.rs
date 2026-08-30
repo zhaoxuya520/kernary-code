@@ -4,6 +4,8 @@
 
 mod budget;
 mod execution;
+mod fullstack;
+mod profile;
 mod state_store;
 
 pub use budget::{
@@ -16,6 +18,10 @@ pub use execution::{
     AgentSession, AgentSessionStatus, AgentTaskContract, AgentTaskHandler, AgentToolCall,
     AgentWorkingContext, BoundedAgentExecutor, ModelAgentHandler, PlanningBudget,
     RunCancellationTree, SharedSteeringBuffer, SteeringAgentHandler,
+};
+pub use profile::{
+    AGENT_PROFILE_SCHEMA_VERSION, AgentFailureRule, AgentMemoryPolicy, AgentModelPolicy,
+    AgentProcedureStep, AgentProfile, agent_profile,
 };
 pub use state_store::AgentStateStore;
 
@@ -70,6 +76,21 @@ pub enum AgentRole {
     Coordinator,
     StaffingRouter,
     Supervisor,
+    ProductManager,
+    UxResearcher,
+    ProductDesigner,
+    DesignSystemEngineer,
+    FrontendEngineer,
+    BackendEngineer,
+    ApiDesigner,
+    DatabaseEngineer,
+    QualityEngineer,
+    AccessibilityEngineer,
+    PlatformEngineer,
+    SiteReliabilityEngineer,
+    TechnicalWriter,
+    LocalizationEngineer,
+    AnalyticsEngineer,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -92,6 +113,7 @@ pub struct AgentDefinition {
     pub max_concurrency: usize,
     pub cost_weight: u32,
     pub integrity_floor: String,
+    pub profile: AgentProfile,
 }
 
 #[derive(Default)]
@@ -102,9 +124,11 @@ pub struct AgentCatalog {
 }
 impl AgentCatalog {
     pub fn register(&mut self, definition: AgentDefinition) -> Result<(), AgentError> {
+        definition.profile.validate()?;
         if definition.name.trim().is_empty()
             || definition.capabilities.is_empty()
             || definition.max_concurrency == 0
+            || !definition.roles.contains(&definition.profile.role)
         {
             return Err(AgentError::new(
                 "agent-definition-invalid",
@@ -199,7 +223,7 @@ impl AgentCatalog {
 
 /// 内置 Agent 只注册能力元数据，启动时全部保持 Sleeping。
 pub fn builtin_agent_catalog() -> Result<AgentCatalog, AgentError> {
-    let definitions = [
+    let mut definitions = vec![
         builtin_definition(
             "agent:staffing-router",
             "专职分配员",
@@ -366,6 +390,7 @@ pub fn builtin_agent_catalog() -> Result<AgentCatalog, AgentError> {
             5,
         ),
     ];
+    definitions.extend(fullstack::builtin_definitions());
     let mut catalog = AgentCatalog::default();
     for definition in definitions {
         catalog.register(definition)?;
@@ -397,6 +422,7 @@ fn builtin_definition(
         max_concurrency,
         cost_weight,
         integrity_floor: "trusted".to_owned(),
+        profile: agent_profile(role),
     }
 }
 
@@ -973,6 +999,8 @@ pub struct AgentResult {
     pub confidence: f32,
     pub follow_up: Vec<String>,
     pub model_tool_yield: Option<AgentModelToolYield>,
+    #[serde(default)]
+    pub budget_checkpoint: Option<AgentModelContinuation>,
 }
 
 /// 子 Agent 只返回压缩结果、证据和显式决策，不把整段私有上下文灌回主会话。

@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    # 一个兼容周期内保留旧目录，避免现有 PATH 失效；目录内同时安装 kernary.exe/harness.exe。
+    # Keep the compatibility directory for one release cycle and install both command names.
     [string]$DestinationDirectory = (Join-Path $env:LOCALAPPDATA 'Programs\Harness\bin'),
     [switch]$Rollback
 )
@@ -10,7 +10,7 @@ $ErrorActionPreference = 'Stop'
 
 $destination = [System.IO.Path]::GetFullPath($DestinationDirectory)
 $root = [System.IO.Path]::GetPathRoot($destination)
-if ($destination.TrimEnd('\') -eq $root.TrimEnd('\')) { throw '拒绝把 Kernary 安装到文件系统根目录。' }
+if ($destination.TrimEnd('\') -eq $root.TrimEnd('\')) { throw 'Refusing to install Kernary at a filesystem root.' }
 $primaryTarget = Join-Path $destination 'kernary.exe'
 $compatibilityTarget = Join-Path $destination 'harness.exe'
 $rollbackDirectory = Join-Path $destination 'rollback'
@@ -23,7 +23,7 @@ function Test-InstalledSet([string]$Directory) {
     if (Test-Path -LiteralPath $primary -PathType Leaf) { & $primary --version | Out-Null }
     if (Test-Path -LiteralPath $compatibility -PathType Leaf) { & $compatibility --version | Out-Null }
     if (-not (Test-Path -LiteralPath $primary -PathType Leaf) -and -not (Test-Path -LiteralPath $compatibility -PathType Leaf)) {
-        throw "Binary set 为空：$Directory"
+        throw "Binary set is empty: $Directory"
     }
 }
 
@@ -48,7 +48,7 @@ function Move-SetToDestination([string]$SourceDirectory) {
 
 if ($Rollback) {
     $previous = Get-ChildItem -LiteralPath $rollbackDirectory -Directory | Sort-Object Name -Descending | Select-Object -First 1
-    if ($null -eq $previous) { throw '没有可回滚的 Kernary binary set。' }
+    if ($null -eq $previous) { throw 'No Kernary binary set is available for rollback.' }
     $swap = Join-Path $destination ("rollback-swap-{0}" -f $PID)
     Move-CurrentSet $swap
     try {
@@ -74,7 +74,7 @@ if ($Rollback) {
 $primarySource = Join-Path $PSScriptRoot 'bin\kernary.exe'
 $compatibilitySource = Join-Path $PSScriptRoot 'bin\harness.exe'
 foreach ($source in @($primarySource, $compatibilitySource)) {
-    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "发布包缺少 $source" }
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Release package is missing $source" }
 }
 $staging = Join-Path $destination ("install-staging-{0}" -f $PID)
 New-Item -ItemType Directory -Force -Path $staging | Out-Null

@@ -843,6 +843,7 @@ mod tests {
             response_format: ResponseFormat::Text,
             max_output_tokens: 100,
             previous_response_id: None,
+            prompt_cache: None,
             store: false,
             timeout: Duration::from_secs(5),
         }

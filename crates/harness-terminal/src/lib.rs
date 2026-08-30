@@ -21,6 +21,7 @@ pub use command::{
 pub use language::{LanguagePack, UiLanguage};
 pub use render::{ActivityIcon, JsonRenderer, PlainRenderer, RenderStyle, TerminalCapabilities};
 pub use tui::{
-    BackendResponse, CancelAction, CancelController, InputPrompt, SecretPrompt, TerminalBackend,
-    TerminalSnapshot, TuiOptions, run_tui,
+    BackendResponse, CancelAction, CancelController, InputPrompt, SecretPrompt, TerminalAgentBadge,
+    TerminalAgentState, TerminalBackend, TerminalSnapshot, TuiOptions, VectorRuntimeStatus,
+    run_tui,
 };

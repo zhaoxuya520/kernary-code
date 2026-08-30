@@ -45,6 +45,28 @@ impl StreamingHttpTransport for NonEmbeddingTransport {
     }
 }
 
+struct BatchTransport {
+    captured: Mutex<Option<serde_json::Value>>,
+}
+
+impl StreamingHttpTransport for BatchTransport {
+    fn send(
+        &self,
+        request: StreamingHttpRequest,
+    ) -> Result<StreamingHttpResponse, HttpTransportError> {
+        if let HttpBody::Json(body) = request.body {
+            *self.captured.lock().expect("capture") = Some(body);
+        }
+        Ok(StreamingHttpResponse {
+            status: 200,
+            headers: Default::default(),
+            body: Box::new(BufReader::new(Cursor::new(
+                br#"{"data":[{"index":1,"embedding":[0.0,1.0,0.5]},{"index":0,"embedding":[1.0,0.0,0.5]}]}"#.to_vec(),
+            ))),
+        })
+    }
+}
+
 #[test]
 fn http_embedding_uses_official_shape_and_os_credential() {
     let credentials = Arc::new(MemoryCredentialStore::new());
@@ -279,4 +301,45 @@ fn non_embedding_model_response_is_rejected() {
         .probe("chat-model", "validation")
         .expect_err("chat response is not an embedding response");
     assert_eq!(error.code, "embedding-data-missing");
+}
+
+#[test]
+fn runtime_batches_documents_and_restores_provider_index_order() {
+    let transport = Arc::new(BatchTransport {
+        captured: Mutex::new(None),
+    });
+    let factory = HttpEmbeddingFactory::new(
+        HttpEmbeddingConfig {
+            provider: "custom".to_owned(),
+            endpoint: "https://relay.example/v1/embeddings".to_owned(),
+            credential_id: None,
+            send_dimensions: false,
+            dimension_field: EmbeddingDimensionField::Dimensions,
+            request_dialect: EmbeddingRequestDialect::OpenAi,
+            allow_remote_project_private: true,
+            timeout_millis: Some(1_000),
+        },
+        Arc::new(MemoryCredentialStore::new()),
+        transport.clone(),
+    )
+    .expect("factory");
+    let provider = factory
+        .create(&EmbeddingProfile {
+            model: "batch-model".to_owned(),
+            provider: "custom".to_owned(),
+            dimensions: 3,
+        })
+        .expect("provider");
+    let vectors = provider
+        .embed_batch(&["first".to_owned(), "second".to_owned()])
+        .expect("batch");
+    assert_eq!(vectors[0], vec![1.0, 0.0, 0.5]);
+    assert_eq!(vectors[1], vec![0.0, 1.0, 0.5]);
+    let body = transport
+        .captured
+        .lock()
+        .expect("captured")
+        .clone()
+        .expect("body");
+    assert_eq!(body["input"], serde_json::json!(["first", "second"]));
 }

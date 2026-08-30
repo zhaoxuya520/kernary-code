@@ -14,6 +14,8 @@ type CliFactory = fn() -> Command;
 type DocumentationCase<'a> = (CliFactory, Vec<&'a str>, &'a str);
 
 static VECTOR_CONFIG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static MODEL_CONFIG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static PROVIDER_CONFIG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn isolated_global_vector_config() -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
@@ -23,23 +25,51 @@ fn isolated_global_vector_config() -> std::path::PathBuf {
     ))
 }
 
+fn isolated_global_model_config() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "kernary-cli-model-{}-{}.json",
+        std::process::id(),
+        MODEL_CONFIG_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+fn isolated_global_provider_config() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "kernary-cli-provider-{}-{}.toml",
+        std::process::id(),
+        PROVIDER_CONFIG_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 fn harness() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_harness"));
     command.env("KERNARY_ENABLE_TEST_MODEL", "1");
+    command.env("KERNARY_ISOLATE_GLOBAL_CONFIG", "1");
     command.env(
         "KERNARY_GLOBAL_VECTOR_CONFIG",
         isolated_global_vector_config(),
     );
+    command.env(
+        "KERNARY_GLOBAL_MODEL_CONFIG",
+        isolated_global_model_config(),
+    );
+    command.env("KERNARY_PROVIDER_CONFIG", isolated_global_provider_config());
     command
 }
 
 fn kernary() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_kernary"));
     command.env("KERNARY_ENABLE_TEST_MODEL", "1");
+    command.env("KERNARY_ISOLATE_GLOBAL_CONFIG", "1");
     command.env(
         "KERNARY_GLOBAL_VECTOR_CONFIG",
         isolated_global_vector_config(),
     );
+    command.env(
+        "KERNARY_GLOBAL_MODEL_CONFIG",
+        isolated_global_model_config(),
+    );
+    command.env("KERNARY_PROVIDER_CONFIG", isolated_global_provider_config());
     command
 }
 
@@ -47,10 +77,16 @@ fn kernary_without_test_model() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_kernary"));
     command.env_remove("KERNARY_ENABLE_TEST_MODEL");
     command.env_remove("HARNESS_ENABLE_TEST_MODEL");
+    command.env("KERNARY_ISOLATE_GLOBAL_CONFIG", "1");
     command.env(
         "KERNARY_GLOBAL_VECTOR_CONFIG",
         isolated_global_vector_config(),
     );
+    command.env(
+        "KERNARY_GLOBAL_MODEL_CONFIG",
+        isolated_global_model_config(),
+    );
+    command.env("KERNARY_PROVIDER_CONFIG", isolated_global_provider_config());
     command
 }
 
@@ -172,7 +208,7 @@ fn headless_run_outputs_completed_fake_plan() {
         .expect("harness run");
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
-    assert!(stdout.contains("Agent 已完成"));
+    assert!(!stdout.contains("Agent 已完成"));
     assert!(stdout.contains("deterministic:finish stage four"));
     assert!(stdout.contains("1 accepted"));
 }
@@ -307,7 +343,7 @@ fn headless_run_persists_isolated_agent_session_lifecycle() {
     let endpoint_count: usize = connection
         .query_row("SELECT COUNT(*) FROM agent_endpoints", [], |row| row.get(0))
         .expect("endpoint count");
-    assert_eq!(endpoint_count, 15);
+    assert_eq!(endpoint_count, 30);
     let result_json: String = connection
         .query_row("SELECT result_json FROM agent_results LIMIT 1", [], |row| {
             row.get(0)
@@ -375,12 +411,15 @@ fn doctor_json_reports_storage_and_terminal_capabilities() {
     );
     assert!(value["providers"]["catalogCount"].as_u64().unwrap_or(0) >= 10);
     assert_eq!(value["providers"]["customConfigPresent"], false);
-    assert_eq!(value["storageSchema"], 3);
-    assert_eq!(value["stage"], 23);
     assert_eq!(
-        value["stageTrack"],
-        "27-vector-provider-and-model-catalog"
+        value["providers"]["scope"],
+        "global-user-with-legacy-project-import"
     );
+    assert_eq!(value["defaultModel"]["scope"], "global-user");
+    assert_eq!(value["defaultModel"]["configured"], false);
+    assert_eq!(value["storageSchema"], 3);
+    assert_eq!(value["stage"], 38);
+    assert_eq!(value["stageTrack"], "42-responsive-streaming-tui");
     assert_eq!(value["sandbox"]["mode"], "workspace-write");
     assert!(value["sandbox"]["available"].as_bool().is_some());
     assert!(value["sandbox"]["backend"].as_str().is_some());
@@ -605,7 +644,7 @@ fn interactive_launch_creates_project_local_sessions_and_resume_never_crosses_fo
     assert!(stdout.contains("fix cache regression"), "stdout={stdout}");
     let first_id = stdout
         .lines()
-        .find(|line| line.contains("build auth feature | session:"))
+        .find(|line| line.contains("build auth feature | #"))
         .and_then(|line| line.split(" | ").nth(1))
         .and_then(|tail| tail.split_whitespace().next())
         .expect("first session id")
@@ -1124,7 +1163,7 @@ fn every_setup_wizard_accepts_cancel_and_returns_to_normal_chat() {
         .as_mut()
         .expect("stdin")
         .write_all(
-            b"keep this conversation visible\n/provider add\n/cancel\n/status\n/provider add\nExample Relay\nhttps://example.com/v1\n/cancel\n/status\n/vector setup\n/cancel\n/status\n/vector setup\nvoyage\n/cancel\n/status\n/vector clear\n/cancel\n/status\n/permissions bypass\n/cancel\n/status\n/exit\n",
+            b"keep this conversation visible\n/provider add\n/cancel\n/status\n/provider key\n/cancel\n/status\n/provider add\nExample Relay\nresponses\nhttps://example.com/v1\n/cancel\n/status\n/vector setup\n/cancel\n/status\n/vector setup\nvoyage\n/cancel\n/status\n/vector clear\n/cancel\n/status\n/permissions bypass\n/cancel\n/status\n/exit\n",
         )
         .expect("commands");
     let output = child.wait_with_output().expect("output");
@@ -1185,7 +1224,7 @@ fn plain_mode_accepts_slash_commands_from_stdin() {
     let output = child.wait_with_output().expect("wait plain harness");
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
-    assert!(stdout.contains("会话  未命名会话 | session:"));
+    assert!(stdout.contains("会话  未命名会话 | #"));
     assert!(stdout.contains("模型      未配置"));
     assert!(
         stdout.contains("模型  未配置 | 推理 max"),
@@ -1203,6 +1242,28 @@ fn plain_mode_accepts_slash_commands_from_stdin() {
     assert!(stdout.contains("Checkpoint checkpoint:"));
     assert!(stdout.contains("Cache hit rate"));
     assert!(stdout.contains("[DONE] Shutdown | user-exit"));
+}
+
+#[test]
+fn clear_and_cls_are_local_aliases_even_without_a_configured_model() {
+    let temporary = tempdir().expect("tempdir");
+    let mut child = kernary_without_test_model()
+        .current_dir(temporary.path())
+        .args(["--ui", "plain", "--ascii"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn plain kernary");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"clear\ncls\n/exit\n")
+        .expect("commands");
+    let output = child.wait_with_output().expect("output");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(!stdout.contains("MODEL_NOT_CONFIGURED"), "stdout={stdout}");
 }
 
 #[test]
@@ -1226,7 +1287,7 @@ fn language_switch_persists_and_localizes_command_help() {
     let stdout = String::from_utf8(output.stdout).expect("stdout");
     assert!(stdout.contains("Interface language: en"), "stdout={stdout}");
     assert!(
-        stdout.contains("Show, add, or switch text-model providers"),
+        stdout.contains("Show, add, switch, re-key, or remove text-model providers"),
         "stdout={stdout}"
     );
 
@@ -1331,8 +1392,8 @@ fn plain_mode_can_checkpoint_and_compact_real_context() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
     assert!(stdout.contains("Checkpoint checkpoint:"));
-    assert!(stdout.contains("Forked child session:child"));
-    assert!(stdout.contains("parent session:") && stdout.contains(" unchanged"));
+    assert!(stdout.contains("Forked child #"));
+    assert!(stdout.contains("parent #") && stdout.contains(" unchanged"));
     assert!(stdout.contains("Rolled back into new series"));
     assert!(stdout.contains("Context compacted Safe"));
     assert!(stdout.contains("Recovery 2 checkpoint(s)"));
@@ -1389,6 +1450,202 @@ fn model_and_reasoning_selection_resume_from_session_events() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("stdout");
     assert!(stdout.contains("推理 max"), "stdout={stdout}");
+}
+
+#[test]
+fn default_text_provider_and_model_are_global_across_projects_and_windows() {
+    let temporary = tempdir().expect("tempdir");
+    let first_project = temporary.path().join("first-project");
+    let second_project = temporary.path().join("second-project");
+    std::fs::create_dir_all(&first_project).expect("first project");
+    std::fs::create_dir_all(&second_project).expect("second project");
+    std::fs::write(
+        first_project.join("kernary.providers.toml"),
+        r#"
+schema_version = 1
+
+[[providers]]
+id = "local-relay"
+display_name = "Local Relay"
+credential_required = false
+
+[[providers.routes]]
+protocol = "openai-chat"
+endpoint = "http://127.0.0.1:45678/v1/chat/completions"
+models = ["local-coder"]
+"#,
+    )
+    .expect("legacy project provider");
+    let global_model = temporary.path().join("global/model.json");
+    let global_providers = temporary.path().join("global/providers.toml");
+
+    let mut first = kernary_without_test_model();
+    first
+        .current_dir(&first_project)
+        .env("KERNARY_GLOBAL_MODEL_CONFIG", &global_model)
+        .env("KERNARY_PROVIDER_CONFIG", &global_providers)
+        .args(["--ui", "plain", "--ascii"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    let mut first = first.spawn().expect("first window");
+    first
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"/model local-relay/local-coder\n/exit\n")
+        .expect("select global model");
+    let first_output = first.wait_with_output().expect("first output");
+    assert!(first_output.status.success());
+    let first_stdout = String::from_utf8(first_output.stdout).expect("stdout");
+    assert!(
+        first_stdout.contains("Global default  local-relay/local-coder"),
+        "stdout={first_stdout}"
+    );
+    assert!(global_model.is_file());
+    assert!(global_providers.is_file());
+
+    let mut second = kernary_without_test_model();
+    second
+        .current_dir(&second_project)
+        .env("KERNARY_GLOBAL_MODEL_CONFIG", &global_model)
+        .env("KERNARY_PROVIDER_CONFIG", &global_providers)
+        .args(["--ui", "plain", "--ascii"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    let mut second = second.spawn().expect("second window");
+    second
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"/status\n/exit\n")
+        .expect("read inherited model");
+    let second_output = second.wait_with_output().expect("second output");
+    assert!(second_output.status.success());
+    let second_stdout = String::from_utf8(second_output.stdout).expect("stdout");
+    assert!(
+        second_stdout.contains("local-relay/local-coder"),
+        "stdout={second_stdout}"
+    );
+    assert!(!second_stdout.contains("MODEL_NOT_CONFIGURED"));
+}
+
+#[test]
+fn provider_switch_reloads_late_global_custom_provider_and_registers_it_lazily() {
+    let temporary = tempdir().expect("tempdir");
+    let project = temporary.path().join("project");
+    let global_provider = temporary.path().join("global/providers.toml");
+    let global_model = temporary.path().join("global/model.json");
+    std::fs::create_dir_all(&project).expect("project");
+
+    let mut command = kernary_without_test_model();
+    command
+        .current_dir(&project)
+        .env("KERNARY_PROVIDER_CONFIG", &global_provider)
+        .env("KERNARY_GLOBAL_MODEL_CONFIG", &global_model)
+        .args(["--ui", "plain", "--ascii"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    let mut child = command.spawn().expect("window before provider exists");
+    thread::sleep(Duration::from_millis(400));
+    std::fs::create_dir_all(global_provider.parent().expect("global parent"))
+        .expect("global parent");
+    std::fs::write(
+        &global_provider,
+        r#"
+schema_version = 1
+
+[[providers]]
+id = "late-relay"
+display_name = "Late Relay"
+credential_required = false
+default_model = "late-coder"
+
+[[providers.routes]]
+protocol = "openai-chat"
+endpoint = "http://127.0.0.1:45679/v1/chat/completions"
+models = ["late-coder"]
+"#,
+    )
+    .expect("late global provider");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"/provider switch\nlate-relay\n/status\n/exit\n")
+        .expect("switch late provider");
+    let output = child.wait_with_output().expect("output");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("late-relay/late-coder"), "stdout={stdout}");
+    assert!(global_model.is_file());
+}
+
+#[test]
+fn canonical_global_provider_and_model_survive_empty_process_path_overrides() {
+    let temporary = tempdir().expect("tempdir");
+    let project = temporary.path().join("project");
+    let appdata = temporary.path().join("roaming");
+    let canonical_directory = appdata.join("Kernary");
+    std::fs::create_dir_all(&project).expect("project");
+    std::fs::create_dir_all(&canonical_directory).expect("canonical directory");
+    std::fs::write(
+        canonical_directory.join("providers.toml"),
+        r#"
+schema_version = 1
+
+[[providers]]
+id = "canonical-relay"
+display_name = "Canonical Relay"
+credential_required = false
+default_model = "canonical-coder"
+
+[[providers.routes]]
+protocol = "openai-chat"
+endpoint = "http://127.0.0.1:45680/v1/chat/completions"
+models = ["canonical-coder"]
+"#,
+    )
+    .expect("canonical providers");
+    std::fs::write(
+        canonical_directory.join("model.json"),
+        r#"{"schemaVersion":1,"providerId":"canonical-relay","modelId":"canonical-coder"}"#,
+    )
+    .expect("canonical model");
+
+    let mut command = kernary_without_test_model();
+    command
+        .current_dir(&project)
+        .env_remove("KERNARY_ISOLATE_GLOBAL_CONFIG")
+        .env("APPDATA", &appdata)
+        .env(
+            "KERNARY_PROVIDER_CONFIG",
+            temporary.path().join("override/missing-providers.toml"),
+        )
+        .env(
+            "KERNARY_GLOBAL_MODEL_CONFIG",
+            temporary.path().join("override/missing-model.json"),
+        )
+        .args(["--ui", "plain", "--ascii"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    let mut child = command.spawn().expect("canonical fallback process");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"/provider switch\ncanonical-relay\n/status\n/exit\n")
+        .expect("commands");
+    let output = child.wait_with_output().expect("output");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(
+        stdout.contains("canonical-relay/canonical-coder"),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("15 providers | 1 custom"),
+        "stdout={stdout}"
+    );
 }
 
 #[test]
@@ -2373,7 +2630,8 @@ fn session_goal_reset_and_forget_control_plane_is_durable_and_recoverable() {
     assert!(stdout.contains("retained="), "stdout={stdout}");
     assert!(stdout.contains("Sessions | 2"), "stdout={stdout}");
     assert!(stdout.contains("[current]"), "stdout={stdout}");
-    assert!(stdout.contains("session:child-control"), "stdout={stdout}");
+    assert!(!stdout.contains("session:child-control"), "stdout={stdout}");
+    assert!(stdout.contains("未命名会话 | #"), "stdout={stdout}");
     assert!(stdout.contains("目标  <empty>"), "stdout={stdout}");
     assert!(
         stdout.contains("Goal history | 2 revision(s)"),
@@ -2432,12 +2690,20 @@ fn agent_control_plane_is_sleeping_inspectable_and_project_local() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout");
-    assert!(stdout.contains("Team 15 | sleeping 15"), "stdout={stdout}");
+    assert!(stdout.contains("Team 30 | sleeping 30"), "stdout={stdout}");
     assert!(
         stdout.contains("messages=true | leases=true"),
         "stdout={stdout}"
     );
     assert!(stdout.contains("agent:coordinator"), "stdout={stdout}");
+    assert!(
+        stdout.contains("Profile    coordinator-v1"),
+        "stdout={stdout}"
+    );
+    assert!(stdout.contains("SOP"), "stdout={stdout}");
+    assert!(stdout.contains("Evidence Contract"), "stdout={stdout}");
+    assert!(stdout.contains("Failure Policy"), "stdout={stdout}");
+    assert!(stdout.contains("Completion Gate"), "stdout={stdout}");
     for specialist in [
         "agent:requirements",
         "agent:explorer",
@@ -2591,7 +2857,7 @@ fn budget_steering_and_queue_priority_are_wired_to_durable_runtime() {
         .stdin
         .as_mut()
         .expect("stdin")
-        .write_all(b"/budget\n/budget parallel 3\nimplement queue controls\n/steer do not change schema\n/queue priority task:main 70\n/queue\n/exit\n")
+        .write_all(b"/budget\n/budget parallel 2\nimplement queue controls\n/steer do not change schema\n/queue priority task:main 70\n/queue\n/exit\n")
         .expect("write");
     let output = child.wait_with_output().expect("wait");
     assert!(
@@ -2600,8 +2866,8 @@ fn budget_steering_and_queue_priority_are_wired_to_durable_runtime() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout");
-    assert!(stdout.contains("parallel=4"), "stdout={stdout}");
     assert!(stdout.contains("parallel=3"), "stdout={stdout}");
+    assert!(stdout.contains("parallel=2"), "stdout={stdout}");
     assert!(
         stdout.contains("Steering agent-message:"),
         "stdout={stdout}"

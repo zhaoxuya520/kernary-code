@@ -313,14 +313,32 @@ pub fn build_request(
             })
         })
         .collect::<Vec<_>>();
+    let system = if let Some(prompt_cache) = &request.prompt_cache {
+        let dynamic_tail = prompt_cache.dynamic_tail(&request.instructions)?;
+        let mut blocks = vec![serde_json::json!({
+            "type": "text",
+            "text": prompt_cache.stable_prefix,
+            "cache_control": {"type": "ephemeral"}
+        })];
+        if !dynamic_tail.is_empty() {
+            blocks.push(serde_json::json!({"type":"text", "text":dynamic_tail}));
+        }
+        serde_json::Value::Array(blocks)
+    } else {
+        serde_json::Value::String(request.instructions.clone())
+    };
     let mut body = serde_json::json!({
         "model":request.model_id,
-        "system":request.instructions,
+        "system":system,
         "messages":messages,
         "tools":tools,
         "max_tokens":request.max_output_tokens,
         "stream":true
     });
+    if request.prompt_cache.is_some() {
+        // 显式断点缓存 Tool ABI + 稳定 system；自动断点继续缓存增长中的对话尾部。
+        body["cache_control"] = serde_json::json!({"type":"ephemeral"});
+    }
     if effective_reasoning.is_some_and(|level| level != ReasoningLevel::Off) {
         body["thinking"] = serde_json::json!({
             "type":"adaptive",
@@ -713,7 +731,7 @@ mod tests {
     use std::sync::Mutex;
 
     use harness_auth::{CredentialStore, MemoryCredentialStore};
-    use harness_model::{ToolDefinition, validate_event_contract};
+    use harness_model::{PromptCachePolicy, ToolDefinition, validate_event_contract};
 
     use super::*;
 
@@ -758,6 +776,7 @@ mod tests {
             response_format: ResponseFormat::Text,
             max_output_tokens: 100,
             previous_response_id: None,
+            prompt_cache: None,
             store: false,
             timeout: Duration::from_secs(5),
         }
@@ -769,6 +788,19 @@ mod tests {
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["thinking"]["display"], "summarized");
         assert_eq!(body["tools"][0]["name"], "weather");
+    }
+
+    #[test]
+    fn request_caches_tool_and_stable_system_prefix_then_growing_conversation() {
+        let mut request = request();
+        request.instructions = "stable\ndynamic".to_owned();
+        request.prompt_cache =
+            Some(PromptCachePolicy::for_request("stable", &request.tools).expect("cache policy"));
+        let body = build_request(&request, None).expect("body");
+        assert_eq!(body["system"][0]["text"], "stable");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["system"][1]["text"], "dynamic");
+        assert_eq!(body["cache_control"]["type"], "ephemeral");
     }
 
     #[test]

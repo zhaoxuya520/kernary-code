@@ -11,6 +11,7 @@ description = "Provider-neutral model contracts, capability adaptation and deter
 harness-types = { path = "../harness-types" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 
 [lints]
 workspace = true

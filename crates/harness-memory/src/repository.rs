@@ -37,9 +37,11 @@ pub struct RepositoryUpdateStats {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RepositorySearchResult {
     pub path: String,
+    pub content_hash: String,
     pub language: String,
     pub summary: String,
     pub symbols: Vec<String>,
+    pub imports: Vec<String>,
     pub diagnostics: Vec<String>,
     pub score: f64,
     pub matched_by: String,
@@ -628,6 +630,40 @@ impl RepositoryIndex {
             .collect()
     }
 
+    /// 为自然语言查询提供一小组结构中心候选；真正排序仍由项目 Embedding 完成。
+    /// 这让“鉴权入口在哪里”一类不包含源码字面量的问题不至于在 FTS 阶段得到空集。
+    pub fn semantic_seed(&self, limit: usize) -> Result<Vec<RepositorySearchResult>, MemoryError> {
+        let limit = limit.clamp(1, 32);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT f.path,
+                        COUNT(DISTINCT s.name) + COUNT(DISTINCT i.target) AS structural_signals
+                 FROM repository_files f
+                 LEFT JOIN repository_symbols s ON s.path=f.path
+                 LEFT JOIN repository_imports i ON i.path=f.path
+                 GROUP BY f.path
+                 ORDER BY structural_signals DESC, length(f.path), f.path
+                 LIMIT ?1",
+            )
+            .map_err(sql_error)?;
+        statement
+            .query_map(params![limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })
+            .map_err(sql_error)?
+            .enumerate()
+            .map(|(index, row)| {
+                let (path, structural_signals) = row.map_err(sql_error)?;
+                self.result(
+                    path,
+                    structural_signals + 1.0 / (index + 1) as f64,
+                    "semantic-seed".to_owned(),
+                )
+            })
+            .collect()
+    }
+
     fn result(
         &self,
         path: String,
@@ -637,17 +673,22 @@ impl RepositoryIndex {
         let indexed = self
             .connection
             .query_row(
-                "SELECT language,summary FROM repository_files WHERE path=?1",
+                "SELECT content_hash,language,summary FROM repository_files WHERE path=?1",
                 [&path],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(sql_error)?;
-        let (language, summary) = indexed.map_or_else(
+        let (content_hash, language, summary) = indexed.map_or_else(
             || {
                 let absolute = self.root.join(&path);
                 let content = fs::read_to_string(&absolute).map_err(io_error)?;
-                Ok::<_, MemoryError>((language_for(&absolute).to_owned(), summarize(&content)))
+                let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+                Ok::<_, MemoryError>((
+                    hash,
+                    language_for(&absolute).to_owned(),
+                    summarize(&content),
+                ))
             },
             Ok,
         )?;
@@ -670,6 +711,16 @@ impl RepositoryIndex {
         );
         symbols.sort();
         symbols.dedup();
+        let imports = self
+            .connection
+            .prepare(
+                "SELECT target FROM repository_imports WHERE path=?1 ORDER BY line,target LIMIT 64",
+            )
+            .map_err(sql_error)?
+            .query_map([&path], |row| row.get(0))
+            .map_err(sql_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql_error)?;
         let diagnostics = self
             .connection
             .prepare("SELECT severity,code,message,line,character FROM repository_lsp_diagnostics WHERE path=?1 ORDER BY severity,line,character LIMIT 16")
@@ -692,9 +743,11 @@ impl RepositoryIndex {
             .map_err(sql_error)?;
         Ok(RepositorySearchResult {
             path,
+            content_hash,
             language,
             summary,
             symbols,
+            imports,
             diagnostics,
             score,
             matched_by,

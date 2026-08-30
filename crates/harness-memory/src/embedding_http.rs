@@ -156,6 +156,19 @@ impl EmbeddingProvider for HttpEmbeddingProvider {
             text,
         )
     }
+
+    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemoryError> {
+        request_embeddings(
+            &self.config,
+            self.credentials.as_ref(),
+            self.transport.as_ref(),
+            &self.profile.model,
+            self.config
+                .send_dimensions
+                .then_some(self.profile.dimensions),
+            texts,
+        )
+    }
 }
 
 fn request_embedding(
@@ -166,12 +179,39 @@ fn request_embedding(
     dimensions: Option<usize>,
     text: &str,
 ) -> Result<Vec<f32>, MemoryError> {
-    let input = text.trim();
-    if input.is_empty() {
+    let mut vectors = request_embeddings(
+        config,
+        credentials,
+        transport,
+        model,
+        dimensions,
+        &[text.to_owned()],
+    )?;
+    vectors
+        .pop()
+        .ok_or_else(|| MemoryError::new("embedding-data-count", "0"))
+}
+
+fn request_embeddings(
+    config: &HttpEmbeddingConfig,
+    credentials: &dyn CredentialStore,
+    transport: &dyn StreamingHttpTransport,
+    model: &str,
+    dimensions: Option<usize>,
+    texts: &[String],
+) -> Result<Vec<Vec<f32>>, MemoryError> {
+    if texts.is_empty() || texts.len() > 64 {
+        return Err(MemoryError::new(
+            "embedding-batch-size",
+            texts.len().to_string(),
+        ));
+    }
+    let inputs = texts.iter().map(|text| text.trim()).collect::<Vec<_>>();
+    if inputs.iter().any(|input| input.is_empty()) {
         return Err(MemoryError::new("embedding-input-empty", "input"));
     }
     let mut body = serde_json::json!({
-        "input": [input],
+        "input": inputs,
         "model": model
     });
     match config.request_dialect {
@@ -237,31 +277,49 @@ fn request_embedding(
         .get("data")
         .and_then(|v| v.as_array())
         .ok_or_else(|| MemoryError::new("embedding-data-missing", "data"))?;
-    if data.len() != 1 {
+    if data.len() != texts.len() {
         return Err(MemoryError::new(
             "embedding-data-count",
-            data.len().to_string(),
+            format!("expected={}, actual={}", texts.len(), data.len()),
         ));
     }
-    let vector = data[0]
-        .get("embedding")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| MemoryError::new("embedding-vector-missing", "embedding"))?
-        .iter()
-        .map(|value| {
-            value
-                .as_f64()
-                .map(|v| v as f32)
-                .ok_or_else(|| MemoryError::new("embedding-vector-value", value.to_string()))
+    let mut vectors = vec![None; texts.len()];
+    for (position, item) in data.iter().enumerate() {
+        let index = item
+            .get("index")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(position);
+        if index >= vectors.len() || vectors[index].is_some() {
+            return Err(MemoryError::new("embedding-data-index", index.to_string()));
+        }
+        let vector =
+            item.get("embedding")
+                .and_then(|value| value.as_array())
+                .ok_or_else(|| MemoryError::new("embedding-vector-missing", "embedding"))?
+                .iter()
+                .map(|value| {
+                    value.as_f64().map(|number| number as f32).ok_or_else(|| {
+                        MemoryError::new("embedding-vector-value", value.to_string())
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+        if vector.is_empty() || vector.iter().any(|value| !value.is_finite()) {
+            return Err(MemoryError::new(
+                "embedding-vector-invalid",
+                vector.len().to_string(),
+            ));
+        }
+        vectors[index] = Some(vector);
+    }
+    vectors
+        .into_iter()
+        .enumerate()
+        .map(|(index, vector)| {
+            vector
+                .ok_or_else(|| MemoryError::new("embedding-data-index-missing", index.to_string()))
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    if vector.is_empty() || vector.iter().any(|value| !value.is_finite()) {
-        return Err(MemoryError::new(
-            "embedding-vector-invalid",
-            vector.len().to_string(),
-        ));
-    }
-    Ok(vector)
+        .collect()
 }
 fn validate_endpoint(endpoint: &str) -> Result<(), MemoryError> {
     if !(endpoint.starts_with("https://") || is_loopback(endpoint)) {

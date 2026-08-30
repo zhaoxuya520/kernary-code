@@ -386,6 +386,7 @@ pub enum ProviderCommand {
     Show,
     Add,
     Switch,
+    Key { provider_id: Option<String> },
     Remove { provider_id: String },
 }
 
@@ -610,7 +611,7 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/connect",
         synopsis: "/connect [provider]",
-        description: "安全输入 Provider API key；Key 不进入 Slash 历史",
+        description: "安全输入或更新 Provider API key；Key 不进入 Slash 历史",
     },
     CommandSpec {
         name: "/config",
@@ -764,8 +765,8 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/provider",
-        synopsis: "/provider [add|switch|remove <provider-id>]",
-        description: "显示、添加、切换或删除文本模型提供商",
+        synopsis: "/provider [add|switch|key [provider-id]|remove <provider-id>]",
+        description: "显示、添加、切换、更新 Key 或删除文本模型提供商",
     },
     CommandSpec {
         name: "/providers",
@@ -1207,6 +1208,14 @@ impl CommandRegistry {
             "/provider" if remainder == "switch" => SlashCommand::Provider {
                 operation: ProviderCommand::Switch,
             },
+            "/provider" if remainder == "key" => SlashCommand::Provider {
+                operation: ProviderCommand::Key { provider_id: None },
+            },
+            "/provider" if remainder.starts_with("key ") => SlashCommand::Provider {
+                operation: ProviderCommand::Key {
+                    provider_id: Some(remainder[4..].trim().to_owned()),
+                },
+            },
             "/provider" if remainder.starts_with("remove ") => SlashCommand::Provider {
                 operation: ProviderCommand::Remove {
                     provider_id: remainder[7..].trim().to_owned(),
@@ -1457,7 +1466,7 @@ fn argument_suggestions(input: &str) -> Vec<InputSuggestion> {
         ],
         "/vector" => &[
             ("status", "显示向量硬门与后端状态"),
-            ("setup", "配置全局 URL、Key、模型与自动/手动维度"),
+            ("setup", "选择 Voyage/Jina/Custom 并验证 Key、模型与维度"),
             ("providers", "列出全局向量 Provider Catalog"),
             ("provider ", "切换 Provider，随后选择其模型"),
             ("model ", "切换当前 Provider 内的向量模型"),
@@ -1503,9 +1512,13 @@ fn argument_suggestions(input: &str) -> Vec<InputSuggestion> {
             ("search ", "搜索 Repository Index"),
         ],
         "/provider" => &[
-            ("add", "添加 OpenAI-compatible 自定义提供商"),
+            (
+                "add",
+                "添加 Responses、Chat Completions 或 Messages 自定义提供商",
+            ),
             ("switch", "切换当前模型提供商及其默认模型"),
-            ("remove ", "删除项目级自定义提供商及其凭证"),
+            ("key", "安全更新已有提供商 API Key；失败保留旧 Key"),
+            ("remove ", "删除全局自定义提供商及其凭证"),
         ],
         "/language" => &[
             ("en", "English"),
@@ -2175,6 +2188,9 @@ mod tests {
         assert!(suggestions.iter().all(|suggestion| {
             suggestion.label.starts_with('/') && !suggestion.description.is_empty()
         }));
+        let provider_key = registry.suggestions("/provider k");
+        assert_eq!(provider_key.len(), 1);
+        assert_eq!(provider_key[0].replacement, "/provider key");
         assert!(
             suggestions
                 .iter()
@@ -2595,6 +2611,24 @@ mod tests {
             registry.parse("/provider switch").expect("provider switch"),
             ParsedInput::Command(SlashCommand::Provider {
                 operation: ProviderCommand::Switch
+            })
+        );
+        assert_eq!(
+            registry
+                .parse("/provider key")
+                .expect("provider key picker"),
+            ParsedInput::Command(SlashCommand::Provider {
+                operation: ProviderCommand::Key { provider_id: None }
+            })
+        );
+        assert_eq!(
+            registry
+                .parse("/provider key custom-relay")
+                .expect("provider key direct"),
+            ParsedInput::Command(SlashCommand::Provider {
+                operation: ProviderCommand::Key {
+                    provider_id: Some("custom-relay".to_owned())
+                }
             })
         );
         assert_eq!(

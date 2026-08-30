@@ -23,7 +23,7 @@ impl AgentBudgetPolicy {
     pub const fn balanced() -> Self {
         Self {
             max_agents: 8,
-            max_parallel_agents: 4,
+            max_parallel_agents: 3,
             max_total_tokens: 100_000,
             max_tool_calls: 128,
             max_runtime_millis: 30 * 60 * 1_000,

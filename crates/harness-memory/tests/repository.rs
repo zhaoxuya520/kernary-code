@@ -31,6 +31,14 @@ fn repository_index_is_incremental_searchable_and_removes_deleted_files() {
             .contains(&"PermissionEngine".to_owned())
     );
     assert!(index.repository_map().expect("map").contains("src/lib.rs"));
+    let seeds = index.semantic_seed(8).expect("semantic seeds");
+    let library = seeds
+        .iter()
+        .find(|result| result.path == "src/lib.rs")
+        .expect("library seed");
+    assert_eq!(library.content_hash.len(), 64);
+    assert!(library.imports.contains(&"crate::auth".to_owned()));
+    assert_eq!(library.matched_by, "semantic-seed");
     let second = index.update(2).expect("second");
     assert_eq!(second.unchanged_metadata, 2);
     assert_eq!(second.indexed, 0);

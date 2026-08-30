@@ -11,8 +11,8 @@ use std::sync::{Arc, Barrier};
 use tempfile::tempdir;
 
 use harness_model::{
-    CancellationToken, FakeModelProvider, FakeScenario, ModelRegistry, ModelRuntime, ModelUsage,
-    ReasoningLevel,
+    CancellationToken, FakeModelProvider, FakeScenario, ModelInputItem, ModelRegistry,
+    ModelRuntime, ModelUsage, ReasoningLevel,
 };
 
 fn agent(id: &str, role: AgentRole, capability: &str, cost: u32) -> AgentDefinition {
@@ -25,18 +25,24 @@ fn agent(id: &str, role: AgentRole, capability: &str, cost: u32) -> AgentDefinit
         max_concurrency: 8,
         cost_weight: cost,
         integrity_floor: "trusted".to_owned(),
+        profile: agent_profile(role),
     }
 }
 
 #[test]
-fn builtin_catalog_has_fifteen_nonduplicative_roles_and_routes_specialists() {
+fn builtin_catalog_has_thirty_nonduplicative_roles_and_routes_specialists() {
     let catalog = builtin_agent_catalog().expect("builtin catalog");
     let definitions = catalog.list();
-    assert_eq!(definitions.len(), 15);
+    assert_eq!(definitions.len(), 30);
     let ids = definitions
         .iter()
         .map(|definition| definition.id.to_string())
         .collect::<BTreeSet<_>>();
+    let profile_ids = definitions
+        .iter()
+        .map(|definition| definition.profile.profile_id.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(profile_ids.len(), definitions.len());
     for expected in [
         "agent:requirements",
         "agent:explorer",
@@ -44,10 +50,31 @@ fn builtin_catalog_has_fifteen_nonduplicative_roles_and_routes_specialists() {
         "agent:security",
         "agent:performance",
         "agent:release",
+        "agent:product-manager",
+        "agent:ux-researcher",
+        "agent:product-designer",
+        "agent:design-system",
+        "agent:frontend",
+        "agent:backend",
+        "agent:api-designer",
+        "agent:database",
+        "agent:quality",
+        "agent:accessibility",
+        "agent:platform",
+        "agent:sre",
+        "agent:technical-writer",
+        "agent:localization",
+        "agent:analytics",
     ] {
         assert!(ids.contains(expected), "missing {expected}");
     }
     for definition in &definitions {
+        definition.profile.validate().expect("deep profile");
+        assert!(definition.roles.contains(&definition.profile.role));
+        assert!(definition.profile.procedure.len() >= 4);
+        assert!(definition.profile.completion_gate.len() >= 3);
+        assert!(definition.profile.output_contract.len() >= 3);
+        assert!(!definition.profile.methodology_sources.is_empty());
         let control_plane = definition.roles.contains(&AgentRole::Coordinator)
             || definition.roles.contains(&AgentRole::StaffingRouter);
         assert!(!control_plane || !definition.roles.contains(&AgentRole::Coder));
@@ -74,6 +101,21 @@ fn builtin_catalog_has_fifteen_nonduplicative_roles_and_routes_specialists() {
         ("security-audit", AgentRole::SecurityAuditor),
         ("performance-analysis", AgentRole::PerformanceEngineer),
         ("release-readiness", AgentRole::ReleaseManager),
+        ("product-shaping", AgentRole::ProductManager),
+        ("ux-research", AgentRole::UxResearcher),
+        ("interaction-design", AgentRole::ProductDesigner),
+        ("design-system", AgentRole::DesignSystemEngineer),
+        ("frontend-development", AgentRole::FrontendEngineer),
+        ("backend-development", AgentRole::BackendEngineer),
+        ("api-design", AgentRole::ApiDesigner),
+        ("data-modeling", AgentRole::DatabaseEngineer),
+        ("test-strategy", AgentRole::QualityEngineer),
+        ("accessibility-audit", AgentRole::AccessibilityEngineer),
+        ("ci-cd", AgentRole::PlatformEngineer),
+        ("observability", AgentRole::SiteReliabilityEngineer),
+        ("technical-writing", AgentRole::TechnicalWriter),
+        ("internationalization", AgentRole::LocalizationEngineer),
+        ("tracking-plan", AgentRole::AnalyticsEngineer),
     ]
     .into_iter()
     .enumerate()
@@ -463,6 +505,7 @@ fn coordinator_records_meeting_and_acceptance_requires_review_and_test_evidence(
         confidence: 0.9,
         follow_up: vec![],
         model_tool_yield: None,
+        budget_checkpoint: None,
     };
     assert!(validate_acceptance(&result, true, true).is_err());
     result.evidence.push(Evidence {
@@ -501,6 +544,7 @@ fn coordinator_detects_file_and_decision_conflicts_and_persists_meeting() {
                     confidence: 0.8,
                     follow_up: vec![],
                     model_tool_yield: None,
+                    budget_checkpoint: None,
                 },
                 decision_claims: [("auth.strategy".to_owned(), auth_strategy.to_owned())]
                     .into_iter()
@@ -657,6 +701,7 @@ fn endpoint_and_agent_session_recover_with_cas_versions() {
         confidence: 0.75,
         follow_up: vec!["review".to_owned()],
         model_tool_yield: None,
+        budget_checkpoint: None,
     };
     store
         .save_result(&session.run_id, &result, 12)
@@ -866,6 +911,7 @@ impl AgentTaskHandler for ParallelHandler {
             confidence: 1.0,
             follow_up: vec![],
             model_tool_yield: None,
+            budget_checkpoint: None,
         })
     }
 }
@@ -896,6 +942,7 @@ fn bounded_executor_runs_two_four_and_eight_agents_in_parallel_with_stable_merge
                             endpoint_id: AgentEndpointId::from("endpoint:coder"),
                             agent_definition_id: AgentDefinitionId::from("agent:coder"),
                             role: AgentRole::Coder,
+                            profile: agent_profile(AgentRole::Coder),
                             objective: format!("task {index}"),
                             acceptance_criteria: vec!["returns result".to_owned()],
                             max_turns: 4,
@@ -974,6 +1021,7 @@ fn model_agent_handler_executes_isolated_request_through_real_model_runtime() {
                         endpoint_id: AgentEndpointId::from("endpoint:reviewer"),
                         agent_definition_id: AgentDefinitionId::from("agent:reviewer"),
                         role: AgentRole::Reviewer,
+                        profile: agent_profile(AgentRole::Reviewer),
                         objective: "review the patch".to_owned(),
                         acceptance_criteria: vec!["report findings".to_owned()],
                         max_turns: 1,
@@ -1003,9 +1051,34 @@ fn model_agent_handler_executes_isolated_request_through_real_model_runtime() {
     assert_eq!(result.metrics.cached_input_tokens, 1);
     assert_eq!(result.metrics.output_tokens, 2);
     let requests = provider.requests().expect("requests");
-    assert!(requests[0].instructions.contains("<role-contract>"));
-    assert!(requests[0].instructions.contains("独立代码审查员"));
+    assert!(requests[0].instructions.contains("<agent-profile"));
+    assert!(requests[0].instructions.contains("reviewer-v1"));
+    assert!(requests[0].instructions.contains("<procedure>"));
+    assert!(requests[0].instructions.contains("<failure-policy>"));
+    assert!(requests[0].instructions.contains("<completion-gate>"));
     assert!(requests[0].instructions.contains("review only"));
+    assert!(!requests[0].instructions.contains("<task-contract-data"));
+    assert!(!requests[0].instructions.contains("diff: auth.rs"));
+    let input = requests[0]
+        .input
+        .iter()
+        .filter_map(|item| match item {
+            ModelInputItem::Message { content, .. } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(input.contains("<task-contract-data"));
+    assert!(input.contains("report findings"));
+    assert!(input.contains("diff: auth.rs"));
+    assert_eq!(
+        requests[0]
+            .prompt_cache
+            .as_ref()
+            .expect("prompt cache")
+            .stable_prefix,
+        requests[0].instructions
+    );
 }
 
 #[test]
@@ -1044,6 +1117,7 @@ fn model_agent_handler_yields_typed_tool_calls_and_resumes_exact_continuation() 
             endpoint_id: AgentEndpointId::from("endpoint:coder"),
             agent_definition_id: AgentDefinitionId::from("agent:coder"),
             role: AgentRole::Coder,
+            profile: agent_profile(AgentRole::Coder),
             objective: "read note".to_owned(),
             acceptance_criteria: vec!["use tool result".to_owned()],
             max_turns: 4,
@@ -1087,4 +1161,173 @@ fn model_agent_handler_yields_typed_tool_calls_and_resumes_exact_continuation() 
     assert_eq!(completed.summary, "tool continuation complete");
     assert_eq!(completed.metrics.turns, 2);
     assert_eq!(completed.metrics.tool_calls, 1);
+}
+
+#[test]
+fn model_agent_budget_checkpoint_resumes_instead_of_discarding_partial_work() {
+    let usage = ModelUsage {
+        input_tokens: 2,
+        output_tokens: 2,
+        total_tokens: 4,
+        ..ModelUsage::default()
+    };
+    let mut registry = ModelRegistry::new();
+    registry
+        .register(Arc::new(FakeModelProvider::standard(vec![
+            FakeScenario::text(
+                &["[PARTIAL_HANDOFF] completed=inspection; remaining=tests"],
+                usage,
+            ),
+            FakeScenario::text(&["final verification complete"], usage),
+        ])))
+        .expect("provider");
+    let runtime = Arc::new(
+        ModelRuntime::new(
+            registry,
+            ProviderId::from("fake"),
+            ModelId::from("deterministic"),
+            ReasoningLevel::Off,
+        )
+        .expect("runtime"),
+    );
+    let handler =
+        ModelAgentHandler::new(runtime, std::time::Duration::from_secs(1)).expect("handler");
+    let mut profile = agent_profile(AgentRole::Coder);
+    profile.model_policy.target_turns = 1;
+    profile.model_policy.max_turns = 3;
+    profile.model_policy.extension_turns = 1;
+    let mut request = AgentExecutionRequest {
+        session_id: AgentSessionId::from("agent-session:budget"),
+        contract: AgentTaskContract {
+            mission_id: MissionId::from("mission:budget"),
+            task_id: TaskId::from("task:coder"),
+            run_id: RunId::from("run:budget"),
+            parent_run_id: None,
+            endpoint_id: AgentEndpointId::from("endpoint:coder"),
+            agent_definition_id: AgentDefinitionId::from("agent:coder"),
+            role: AgentRole::Coder,
+            profile,
+            objective: "finish safely".to_owned(),
+            acceptance_criteria: vec!["tests complete".to_owned()],
+            max_turns: 1,
+            deadline_millis: 1_000,
+            planning_budget: None,
+        },
+        context: AgentWorkingContext {
+            stable_instructions: "core".to_owned(),
+            dynamic_context: "task".to_owned(),
+            selected_item_ids: vec![],
+            excluded_item_ids: vec![],
+            token_cost: 2,
+            max_input_tokens: 100,
+            fingerprint: "context:budget".to_owned(),
+        },
+        steering_messages: vec![],
+        model_tools: vec![],
+        model_continuation: None,
+    };
+    let partial = handler
+        .execute(request.clone(), CancellationToken::new())
+        .expect("partial turn");
+    assert_eq!(partial.status, "partial-budget");
+    assert!(partial.summary.contains("completed=inspection"));
+    let mut checkpoint = partial.budget_checkpoint.expect("checkpoint");
+    assert_eq!(checkpoint.next_turn, 1);
+    checkpoint.max_turns = 2;
+    request.contract.max_turns = 2;
+    request.model_continuation = Some(checkpoint);
+    let completed = handler
+        .execute(request, CancellationToken::new())
+        .expect("resumed turn");
+    assert_eq!(completed.status, "completed");
+    assert!(completed.summary.contains("completed=inspection"));
+    assert!(completed.summary.contains("final verification complete"));
+    assert_eq!(completed.metrics.turns, 2);
+}
+
+#[test]
+fn repeated_tool_loop_is_checkpointed_before_the_third_call_executes() {
+    let usage = ModelUsage {
+        input_tokens: 1,
+        output_tokens: 1,
+        total_tokens: 2,
+        ..ModelUsage::default()
+    };
+    let repeated =
+        || FakeScenario::tool("files.read", serde_json::json!({"path":"same.txt"}), usage);
+    let mut registry = ModelRegistry::new();
+    registry
+        .register(Arc::new(FakeModelProvider::standard(vec![
+            repeated(),
+            repeated(),
+            repeated(),
+        ])))
+        .expect("provider");
+    let runtime = Arc::new(
+        ModelRuntime::new(
+            registry,
+            ProviderId::from("fake"),
+            ModelId::from("deterministic"),
+            ReasoningLevel::Off,
+        )
+        .expect("runtime"),
+    );
+    let handler =
+        ModelAgentHandler::new(runtime, std::time::Duration::from_secs(1)).expect("handler");
+    let mut request = AgentExecutionRequest {
+        session_id: AgentSessionId::from("agent-session:stuck"),
+        contract: AgentTaskContract {
+            mission_id: MissionId::from("mission:stuck"),
+            task_id: TaskId::from("task:coder"),
+            run_id: RunId::from("run:stuck"),
+            parent_run_id: None,
+            endpoint_id: AgentEndpointId::from("endpoint:coder"),
+            agent_definition_id: AgentDefinitionId::from("agent:coder"),
+            role: AgentRole::Coder,
+            profile: agent_profile(AgentRole::Coder),
+            objective: "inspect without looping".to_owned(),
+            acceptance_criteria: vec!["avoid duplicate calls".to_owned()],
+            max_turns: 6,
+            deadline_millis: 1_000,
+            planning_budget: None,
+        },
+        context: AgentWorkingContext {
+            stable_instructions: "core".to_owned(),
+            dynamic_context: "task".to_owned(),
+            selected_item_ids: vec![],
+            excluded_item_ids: vec![],
+            token_cost: 2,
+            max_input_tokens: 100,
+            fingerprint: "context:stuck".to_owned(),
+        },
+        steering_messages: vec![],
+        model_tools: vec![harness_model::ToolDefinition {
+            name: "files.read".to_owned(),
+            description: "read".to_owned(),
+            input_schema: serde_json::json!({"type":"object"}),
+            strict: true,
+        }],
+        model_continuation: None,
+    };
+    for turn in 0..3 {
+        let result = handler
+            .execute(request.clone(), CancellationToken::new())
+            .expect("turn");
+        if turn < 2 {
+            assert_eq!(result.status, "waiting-tool");
+            let mut yielded = result.model_tool_yield.expect("tool yield");
+            yielded.continuation.previous_response_id = yielded.response_id;
+            yielded.continuation.next_input = vec![harness_model::ModelInputItem::ToolResult {
+                call_id: yielded.calls[0].call_id.clone(),
+                output: serde_json::json!({"content":"same evidence"}),
+            }];
+            request.model_continuation = Some(yielded.continuation);
+        } else {
+            assert_eq!(result.status, "recoverable-stuck");
+            assert!(result.model_tool_yield.is_none());
+            let checkpoint = result.budget_checkpoint.expect("stuck checkpoint");
+            assert_eq!(checkpoint.stuck_recoveries, 1);
+            assert_eq!(checkpoint.recent_tool_fingerprints.len(), 3);
+        }
+    }
 }

@@ -159,9 +159,19 @@ impl PlainRenderer {
                 output_tokens,
                 reasoning_tokens,
                 total_tokens,
-            } => format!(
-                "Usage in={input_tokens} cached={cached_input_tokens} cache-write={cache_write_tokens} out={output_tokens} reasoning={reasoning_tokens} total={total_tokens}"
-            ),
+            } => {
+                let cache_rate = if *input_tokens == 0 {
+                    "n/a".to_owned()
+                } else {
+                    format!(
+                        "{}%",
+                        cached_input_tokens.saturating_mul(100) / input_tokens
+                    )
+                };
+                format!(
+                    "Usage in={input_tokens} cached={cached_input_tokens} ({cache_rate}) cache-write={cache_write_tokens} out={output_tokens} reasoning={reasoning_tokens} total={total_tokens}"
+                )
+            }
             HarnessEvent::PlanChanged {
                 accepted,
                 running,

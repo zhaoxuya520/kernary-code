@@ -3,6 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::ops::{Deref, DerefMut};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -13,15 +15,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell as CompletionShell;
 use harness_agent::{
-    AgentBudgetManager, AgentExecutionOutcome, AgentMessageBus, AgentStateStore, FileLeaseManager,
-    SharedSteeringBuffer, builtin_agent_catalog,
+    AgentBudgetManager, AgentExecutionOutcome, AgentLifecycle, AgentMessageBus, AgentStateStore,
+    FileLeaseManager, SharedSteeringBuffer, builtin_agent_catalog,
 };
 use harness_application::{
     AgentBudgetView, AgentQueueView, AgentTeamContinuation, AgentTeamView, AgentView,
     ApplicationError, AuthView, BrowserCapabilityView, CacheView, CompactionMode, ContextView,
     GoalHistoryView, HarnessApplication, ModelView, PlanView, PreparedAgentTeam,
-    ProcessIdGenerator, ProfileView, SessionSummaryView, StatusView, SystemClock, ToolRuntimeView,
-    WhyView,
+    ProcessIdGenerator, ProfileView, SessionSummaryView, SessionTitleOutcome, StatusView,
+    SystemClock, ToolRuntimeView, WhyView,
 };
 use harness_auth::{
     CredentialId, CredentialStore, OPENAI_API_KEY_CREDENTIAL_ID, OsCredentialStore, SecretString,
@@ -60,8 +62,9 @@ use harness_model::{
     UNCONFIGURED_MODEL_ID, UNCONFIGURED_PROVIDER_ID, UnconfiguredModelProvider,
 };
 use harness_permission::{
-    ApprovalPolicy, PermissionEngine, PermissionRule, PermissionRuleAction, PermissionRuleEffect,
-    load_permission_rules, save_permission_rules_atomic, workspace_write_profile,
+    ApprovalPolicy, GrantScope, PermissionEngine, PermissionRule, PermissionRuleAction,
+    PermissionRuleEffect, load_permission_rules, save_permission_rules_atomic,
+    workspace_write_profile,
 };
 use harness_plugin::PluginManager;
 use harness_provider_catalog::{
@@ -83,14 +86,19 @@ use harness_terminal::{
     InputPrompt, InputSuggestion, JsonRenderer, LspCommand, MASCOT_NAME, McpCommand, MemoryCommand,
     PRODUCT_NAME, PRODUCT_SHORT_NAME, ParsedInput, PermissionCommand, PlainRenderer, PluginCommand,
     ProviderCommand, QueueCommand, RenderStyle, SecretPrompt, SettingLayer, SettingsCommand,
-    SkillCommand, SlashCommand, TAGLINE, TeamCommand, TerminalBackend, TerminalCapabilities,
-    TerminalSnapshot, TraceCommand, TuiOptions, UiLanguage, VectorCommand, run_tui,
+    SkillCommand, SlashCommand, TAGLINE, TeamCommand, TerminalAgentBadge, TerminalAgentState,
+    TerminalBackend, TerminalCapabilities, TerminalSnapshot, TraceCommand, TuiOptions, UiLanguage,
+    VectorCommand, VectorRuntimeStatus, run_tui,
 };
 use harness_tool::{ToolInvocationJournal, ToolInvocationStatus, ToolRegistry, ToolRuntime};
 use harness_types::{
     BrowserSessionId, ModelId, ProjectId, ProviderId, SessionId, TaskId, ToolInvocationId,
 };
+use sha2::{Digest, Sha256};
 use url::Url;
+
+const GLOBAL_MODEL_SELECTION_SCHEMA_VERSION: u64 = 1;
+const MAX_GLOBAL_MODEL_SELECTION_BYTES: u64 = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum UiMode {
@@ -254,6 +262,43 @@ enum AuthProvider {
 
 type Application = HarnessApplication<SqliteKernelStore, SystemClock, ProcessIdGenerator>;
 
+struct ApplicationSlot(Option<Application>);
+
+impl ApplicationSlot {
+    fn take(&mut self) -> Application {
+        self.0.take().expect("Application 正在后台运行")
+    }
+
+    fn restore(&mut self, application: Application) {
+        debug_assert!(self.0.is_none());
+        self.0 = Some(application);
+    }
+
+    const fn is_available(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+impl From<Application> for ApplicationSlot {
+    fn from(application: Application) -> Self {
+        Self(Some(application))
+    }
+}
+
+impl Deref for ApplicationSlot {
+    type Target = Application;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("Application 正在后台运行")
+    }
+}
+
+impl DerefMut for ApplicationSlot {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().expect("Application 正在后台运行")
+    }
+}
+
 const INTERNAL_TEST_PROVIDER: &str = "fake";
 const INTERNAL_TEST_MODEL: &str = "deterministic";
 
@@ -321,6 +366,26 @@ fn selection_is_ready(
         })
 }
 
+fn selection_is_routable(
+    catalog: &ProviderCatalog,
+    provider_id: &ProviderId,
+    model_id: &ModelId,
+    test_model_enabled: bool,
+) -> bool {
+    if is_internal_test_model(provider_id, model_id) {
+        return test_model_enabled;
+    }
+    if is_unconfigured_model(provider_id, model_id) {
+        return true;
+    }
+    catalog.get(provider_id).is_some_and(|provider| {
+        provider
+            .routes
+            .iter()
+            .any(|route| route.models.iter().any(|candidate| candidate == model_id))
+    })
+}
+
 fn slash_requires_ready_model(command: &SlashCommand) -> bool {
     matches!(
         command,
@@ -349,7 +414,13 @@ fn normalize_openai_base_url(value: &str) -> Result<(String, String, String), St
         return Err("URL 不能包含凭证、query 或 fragment".to_owned());
     }
     let mut path = url.path().trim_end_matches('/').to_owned();
-    for suffix in ["/chat/completions", "/responses", "/models", "/embeddings"] {
+    for suffix in [
+        "/chat/completions",
+        "/responses",
+        "/messages",
+        "/models",
+        "/embeddings",
+    ] {
         if path.ends_with(suffix) {
             path.truncate(path.len() - suffix.len());
             break;
@@ -364,6 +435,46 @@ fn normalize_openai_base_url(value: &str) -> Result<(String, String, String), St
         base.clone(),
         format!("{base}/chat/completions"),
         format!("{base}/models"),
+    ))
+}
+
+fn custom_provider_route(
+    value: &str,
+    protocol: ProviderProtocol,
+) -> Result<
+    (
+        String,
+        String,
+        String,
+        ProviderDiscoveryFormat,
+        ProviderDiscoveryAuth,
+    ),
+    String,
+> {
+    let (base, _, discovery_endpoint) = normalize_openai_base_url(value)?;
+    let (suffix, discovery_format, discovery_auth) = match protocol {
+        ProviderProtocol::OpenaiResponses => (
+            "/responses",
+            ProviderDiscoveryFormat::OpenaiModels,
+            ProviderDiscoveryAuth::Bearer,
+        ),
+        ProviderProtocol::OpenaiChat => (
+            "/chat/completions",
+            ProviderDiscoveryFormat::OpenaiModels,
+            ProviderDiscoveryAuth::Bearer,
+        ),
+        ProviderProtocol::AnthropicMessages => (
+            "/messages",
+            ProviderDiscoveryFormat::AnthropicModels,
+            ProviderDiscoveryAuth::AnthropicApiKey,
+        ),
+    };
+    Ok((
+        base.clone(),
+        format!("{base}{suffix}"),
+        discovery_endpoint,
+        discovery_format,
+        discovery_auth,
     ))
 }
 
@@ -490,6 +601,21 @@ fn default_model_for_provider(
     models.into_iter().next()
 }
 
+fn provider_key_update_candidate(
+    provider: &ProviderDefinition,
+    prefix: &str,
+    credential_configured: bool,
+) -> bool {
+    provider.credential_required
+        && credential_configured
+        && (provider
+            .id
+            .as_str()
+            .to_ascii_lowercase()
+            .starts_with(prefix)
+            || provider.display_name.to_ascii_lowercase().contains(prefix))
+}
+
 fn restore_vector_credential(
     store: &dyn CredentialStore,
     credential_id: &str,
@@ -499,6 +625,28 @@ fn restore_vector_credential(
         let _ = store.put(&CredentialId::new(credential_id), previous);
     } else {
         let _ = store.delete(&CredentialId::new(credential_id));
+    }
+}
+
+fn replace_credential_transactionally<T>(
+    store: &dyn CredentialStore,
+    credential_id: &str,
+    replacement: SecretString,
+    validate: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let credential_id = CredentialId::new(credential_id);
+    let previous = store
+        .get(&credential_id)
+        .map_err(|error| error.to_string())?;
+    store
+        .put(&credential_id, replacement)
+        .map_err(|error| error.to_string())?;
+    match validate() {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            restore_vector_credential(store, credential_id.as_str(), previous);
+            Err(error)
+        }
     }
 }
 
@@ -516,13 +664,14 @@ fn supports_manual_dimension_retry(error: &str) -> bool {
 }
 
 struct AppBackend {
-    application: Application,
+    application: ApplicationSlot,
     registry: CommandRegistry,
     project_root: String,
     project_branch: Option<String>,
     agent_instructions: Option<AgentInstructionsFile>,
     seed_session_settings: BTreeMap<String, String>,
     provider_config_path: PathBuf,
+    global_model_config_path: PathBuf,
     vector_config_path: PathBuf,
     mcp_config_path: PathBuf,
     mcp_configs: BTreeMap<String, McpServerConfig>,
@@ -530,7 +679,14 @@ struct AppBackend {
     permission_rules: BTreeMap<String, PermissionRule>,
     event_log_subscription: EventSubscription,
     event_log: VecDeque<EventEnvelope>,
+    prompt_cache_input_tokens: u64,
+    prompt_cache_read_tokens: u64,
+    prompt_cache_write_tokens: u64,
     background_team: Option<BackgroundTeam>,
+    background_single: Option<BackgroundSingleTask>,
+    async_single_tasks: bool,
+    background_session_title: Option<BackgroundSessionTitle>,
+    session_title_attempts: BTreeMap<SessionId, u8>,
     pending_credential: Option<PendingCredential>,
     pending_setup: Option<SetupState>,
     model_ready: bool,
@@ -596,9 +752,14 @@ enum VectorModelTarget {
 
 enum SetupState {
     ProviderName,
+    ProviderProtocolSelect {
+        provider_id: ProviderId,
+        display_name: String,
+    },
     ProviderUrl {
         provider_id: ProviderId,
         display_name: String,
+        protocol: ProviderProtocol,
     },
     ProviderKey {
         definition: ProviderDefinition,
@@ -608,6 +769,7 @@ enum SetupState {
         models: Vec<ModelId>,
     },
     ProviderSwitch,
+    ProviderKeyUpdateSelect,
     VectorSetupProvider,
     VectorCustomName,
     VectorCustomUrl {
@@ -659,6 +821,26 @@ struct BackgroundTeam {
     steering: SharedSteeringBuffer,
     cancellation_requested: bool,
     cancelled_tasks: BTreeSet<TaskId>,
+}
+
+struct BackgroundSingleTask {
+    receiver: Receiver<(Application, BackgroundSingleResult)>,
+    cancellation: CancellationToken,
+    cached_snapshot: TerminalSnapshot,
+}
+
+enum BackgroundSingleResult {
+    Task(Result<PlanView, String>),
+    ToolApproval(Result<ApprovedToolResult, String>),
+}
+
+struct ApprovedToolResult {
+    invocation_id: String,
+    status: String,
+}
+
+struct BackgroundSessionTitle {
+    receiver: Receiver<Result<SessionTitleOutcome, ApplicationError>>,
 }
 
 impl AppBackend {
@@ -807,7 +989,7 @@ impl AppBackend {
             }
             Err(error) => return Self::response_error(error),
         }
-        match self.application.select_model(provider_id, model_id) {
+        match self.select_global_default_model(provider_id, model_id) {
             Ok(model) => {
                 self.model_ready = true;
                 BackendResponse {
@@ -819,17 +1001,128 @@ impl AppBackend {
         }
     }
 
+    fn select_global_default_model(
+        &mut self,
+        provider_id: ProviderId,
+        model_id: ModelId,
+    ) -> Result<ModelView, String> {
+        let previous = self.application.model().ok();
+        let previous_ready = self.model_ready;
+        let provider_is_loaded = self.application.models().into_iter().any(|capability| {
+            capability.provider_id == provider_id && capability.model_id == model_id
+        });
+        let selected = if provider_is_loaded {
+            self.application
+                .select_model(provider_id.clone(), model_id.clone())
+                .map_err(|error| error.to_string())?
+        } else {
+            let catalog = load_provider_catalog(Path::new(&self.project_root))
+                .map_err(|error| error.to_string())?;
+            let definition = catalog
+                .get(&provider_id)
+                .ok_or_else(|| format!("Provider Catalog 中不存在 {provider_id}"))?
+                .clone();
+            if !definition
+                .routes
+                .iter()
+                .any(|route| route.models.iter().any(|candidate| candidate == &model_id))
+            {
+                return Err(format!("Provider {provider_id} 不提供模型 {model_id}"));
+            }
+            let credentials: Arc<dyn CredentialStore> = Arc::new(
+                OsCredentialStore::new("dev.openai.harness").map_err(|error| error.to_string())?,
+            );
+            let runtime = CatalogProviderRuntime::with_ureq(
+                default_model_cache_path(Path::new(&self.project_root)),
+                credentials,
+            )
+            .map_err(|error| error.to_string())?;
+            let provider = runtime
+                .build(definition)
+                .map_err(|error| error.to_string())?;
+            self.application
+                .register_and_select_provider(provider, provider_id.clone(), model_id.clone())
+                .map_err(|error| error.to_string())?
+        };
+        if let Err(error) = self.persist_selected_custom_provider(&provider_id) {
+            if let Some(previous) = previous {
+                let _ = self
+                    .application
+                    .select_model(previous.provider_id, previous.model_id);
+            }
+            self.model_ready = previous_ready;
+            return Err(format!("global-provider-selection-save: {error}"));
+        }
+        if let Err(error) =
+            save_global_model_selection(&self.global_model_config_path, &provider_id, &model_id)
+        {
+            if let Some(previous) = previous {
+                let _ = self
+                    .application
+                    .select_model(previous.provider_id, previous.model_id);
+            }
+            self.model_ready = previous_ready;
+            return Err(format!("global-model-selection-save: {error}"));
+        }
+        Ok(selected)
+    }
+
+    fn persist_selected_custom_provider(&self, provider_id: &ProviderId) -> Result<(), String> {
+        let catalog = load_provider_catalog(Path::new(&self.project_root))
+            .map_err(|error| error.to_string())?;
+        let Some(provider) = catalog.get(provider_id) else {
+            return Ok(());
+        };
+        if provider.source != ProviderSource::Project {
+            return Ok(());
+        }
+        catalog
+            .save_project_file(&self.provider_config_path)
+            .map_err(|error| error.to_string())
+    }
+
     fn input_suggestions(&self, input: &str) -> Vec<InputSuggestion> {
         if self.pending_setup.is_some() && !input.trim().is_empty() && is_setup_cancel_value(input)
         {
             return Vec::new();
         }
+        if matches!(
+            self.pending_setup,
+            Some(SetupState::ProviderProtocolSelect { .. })
+        ) {
+            let prefix = input.trim().to_ascii_lowercase();
+            let pack = self.language().pack();
+            return [
+                (
+                    "responses",
+                    "OpenAI Responses",
+                    pack.provider_protocol_responses,
+                ),
+                (
+                    "chat",
+                    "OpenAI Chat Completions",
+                    pack.provider_protocol_chat,
+                ),
+                (
+                    "messages",
+                    "Anthropic Messages",
+                    pack.provider_protocol_messages,
+                ),
+            ]
+            .into_iter()
+            .filter(|(id, name, _)| {
+                id.starts_with(&prefix) || name.to_ascii_lowercase().contains(&prefix)
+            })
+            .map(|(id, name, description)| InputSuggestion::new(id, name, description))
+            .collect();
+        }
         if matches!(self.pending_setup, Some(SetupState::VectorSetupProvider)) {
             let prefix = input.trim().to_ascii_lowercase();
+            let pack = self.language().pack();
             return [
-                ("voyage", "Voyage AI", "built-in · recommended first"),
-                ("jina", "Jina AI", "built-in · multilingual/code models"),
-                ("custom", "Custom", "named URL + multiple model IDs"),
+                ("voyage", "Voyage AI", pack.vector_voyage_option),
+                ("jina", "Jina AI", pack.vector_jina_option),
+                ("custom", "Custom", pack.vector_custom_option),
             ]
             .into_iter()
             .filter(|(id, name, _)| {
@@ -863,6 +1156,7 @@ impl AppBackend {
         }
         if let Some(SetupState::VectorModelSelect { target }) = &self.pending_setup {
             let prefix = input.trim().to_ascii_lowercase();
+            let pack = self.language().pack();
             return self
                 .vector_target_provider(target)
                 .map(|provider| {
@@ -875,8 +1169,10 @@ impl AppBackend {
                                 model.id.clone(),
                                 model.id,
                                 model.dimensions.map_or_else(
-                                    || "unverified embedding model".to_owned(),
-                                    |dimensions| format!("verified · {dimensions}d"),
+                                    || pack.vector_model_verify_on_select.to_owned(),
+                                    |dimensions| {
+                                        format!("{} · {dimensions}d", pack.vector_model_verified)
+                                    },
                                 ),
                             )
                         })
@@ -894,6 +1190,8 @@ impl AppBackend {
                 .filter(|session| !session.current)
                 .filter(|session| {
                     session.session_id.as_str().to_lowercase().contains(&prefix)
+                        || short_session_id(&session.session_id)
+                            .contains(prefix.trim_start_matches('#'))
                         || session
                             .title
                             .as_deref()
@@ -904,14 +1202,15 @@ impl AppBackend {
                 .map(|session| {
                     InputSuggestion::new(
                         session.session_id.to_string(),
-                        session
-                            .title
-                            .clone()
-                            .unwrap_or_else(|| "未命名会话".to_owned()),
                         format!(
-                            "{} · {:?} · v{}",
-                            session.session_id, session.status, session.version
+                            "{}  {}",
+                            session
+                                .title
+                                .clone()
+                                .unwrap_or_else(|| "未命名会话".to_owned()),
+                            short_session_label(&session.session_id)
                         ),
+                        format!("{:?} · v{}", session.status, session.version),
                     )
                 })
                 .collect();
@@ -931,15 +1230,11 @@ impl AppBackend {
                 })
                 .collect();
         }
-        if matches!(self.pending_setup, Some(SetupState::ProviderSwitch)) {
-            let prefix = input.trim();
-            let pack = self.language().pack();
-            let available = self
-                .application
-                .models()
-                .into_iter()
-                .map(|model| model.provider_id)
-                .collect::<BTreeSet<_>>();
+        if matches!(
+            self.pending_setup,
+            Some(SetupState::ProviderKeyUpdateSelect)
+        ) {
+            let prefix = input.trim().to_ascii_lowercase();
             let Ok(catalog) = load_provider_catalog(Path::new(&self.project_root)) else {
                 return Vec::new();
             };
@@ -947,7 +1242,38 @@ impl AppBackend {
                 .list()
                 .into_iter()
                 .filter(|provider| {
-                    available.contains(&provider.id) && provider.id.as_str().starts_with(prefix)
+                    provider_key_update_candidate(
+                        provider,
+                        &prefix,
+                        self.provider_credential_ready(&provider.id)
+                            .unwrap_or(false),
+                    )
+                })
+                .map(|provider| {
+                    InputSuggestion::new(
+                        provider.id.to_string(),
+                        format!("{} · {}", provider.id, provider.display_name),
+                        "API key · configured".to_owned(),
+                    )
+                })
+                .collect();
+        }
+        if matches!(self.pending_setup, Some(SetupState::ProviderSwitch)) {
+            let prefix = input.trim().to_ascii_lowercase();
+            let pack = self.language().pack();
+            let Ok(catalog) = load_provider_catalog(Path::new(&self.project_root)) else {
+                return Vec::new();
+            };
+            return catalog
+                .list()
+                .into_iter()
+                .filter(|provider| {
+                    provider
+                        .id
+                        .as_str()
+                        .to_ascii_lowercase()
+                        .starts_with(&prefix)
+                        || provider.display_name.to_ascii_lowercase().contains(&prefix)
                 })
                 .map(|provider| {
                     InputSuggestion::new(
@@ -1154,13 +1480,74 @@ impl AppBackend {
 
     fn start_provider_switch(&mut self) -> BackendResponse {
         let pack = self.language().pack();
+        let catalog = match load_provider_catalog(Path::new(&self.project_root)) {
+            Ok(catalog) => catalog,
+            Err(error) => return Self::response_error(error),
+        };
+        let providers = catalog.list();
+        let custom_count = providers
+            .iter()
+            .filter(|provider| provider.source == ProviderSource::Project)
+            .count();
         self.pending_setup = Some(SetupState::ProviderSwitch);
         BackendResponse {
-            lines: vec![pack.provider_switch_prompt.to_owned()],
+            lines: vec![format!(
+                "{} · {} providers · {} custom",
+                pack.provider_switch_prompt,
+                providers.len(),
+                custom_count
+            )],
             clear_view: true,
             input_prompt: Some(InputPrompt {
                 request_id: "provider-switch".to_owned(),
                 prompt: pack.provider_switch_prompt.to_owned(),
+                placeholder: Some(pack.select_confirm.to_owned()),
+            }),
+            ..BackendResponse::default()
+        }
+    }
+
+    fn start_provider_key_update(&mut self, provider_id: Option<String>) -> BackendResponse {
+        if let Some(provider_id) = provider_id {
+            let id = ProviderId::from(provider_id.clone());
+            match self.provider_credential_ready(&id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Self::response_error(format!(
+                        "Provider {id} 尚未配置 Key；请先使用 /connect {id}"
+                    ));
+                }
+                Err(error) => return Self::response_error(error),
+            }
+            return self.begin_provider_connect(Some(provider_id));
+        }
+        let pack = self.language().pack();
+        let configured_count = load_provider_catalog(Path::new(&self.project_root))
+            .map(|catalog| {
+                catalog
+                    .list()
+                    .into_iter()
+                    .filter(|provider| {
+                        provider_key_update_candidate(
+                            provider,
+                            "",
+                            self.provider_credential_ready(&provider.id)
+                                .unwrap_or(false),
+                        )
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        self.pending_setup = Some(SetupState::ProviderKeyUpdateSelect);
+        BackendResponse {
+            lines: vec![format!(
+                "{} · {} configured",
+                pack.provider_key_update_prompt, configured_count
+            )],
+            clear_view: true,
+            input_prompt: Some(InputPrompt {
+                request_id: "provider-key-update-select".to_owned(),
+                prompt: pack.provider_key_update_prompt.to_owned(),
                 placeholder: Some(pack.select_confirm.to_owned()),
             }),
             ..BackendResponse::default()
@@ -1247,18 +1634,24 @@ impl AppBackend {
             provider.display_name, provider.id
         ))
         .chain(provider.models.iter().map(|model| {
-            format!(
-                "{}{} · {}",
-                if provider.active_model.as_deref() == Some(model.id.as_str()) {
-                    "* "
-                } else {
-                    "  "
+            let active = provider.active_model.as_deref() == Some(model.id.as_str());
+            model.dimensions.map_or_else(
+                || {
+                    format!(
+                        "{} {} · {}",
+                        if active { "*" } else { "-" },
+                        model.id,
+                        self.language().pack().vector_model_verify_on_select
+                    )
                 },
-                model.id,
-                model.dimensions.map_or_else(
-                    || "unverified".to_owned(),
-                    |dimensions| format!("{dimensions}d · {:?}", model.dimension_mode)
-                )
+                |dimensions| {
+                    format!(
+                        "{} {} · {dimensions}d · {}",
+                        if active { "*" } else { "-" },
+                        model.id,
+                        self.language().pack().vector_model_verified
+                    )
+                },
             )
         }))
         .collect();
@@ -1406,37 +1799,37 @@ impl AppBackend {
             self.save_vector_catalog(&catalog)?;
             Ok(catalog)
         })();
-        if let Err(error) = commit {
-            if let VectorModelTarget::Add {
-                provider,
-                previous_secret,
-            } = target
-                && let Ok(store) = OsCredentialStore::new("dev.openai.harness")
-            {
-                restore_vector_credential(&store, &provider.credential_id, previous_secret);
+        let catalog = match commit {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                if let VectorModelTarget::Add {
+                    provider,
+                    previous_secret,
+                } = target
+                    && let Ok(store) = OsCredentialStore::new("dev.openai.harness")
+                {
+                    restore_vector_credential(&store, &provider.credential_id, previous_secret);
+                }
+                return Self::response_error(error);
             }
-            return Self::response_error(error);
-        }
+        };
         self.vector_health = VectorHealth::Healthy {
             dimensions: verified_model.dimensions.unwrap_or_default(),
             dimension_mode: verified_model.dimension_mode.unwrap_or_default(),
         };
+        let provider_name = catalog
+            .provider(&provider_id)
+            .map(|provider| provider.display_name.as_str())
+            .unwrap_or(provider_id.as_str());
+        let pack = self.language().pack();
         BackendResponse {
-            lines: vec![
-                format!("Vector Provider: {provider_id}"),
-                format!(
-                    "Vector Model: {} · {}d · {:?}",
-                    verified_model.id,
-                    verified_model.dimensions.unwrap_or_default(),
-                    verified_model.dimension_mode.unwrap_or_default()
-                ),
-                format!(
-                    "Global · {} · {}",
-                    self.vector_config_path.display(),
-                    self.language().pack().vector_saved_restart
-                ),
-            ],
-            clear_view: true,
+            lines: vec![format!(
+                "✓ {} · {provider_name} / {} · {}d · {}",
+                pack.vector_enabled,
+                verified_model.id,
+                verified_model.dimensions.unwrap_or_default(),
+                pack.global_configuration
+            )],
             ..BackendResponse::default()
         }
     }
@@ -1591,12 +1984,60 @@ impl AppBackend {
                         );
                     }
                 };
-                self.pending_setup = Some(SetupState::ProviderUrl {
+                self.pending_setup = Some(SetupState::ProviderProtocolSelect {
                     provider_id: provider_id.clone(),
                     display_name: value.clone(),
                 });
                 BackendResponse {
                     lines: vec![format!("Provider ID: {provider_id}")],
+                    input_prompt: Some(InputPrompt {
+                        request_id: "provider-add-protocol".to_owned(),
+                        prompt: self.language().pack().provider_protocol_prompt.to_owned(),
+                        placeholder: Some(self.language().pack().select_confirm.to_owned()),
+                    }),
+                    ..BackendResponse::default()
+                }
+            }
+            (
+                SetupState::ProviderProtocolSelect {
+                    provider_id,
+                    display_name,
+                },
+                "provider-add-protocol",
+            ) => {
+                let protocol = match value.to_ascii_lowercase().as_str() {
+                    "responses" | "response" | "openai-responses" => {
+                        ProviderProtocol::OpenaiResponses
+                    }
+                    "chat" | "chat-completions" | "openai-chat" => ProviderProtocol::OpenaiChat,
+                    "messages" | "message" | "anthropic-messages" => {
+                        ProviderProtocol::AnthropicMessages
+                    }
+                    _ => {
+                        return self.retry_setup_input(
+                            SetupState::ProviderProtocolSelect {
+                                provider_id,
+                                display_name,
+                            },
+                            "provider-add-protocol",
+                            self.language().pack().provider_protocol_prompt,
+                            Some(self.language().pack().select_confirm.to_owned()),
+                            "仅支持 responses、chat、messages",
+                        );
+                    }
+                };
+                let protocol_name = match protocol {
+                    ProviderProtocol::OpenaiResponses => "OpenAI Responses",
+                    ProviderProtocol::OpenaiChat => "OpenAI Chat Completions",
+                    ProviderProtocol::AnthropicMessages => "Anthropic Messages",
+                };
+                self.pending_setup = Some(SetupState::ProviderUrl {
+                    provider_id,
+                    display_name,
+                    protocol,
+                });
+                BackendResponse {
+                    lines: vec![format!("Protocol · {protocol_name}")],
                     input_prompt: Some(InputPrompt {
                         request_id: "provider-add-url".to_owned(),
                         prompt: self.language().pack().provider_url_prompt.to_owned(),
@@ -1609,17 +2050,19 @@ impl AppBackend {
                 SetupState::ProviderUrl {
                     provider_id,
                     display_name,
+                    protocol,
                 },
                 "provider-add-url",
             ) => {
-                let (base, route_endpoint, discovery_endpoint) =
-                    match normalize_openai_base_url(&value) {
+                let (base, route_endpoint, discovery_endpoint, discovery_format, discovery_auth) =
+                    match custom_provider_route(&value, protocol) {
                         Ok(endpoints) => endpoints,
                         Err(error) => {
                             return self.retry_setup_input(
                                 SetupState::ProviderUrl {
                                     provider_id,
                                     display_name,
+                                    protocol,
                                 },
                                 "provider-add-url",
                                 self.language().pack().provider_url_prompt,
@@ -1638,16 +2081,16 @@ impl AppBackend {
                     credential_id: None,
                     credential_required: true,
                     routes: vec![ProviderRouteDefinition {
-                        protocol: ProviderProtocol::OpenaiChat,
+                        protocol,
                         endpoint: route_endpoint,
                         models: vec![ModelId::from("pending-model")],
                         reasoning_field: None,
                     }],
                     default_model: None,
                     discovery: Some(ProviderDiscoveryDefinition {
-                        format: ProviderDiscoveryFormat::OpenaiModels,
+                        format: discovery_format,
                         endpoint: discovery_endpoint,
-                        auth: ProviderDiscoveryAuth::Bearer,
+                        auth: discovery_auth,
                         routing: ProviderDiscoveryRouting::SingleRouteAdditive,
                     }),
                     source: ProviderSource::Project,
@@ -1735,12 +2178,31 @@ impl AppBackend {
                         return Self::response_error(error);
                     }
                 };
+                let previous_model = self.application.model().ok();
+                let previous_ready = self.model_ready;
                 match self.application.register_and_select_provider(
                     provider,
                     definition.id.clone(),
                     model.clone(),
                 ) {
                     Ok(view) => {
+                        if let Err(error) = save_global_model_selection(
+                            &self.global_model_config_path,
+                            &definition.id,
+                            &model,
+                        ) {
+                            if let Some(previous_model) = previous_model {
+                                let _ = self.application.select_model(
+                                    previous_model.provider_id,
+                                    previous_model.model_id,
+                                );
+                            }
+                            self.model_ready = previous_ready;
+                            self.rollback_provider_setup(&previous, &definition);
+                            return Self::response_error(format!(
+                                "global-model-selection-save: {error}"
+                            ));
+                        }
                         self.model_ready = true;
                         let pack = self.language().pack();
                         BackendResponse {
@@ -1791,10 +2253,7 @@ impl AppBackend {
                 let Some(model) = default_model_for_provider(&self.application, definition) else {
                     return Self::response_error("Provider 没有可切换模型");
                 };
-                match self
-                    .application
-                    .select_model(provider_id.clone(), model.clone())
-                {
+                match self.select_global_default_model(provider_id.clone(), model.clone()) {
                     Ok(view) => {
                         self.model_ready = true;
                         let pack = self.language().pack();
@@ -1811,6 +2270,19 @@ impl AppBackend {
                     }
                     Err(error) => Self::response_error(error),
                 }
+            }
+            (SetupState::ProviderKeyUpdateSelect, "provider-key-update-select") => {
+                let provider_id = value.trim().to_owned();
+                if provider_id.is_empty() {
+                    return self.retry_setup_input(
+                        SetupState::ProviderKeyUpdateSelect,
+                        "provider-key-update-select",
+                        self.language().pack().provider_key_update_prompt,
+                        Some(self.language().pack().select_confirm.to_owned()),
+                        "Provider 不能为空",
+                    );
+                }
+                self.start_provider_key_update(Some(provider_id))
             }
             (SetupState::VectorSetupProvider, "vector-setup-provider") => {
                 let selection = value.to_ascii_lowercase();
@@ -2380,10 +2852,15 @@ impl AppBackend {
         };
         let removed = match catalog.remove_project(&provider_id) {
             Ok(Some(provider)) => provider,
-            Ok(None) => return Self::response_error("项目级 Provider 不存在"),
+            Ok(None) => return Self::response_error("自定义 Provider 不存在"),
             Err(error) => return Self::response_error(error),
         };
         if let Err(error) = catalog.save_project_file(&self.provider_config_path) {
+            return Self::response_error(error);
+        }
+        if let Err(error) =
+            clear_global_model_selection_for_provider(&self.global_model_config_path, &provider_id)
+        {
             return Self::response_error(error);
         }
         Self::delete_provider_credential(&removed);
@@ -2402,7 +2879,7 @@ impl AppBackend {
         }
         BackendResponse {
             lines: vec![format!(
-                "Project Provider removed: {provider_id}{}",
+                "Provider removed: {provider_id}{}",
                 if was_current {
                     " · current model is now unconfigured"
                 } else {
@@ -2682,7 +3159,7 @@ impl AppBackend {
                 "{}  {} · {} · {:?}",
                 pack.session_label,
                 status.session_title.as_deref().unwrap_or("未命名会话"),
-                status.session_id,
+                short_session_label(&status.session_id),
                 status.session_status
             ),
             format!(
@@ -2716,6 +3193,16 @@ impl AppBackend {
             .find(|session| session.session_id.as_str() == target)
         {
             return Ok(session.session_id.clone());
+        }
+        let short_target = target.strip_prefix('#').unwrap_or(target);
+        let short_matches = sessions
+            .iter()
+            .filter(|session| short_session_id(&session.session_id) == short_target)
+            .collect::<Vec<_>>();
+        match short_matches.as_slice() {
+            [session] => return Ok(session.session_id.clone()),
+            [] => {}
+            _ => return Err("Session 短 ID 冲突；请使用完整 ID 或标题".to_owned()),
         }
         let matches = sessions
             .into_iter()
@@ -2760,7 +3247,7 @@ impl AppBackend {
         let mut lines = vec![format!(
             "Session · {} · {}",
             status.session_title.as_deref().unwrap_or("未命名会话"),
-            status.session_id
+            short_session_label(&status.session_id)
         )];
         if let Ok(history) = self.application.conversation_history(200) {
             lines.extend(history.into_iter().map(|entry| {
@@ -2816,7 +3303,7 @@ impl AppBackend {
             format!(
                 "{} · {}{} · {:?} · updated={} · version={} · goal={} · parent={} · checkpoint={}",
                 session.title.as_deref().unwrap_or("未命名会话"),
-                session.session_id,
+                short_session_label(&session.session_id),
                 if session.current { " [current]" } else { "" },
                 session.status,
                 session.updated_at_millis,
@@ -2825,7 +3312,7 @@ impl AppBackend {
                 session
                     .parent_session_id
                     .as_ref()
-                    .map_or_else(|| "<none>".to_owned(), ToString::to_string),
+                    .map_or_else(|| "<none>".to_owned(), short_session_label),
                 session
                     .forked_from_checkpoint_id
                     .as_ref()
@@ -2936,7 +3423,7 @@ impl AppBackend {
                 )]
             }),
             "vector" => self.vector_settings_lines(),
-            "cache" => Ok(Self::cache_lines(&self.application.cache())),
+            "cache" => Ok(self.cache_lines(&self.application.cache())),
             "mcp" => self.application.mcp_servers().map(|servers| {
                 vec![format!(
                     "MCP servers={} enabled={} ready={} · config={}",
@@ -3024,6 +3511,7 @@ impl AppBackend {
     fn vector_settings_lines(&self) -> Result<Vec<String>, ApplicationError> {
         let memory = self.application.memory_view()?;
         let repository = self.application.repository_view()?;
+        let benefit = self.application.retrieval_benefit();
         let mut lines = Self::config_lines(&self.application.config(), Some("vector"), false);
         lines.push(format!("Vector {:?}", memory.semantic));
         match self.load_vector_catalog() {
@@ -3103,14 +3591,94 @@ impl AppBackend {
             format!("Hybrid Search    {hybrid}"),
             format!("Reranking        {reranking}"),
             format!("Index Code       on · {} files", repository.file_count),
+            format!(
+                "Vector Coverage   memory={} · repository={} · queries={}",
+                memory.memory_embedding_count,
+                memory.repository_embedding_count,
+                memory.query_embedding_count
+            ),
+            format!(
+                "Embedding Cache   hits={} · writes={}",
+                memory.embedding_cache_hits, memory.embedding_cache_writes
+            ),
+            format!(
+                "Semantic Benefit  searches={} · repository-reranks={}",
+                memory.semantic_searches, memory.semantic_reranks
+            ),
+            format!(
+                "Task Retrieval    requests={} · vector={} · degraded={}",
+                benefit.retrieval_requests,
+                benefit.vector_requests,
+                benefit.degraded_requests
+            ),
+            format!(
+                "Injected Context memory={} · repository={} · tokens={} · rank-promotions={}",
+                benefit.memory_items_injected,
+                benefit.repository_items_injected,
+                benefit.retrieval_tokens_injected,
+                benefit.repository_rank_promotions
+            ),
+            format!(
+                "Knowledge Writes agent={} · failures={}",
+                benefit.agent_knowledge_writes, benefit.failure_knowledge_writes
+            ),
+            format!(
+                "Context Compact   runs={} · vector-runs={} · anchors={} · tokens-saved={}",
+                benefit.context_compactions,
+                benefit.context_vector_runs,
+                benefit.context_vector_anchors,
+                benefit.context_tokens_saved
+            ),
+            format!(
+                "Summary Quality   model={} · safe-fallback={}",
+                benefit.context_model_summaries, benefit.context_fallback_summaries
+            ),
+            "Agent Knowledge    on · contracts/architecture/decisions/lessons/verifications/failures"
+                .to_owned(),
             "Index Chat       off · Session Context is not embedded by default".to_owned(),
             format!("Vector Schema    {}", memory.vector_schema_present),
         ]);
         Ok(lines)
     }
 
+    fn vector_runtime_status(&self) -> VectorRuntimeStatus {
+        match &self.vector_health {
+            VectorHealth::Missing => VectorRuntimeStatus::Unconfigured,
+            VectorHealth::Unhealthy { .. } => VectorRuntimeStatus::Degraded,
+            VectorHealth::Healthy { .. } => match self
+                .application
+                .memory_view()
+                .ok()
+                .map(|view| view.semantic)
+            {
+                Some(SemanticCapability::Active { .. }) => VectorRuntimeStatus::Active,
+                Some(SemanticCapability::Blocked { .. } | SemanticCapability::Degraded { .. }) => {
+                    VectorRuntimeStatus::Degraded
+                }
+                Some(SemanticCapability::Ready { .. } | SemanticCapability::Absent { .. })
+                | None => VectorRuntimeStatus::Ready,
+            },
+        }
+    }
+
     fn drain_event_log(&mut self) {
         while let Ok(envelope) = self.event_log_subscription.try_recv() {
+            if let HarnessEvent::ModelUsage {
+                input_tokens,
+                cached_input_tokens,
+                cache_write_tokens,
+                ..
+            } = &envelope.event
+            {
+                self.prompt_cache_input_tokens =
+                    self.prompt_cache_input_tokens.saturating_add(*input_tokens);
+                self.prompt_cache_read_tokens = self
+                    .prompt_cache_read_tokens
+                    .saturating_add(*cached_input_tokens);
+                self.prompt_cache_write_tokens = self
+                    .prompt_cache_write_tokens
+                    .saturating_add(*cache_write_tokens);
+            }
             self.event_log.push_back(envelope);
             while self.event_log.len() > 1_024 {
                 self.event_log.pop_front();
@@ -3275,7 +3843,7 @@ impl AppBackend {
                 repository.revision
             ));
         }
-        lines.extend(Self::cache_lines(&self.application.cache()));
+        lines.extend(self.cache_lines(&self.application.cache()));
         if let Ok(profile) = self.application.profile() {
             lines.extend(Self::profile_lines(&profile));
         }
@@ -3410,7 +3978,7 @@ impl AppBackend {
                     view.revision
                 )]
             }),
-            "cache" => Ok(Self::cache_lines(&self.application.cache())),
+            "cache" => Ok(self.cache_lines(&self.application.cache())),
             "tool" | "tools" => self.application.tools().map(|view| Self::tool_lines(&view)),
             "agent" | "agents" => self
                 .application
@@ -3734,7 +4302,22 @@ impl AppBackend {
         ]
     }
 
-    fn cache_lines(cache: &CacheView) -> Vec<String> {
+    fn prompt_cache_metrics(&self) -> (u64, u64, u64, Option<u8>) {
+        let rate = (self.prompt_cache_input_tokens != 0).then(|| {
+            u8::try_from(
+                self.prompt_cache_read_tokens.saturating_mul(100) / self.prompt_cache_input_tokens,
+            )
+            .unwrap_or(100)
+        });
+        (
+            self.prompt_cache_input_tokens,
+            self.prompt_cache_read_tokens,
+            self.prompt_cache_write_tokens,
+            rate,
+        )
+    }
+
+    fn cache_lines(&self, cache: &CacheView) -> Vec<String> {
         let rate = cache
             .effective_hit_rate_percent
             .map_or_else(|| "n/a".to_owned(), |value| format!("{value}%"));
@@ -3755,6 +4338,12 @@ impl AppBackend {
                 l2.hits, l2.misses, l2.writes, l2.evictions, l2.rejected_writes
             ));
         }
+        let (input, cached, written, prompt_rate) = self.prompt_cache_metrics();
+        let prompt_rate = prompt_rate.map_or_else(|| "n/a".to_owned(), |value| format!("{value}%"));
+        lines.push(format!(
+            "{} {prompt_rate} · input={input} read={cached} write={written}",
+            self.language().pack().prompt_cache_label
+        ));
         lines
     }
 
@@ -3788,6 +4377,12 @@ impl AppBackend {
                 "{} tools={} structured={}",
                 pack.capability_label, model.tool_calling, model.structured_output
             ),
+            format!(
+                "Global default  {}/{} · {}",
+                model.provider_id,
+                model.model_id,
+                self.global_model_config_path.display()
+            ),
         ]
     }
 
@@ -3801,7 +4396,7 @@ impl AppBackend {
     }
 
     fn agent_lines(agent: &AgentView) -> Vec<String> {
-        vec![
+        let mut lines = vec![
             format!("Agent     {} · {}", agent.id, agent.name),
             format!(
                 "State     {:?} · active {}/{}",
@@ -3810,6 +4405,28 @@ impl AppBackend {
             format!("Roles     {:?}", agent.roles),
             format!("Capability {}", agent.capabilities.join(", ")),
             format!(
+                "Profile    {} · schema={} · SOP={} · output={} · evidence={}",
+                agent.profile_id,
+                agent.profile_schema_version,
+                agent.procedure_steps,
+                agent.output_sections,
+                agent.evidence_requirements
+            ),
+            format!("Mission    {}", agent.mission),
+            format!(
+                "Model      recommended={:?} · turns={}/{} · output={} · tools={}",
+                agent.recommended_reasoning,
+                agent.profile_target_turns,
+                agent.profile_max_turns,
+                agent.profile_max_output_tokens,
+                agent.profile_max_tool_calls
+            ),
+            format!(
+                "Memory     read={} · write={}",
+                agent.memory_read_scopes.join(","),
+                agent.memory_write_scope.as_deref().unwrap_or("none")
+            ),
+            format!(
                 "Boundary  {}",
                 if agent.control_plane {
                     "control-plane / 禁止编码"
@@ -3817,7 +4434,45 @@ impl AppBackend {
                     "worker"
                 }
             ),
-        ]
+        ];
+        lines.push("SOP".to_owned());
+        lines.extend(agent.procedure.iter().map(|step| format!("  - {step}")));
+        lines.push("Output Contract".to_owned());
+        lines.extend(
+            agent
+                .output_contract
+                .iter()
+                .map(|item| format!("  - {item}")),
+        );
+        lines.push("Evidence Contract".to_owned());
+        lines.extend(
+            agent
+                .evidence_contract
+                .iter()
+                .map(|item| format!("  - {item}")),
+        );
+        lines.push("Failure Policy".to_owned());
+        lines.extend(
+            agent
+                .failure_policy
+                .iter()
+                .map(|item| format!("  - {item}")),
+        );
+        lines.push("Public Methodology".to_owned());
+        lines.extend(
+            agent
+                .methodology_sources
+                .iter()
+                .map(|item| format!("  - {item}")),
+        );
+        lines.push("Completion Gate".to_owned());
+        lines.extend(
+            agent
+                .completion_gate
+                .iter()
+                .map(|item| format!("  - {item}")),
+        );
+        lines
     }
 
     fn team_lines(team: &AgentTeamView, mode: AgentDisplayMode) -> Vec<String> {
@@ -3970,6 +4625,141 @@ impl AppBackend {
         self.launch_background_team(prepared, format!("agents={count}"))
     }
 
+    fn start_background_single_task(&mut self, prompt: String) -> BackendResponse {
+        if self.background_single.is_some() || self.background_team.is_some() {
+            return Self::response_error("已有任务正在运行");
+        }
+        let mut cached_snapshot = self.snapshot();
+        cached_snapshot.agents = cached_snapshot.agents.max(1);
+        cached_snapshot.active_agents = vec![TerminalAgentBadge {
+            name: "Coder".to_owned(),
+            state: TerminalAgentState::Running,
+        }];
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let worker_prompt = prompt.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut application = self.application.take();
+        thread::spawn(move || {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                application
+                    .run_fake_task_cancellable(&worker_prompt, worker_cancellation)
+                    .map_err(|error| error.to_string())
+            }))
+            .unwrap_or_else(|_| Err("background-single-task-panicked".to_owned()));
+            let _ = sender.send((application, BackgroundSingleResult::Task(result)));
+        });
+        self.background_single = Some(BackgroundSingleTask {
+            receiver,
+            cancellation,
+            cached_snapshot,
+        });
+        BackendResponse {
+            lines: vec!["[RUN] 已发送 · 正在连接模型".to_owned()],
+            ..BackendResponse::default()
+        }
+    }
+
+    fn start_background_tool_approval(
+        &mut self,
+        invocation_id: String,
+        scope: GrantScope,
+    ) -> BackendResponse {
+        if self.background_single.is_some() || self.background_team.is_some() {
+            return Self::response_error("已有任务正在运行");
+        }
+        let mut cached_snapshot = self.snapshot();
+        cached_snapshot.agents = cached_snapshot.agents.max(1);
+        cached_snapshot.active_agents = vec![TerminalAgentBadge {
+            name: "Coder".to_owned(),
+            state: TerminalAgentState::Running,
+        }];
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let worker_invocation_id = invocation_id.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut application = self.application.take();
+        thread::spawn(move || {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                application
+                    .approve_tool_cancellable(
+                        ToolInvocationId::from(worker_invocation_id),
+                        scope,
+                        worker_cancellation,
+                    )
+                    .map(|invocation| ApprovedToolResult {
+                        invocation_id: invocation.id.to_string(),
+                        status: format!("{:?}", invocation.status),
+                    })
+                    .map_err(|error| error.to_string())
+            }))
+            .unwrap_or_else(|_| Err("background-tool-approval-panicked".to_owned()));
+            let _ = sender.send((application, BackgroundSingleResult::ToolApproval(result)));
+        });
+        self.background_single = Some(BackgroundSingleTask {
+            receiver,
+            cancellation,
+            cached_snapshot,
+        });
+        BackendResponse {
+            lines: vec![format!("[RUN] 已批准 Tool {invocation_id} · 正在继续任务")],
+            ..BackendResponse::default()
+        }
+    }
+
+    fn poll_background_single_task(&mut self) -> BackendResponse {
+        let poll = match self.background_single.as_ref() {
+            None => return BackendResponse::default(),
+            Some(background) => match background.receiver.try_recv() {
+                Ok(result) => Some(Ok(result)),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Err(())),
+            },
+        };
+        let Some(poll) = poll else {
+            return BackendResponse::default();
+        };
+        let _background = self.background_single.take().expect("刚检查后台任务");
+        match poll {
+            Ok((application, result)) => {
+                self.application.restore(application);
+                match result {
+                    BackgroundSingleResult::Task(Ok(plan)) => BackendResponse {
+                        lines: vec![format!(
+                            "[DONE] 任务完成 · accepted={} blocked={}",
+                            plan.accepted, plan.blocked
+                        )],
+                        ..BackendResponse::default()
+                    },
+                    BackgroundSingleResult::Task(Err(error)) => Self::response_error(error),
+                    BackgroundSingleResult::ToolApproval(Ok(approved)) => {
+                        let line = format!(
+                            "[DONE] Tool {} · {}",
+                            approved.invocation_id, approved.status
+                        );
+                        if let Some(prepared) = self.application.take_ready_parallel_resume() {
+                            let mut response = self.launch_background_team(
+                                prepared,
+                                "approved-tool-continuation=true".to_owned(),
+                            );
+                            response.lines.insert(0, line);
+                            response
+                        } else {
+                            BackendResponse {
+                                lines: vec![line],
+                                ..BackendResponse::default()
+                            }
+                        }
+                    }
+                    BackgroundSingleResult::ToolApproval(Err(error)) => Self::response_error(error),
+                }
+            }
+            Err(()) => {
+                Self::response_error("后台任务线程异常退出；Application 未返回，请重新启动当前会话")
+            }
+        }
+    }
+
     fn launch_background_team(
         &mut self,
         prepared: PreparedAgentTeam,
@@ -4102,6 +4892,40 @@ impl AppBackend {
         }
     }
 
+    fn poll_session_title(&mut self) {
+        if let Some(background) = self.background_session_title.take() {
+            match background.receiver.try_recv() {
+                Ok(Ok(outcome)) => {
+                    let _ = self.application.apply_session_title_outcome(outcome);
+                }
+                Ok(Err(_)) | Err(TryRecvError::Disconnected) => {}
+                Err(TryRecvError::Empty) => {
+                    self.background_session_title = Some(background);
+                    return;
+                }
+            }
+        }
+        let Ok(Some(job)) = self.application.prepare_session_title_job() else {
+            return;
+        };
+        let session_id = job.session_id().clone();
+        let attempts = self
+            .session_title_attempts
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0);
+        if attempts >= 2 {
+            return;
+        }
+        self.session_title_attempts
+            .insert(session_id, attempts.saturating_add(1));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let _ = sender.send(job.execute());
+        });
+        self.background_session_title = Some(BackgroundSessionTitle { receiver });
+    }
+
     fn tool_lines(view: &ToolRuntimeView) -> Vec<String> {
         let mut lines = vec![format!(
             "Tools {} · pending approvals {} · active grants {}",
@@ -4188,21 +5012,19 @@ impl TerminalBackend for AppBackend {
                 }
             })
             .collect::<Vec<_>>();
-        match &self.vector_health {
-            VectorHealth::Healthy { .. } => history.push(format!(
-                "[DONE] Global vector health · {}",
-                self.vector_health.summary()
-            )),
-            VectorHealth::Unhealthy { .. } => history.push(format!(
+        if let VectorHealth::Unhealthy { .. } = &self.vector_health {
+            history.push(format!(
                 "[WARN] Global vector health · {} · use /vector setup to repair",
                 self.vector_health.summary()
-            )),
-            VectorHealth::Missing => {}
+            ));
         }
         history
     }
 
     fn cycle_permission_mode(&mut self) -> BackendResponse {
+        if !self.application.is_available() {
+            return Self::response_error("任务运行期间不能切换权限模式");
+        }
         let current = self.application.config().settings.permission_mode;
         let next = match current {
             PermissionMode::Manual | PermissionMode::Safe => "edit",
@@ -4214,22 +5036,34 @@ impl TerminalBackend for AppBackend {
             .application
             .set_setting("permissions.mode", next, ConfigLayer::Session)
         {
-            Ok(view) => BackendResponse {
-                lines: Self::config_lines(&view, Some("permissions.mode"), false),
-                ..BackendResponse::default()
-            },
+            Ok(_) => BackendResponse::default(),
             Err(error) => Self::response_error(error),
         }
     }
 
     fn handle_input(&mut self, input: &str) -> BackendResponse {
         self.drain_event_log();
+        if matches!(input.trim().to_ascii_lowercase().as_str(), "clear" | "cls") {
+            return BackendResponse {
+                clear_view: true,
+                ..BackendResponse::default()
+            };
+        }
         let parsed = match self.registry.parse(input) {
             Ok(parsed) => parsed,
             Err(error) => return Self::response_error(error),
         };
         match parsed {
-            ParsedInput::Text(_) if !self.model_ready => self.model_not_configured_response(),
+            ParsedInput::Text(text) if self.background_single.is_some() => {
+                let mut response = Self::response_error("当前任务仍在运行；Ctrl+C 可取消");
+                response.restore_input = Some(text);
+                response
+            }
+            ParsedInput::Text(text) if !self.model_ready => {
+                let mut response = self.model_not_configured_response();
+                response.restore_input = Some(text);
+                response
+            }
             ParsedInput::Text(text) if self.background_team.is_some() => {
                 match self.application.steer(&text) {
                     Ok(steering) => {
@@ -4249,6 +5083,9 @@ impl TerminalBackend for AppBackend {
                     Err(error) => Self::response_error(error),
                 }
             }
+            ParsedInput::Text(text) if self.async_single_tasks => {
+                self.start_background_single_task(text)
+            }
             ParsedInput::Text(text) => match self.application.run_fake_task(&text) {
                 Ok(plan) => BackendResponse {
                     lines: Self::plan_lines(&plan),
@@ -4256,6 +5093,22 @@ impl TerminalBackend for AppBackend {
                 },
                 Err(error) => Self::response_error(error),
             },
+            ParsedInput::Command(SlashCommand::Exit) if self.background_single.is_some() => {
+                let mut response = self.cancel_current();
+                response
+                    .lines
+                    .push("任务正在取消；完成收尾后再次 /exit".to_owned());
+                response
+            }
+            ParsedInput::Command(SlashCommand::Clear) if self.background_single.is_some() => {
+                BackendResponse {
+                    clear_view: true,
+                    ..BackendResponse::default()
+                }
+            }
+            ParsedInput::Command(_) if self.background_single.is_some() => {
+                Self::response_error("当前任务仍在运行；Ctrl+C 可取消")
+            }
             ParsedInput::Command(command)
                 if !self.model_ready && slash_requires_ready_model(&command) =>
             {
@@ -4484,6 +5337,12 @@ impl TerminalBackend for AppBackend {
                 SlashCommand::Approve {
                     invocation_id,
                     scope,
+                } if self.async_single_tasks => {
+                    self.start_background_tool_approval(invocation_id, scope)
+                }
+                SlashCommand::Approve {
+                    invocation_id,
+                    scope,
                 } => match self
                     .application
                     .approve_tool(ToolInvocationId::from(invocation_id), scope)
@@ -4507,7 +5366,7 @@ impl TerminalBackend for AppBackend {
                     Err(error) => Self::response_error(error),
                 },
                 SlashCommand::Cache => BackendResponse {
-                    lines: Self::cache_lines(&self.application.cache()),
+                    lines: self.cache_lines(&self.application.cache()),
                     ..BackendResponse::default()
                 },
                 SlashCommand::Checkpoint { name } => {
@@ -4527,9 +5386,15 @@ impl TerminalBackend for AppBackend {
                         return match self.application.auto_compact_if_needed() {
                             Ok(Some(compaction)) => BackendResponse {
                                 lines: vec![format!(
-                                    "Auto compacted · {} → {} tokens · checkpoint {}",
+                                    "Auto compacted · {} → {} tokens · method={} · anchor-method={} anchors={} · requirements={} decisions={} blockers={} · checkpoint {}",
                                     compaction.token_cost_before,
                                     compaction.token_cost_after,
+                                    compaction.summary_method,
+                                    compaction.anchor_method,
+                                    compaction.semantic_anchor_count,
+                                    compaction.requirement_count,
+                                    compaction.decision_count,
+                                    compaction.blocker_count,
                                     compaction.checkpoint_id
                                 )],
                                 ..BackendResponse::default()
@@ -4555,10 +5420,16 @@ impl TerminalBackend for AppBackend {
                     match self.application.compact(mode) {
                         Ok(compaction) => BackendResponse {
                             lines: vec![format!(
-                                "Context compacted {:?} · {} → {} tokens · checkpoint {}",
+                                "Context compacted {:?} · {} → {} tokens · method={} · anchor-method={} anchors={} · requirements={} decisions={} blockers={} · checkpoint {}",
                                 compaction.mode,
                                 compaction.token_cost_before,
                                 compaction.token_cost_after,
+                                compaction.summary_method,
+                                compaction.anchor_method,
+                                compaction.semantic_anchor_count,
+                                compaction.requirement_count,
+                                compaction.decision_count,
+                                compaction.blocker_count,
                                 compaction.checkpoint_id
                             )],
                             ..BackendResponse::default()
@@ -4658,8 +5529,8 @@ impl TerminalBackend for AppBackend {
                     Ok(fork) => BackendResponse {
                         lines: vec![format!(
                             "Forked child {} · parent {} unchanged · context {}",
-                            fork.child_session_id,
-                            fork.parent_session_id,
+                            short_session_label(&fork.child_session_id),
+                            short_session_label(&fork.parent_session_id),
                             fork.child_context_series_id
                         )],
                         ..BackendResponse::default()
@@ -4697,11 +5568,18 @@ impl TerminalBackend for AppBackend {
                     MemoryCommand::Stats => match self.application.memory_view() {
                         Ok(view) => BackendResponse {
                             lines: vec![format!(
-                                "Memory records={} fts={} semantic={:?} vectorSchema={}",
+                                "Memory records={} fts={} semantic={:?} vectorSchema={} memoryVectors={} repositoryVectors={} queryVectors={} cacheHits={} cacheWrites={} searches={} reranks={}",
                                 view.record_count,
                                 view.fts_indexed_count,
                                 view.semantic,
-                                view.vector_schema_present
+                                view.vector_schema_present,
+                                view.memory_embedding_count,
+                                view.repository_embedding_count,
+                                view.query_embedding_count,
+                                view.embedding_cache_hits,
+                                view.embedding_cache_writes,
+                                view.semantic_searches,
+                                view.semantic_reranks
                             )],
                             ..Default::default()
                         },
@@ -5457,6 +6335,9 @@ impl TerminalBackend for AppBackend {
                     },
                     ProviderCommand::Add => self.start_provider_add(),
                     ProviderCommand::Switch => self.start_provider_switch(),
+                    ProviderCommand::Key { provider_id } => {
+                        self.start_provider_key_update(provider_id)
+                    }
                     ProviderCommand::Remove { provider_id } => {
                         self.remove_project_provider(&provider_id)
                     }
@@ -6151,6 +7032,9 @@ impl TerminalBackend for AppBackend {
     }
 
     fn snapshot(&self) -> TerminalSnapshot {
+        if let Some(background) = &self.background_single {
+            return background.cached_snapshot.clone();
+        }
         let status = self.application.status();
         let plan = self.application.plan();
         let context = self.application.context().ok();
@@ -6158,6 +7042,34 @@ impl TerminalBackend for AppBackend {
         let language = UiLanguage::parse(&self.application.config().settings.ui_language)
             .unwrap_or(UiLanguage::ZhCn);
         let vector_configured = self.vector_health.is_healthy();
+        let vector_status = self.vector_runtime_status();
+        let prompt_cache_percent = self.prompt_cache_metrics().3;
+        let active_agents: Vec<TerminalAgentBadge> = self
+            .application
+            .agents()
+            .map(|team| {
+                team.agents
+                    .into_iter()
+                    .filter(|agent| agent.active > 0 || agent.lifecycle != AgentLifecycle::Sleeping)
+                    .take(4)
+                    .map(|agent| TerminalAgentBadge {
+                        name: if agent.active > 1 {
+                            format!("{}×{}", agent.name, agent.active)
+                        } else {
+                            agent.name
+                        },
+                        state: match agent.lifecycle {
+                            AgentLifecycle::Sleeping | AgentLifecycle::Reserved => {
+                                TerminalAgentState::Waiting
+                            }
+                            AgentLifecycle::Running => TerminalAgentState::Running,
+                            AgentLifecycle::Draining => TerminalAgentState::Draining,
+                            AgentLifecycle::Failed => TerminalAgentState::Failed,
+                        },
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         match status {
             Ok(status) => TerminalSnapshot {
                 session_title: status
@@ -6184,8 +7096,11 @@ impl TerminalBackend for AppBackend {
                 reasoning: status.reasoning,
                 context_percent: context.as_ref().map_or(0, |context| context.percent),
                 cache_percent: cache.effective_hit_rate_percent,
+                prompt_cache_percent,
                 agents: plan.map_or(0, |plan| plan.running),
+                active_agents: active_agents.clone(),
                 vector_configured,
+                vector_status,
                 project: self.project_root.clone(),
                 branch: self.project_branch.clone(),
                 statusbar_visible: self.application.statusbar_visible(),
@@ -6206,8 +7121,11 @@ impl TerminalBackend for AppBackend {
                 reasoning: "off".to_owned(),
                 context_percent: context.as_ref().map_or(0, |context| context.percent),
                 cache_percent: cache.effective_hit_rate_percent,
+                prompt_cache_percent,
                 agents: 0,
+                active_agents,
                 vector_configured,
+                vector_status,
                 project: self.project_root.clone(),
                 branch: self.project_branch.clone(),
                 statusbar_visible: self.application.statusbar_visible(),
@@ -6216,6 +7134,13 @@ impl TerminalBackend for AppBackend {
     }
 
     fn cancel_current(&mut self) -> BackendResponse {
+        if let Some(background) = &self.background_single {
+            background.cancellation.cancel();
+            return BackendResponse {
+                lines: vec!["[WARN] 正在取消当前模型与工具任务".to_owned()],
+                ..BackendResponse::default()
+            };
+        }
         if let Some(background) = self.background_team.as_mut() {
             for cancellation in background.cancellations.values() {
                 cancellation.cancel();
@@ -6265,12 +7190,47 @@ impl TerminalBackend for AppBackend {
             Ok(store) => store,
             Err(error) => return Self::response_error(error),
         };
-        if let Err(error) = store.put(
-            &CredentialId::new(&pending.credential_id),
+        let catalog = match load_provider_catalog(Path::new(&self.project_root)) {
+            Ok(catalog) => catalog,
+            Err(error) => return Self::response_error(error),
+        };
+        let Some(definition) = catalog.get(&pending.provider_id).cloned() else {
+            return Self::response_error(format!(
+                "Provider Catalog 中不存在 {}",
+                pending.provider_id
+            ));
+        };
+        let verified_models = match replace_credential_transactionally(
+            &store,
+            &pending.credential_id,
             SecretString::new(secret),
+            || {
+                if definition.discovery.is_none() {
+                    return Ok(None);
+                }
+                let credentials: Arc<dyn CredentialStore> = Arc::new(
+                    OsCredentialStore::new("dev.openai.harness")
+                        .map_err(|error| error.to_string())?,
+                );
+                let runtime = CatalogProviderRuntime::with_ureq(
+                    default_model_cache_path(Path::new(&self.project_root)),
+                    credentials,
+                )
+                .map_err(|error| error.to_string())?;
+                runtime
+                    .discover_models(&definition)
+                    .map(|models| Some(models.len()))
+                    .map_err(|error| error.to_string())
+            },
         ) {
-            return Self::response_error(error);
-        }
+            Ok(verified_models) => verified_models,
+            Err(error) => {
+                return Self::response_error(format!(
+                    "{} · {error}",
+                    self.language().pack().provider_key_rollback
+                ));
+            }
+        };
         if self
             .application
             .model()
@@ -6281,8 +7241,13 @@ impl TerminalBackend for AppBackend {
         BackendResponse {
             lines: vec![
                 format!(
-                    "{} credential 已保存到 OS Credential Store",
-                    pending.display_name
+                    "{} · {}",
+                    pending.display_name,
+                    self.language().pack().provider_key_updated
+                ),
+                verified_models.map_or_else(
+                    || "Provider 未提供模型目录验证接口；将在首次模型请求时继续验证。".to_owned(),
+                    |count| format!("Provider validation  OK · {count} models"),
                 ),
                 if self.model_ready {
                     "当前模型已可用，可以开始输入任务。".to_owned()
@@ -6295,6 +7260,9 @@ impl TerminalBackend for AppBackend {
     }
 
     fn complete_input(&self, input: &str) -> Vec<InputSuggestion> {
+        if self.background_single.is_some() || !self.application.is_available() {
+            return Vec::new();
+        }
         self.input_suggestions(input)
     }
 
@@ -6304,7 +7272,18 @@ impl TerminalBackend for AppBackend {
 
     fn poll(&mut self) -> BackendResponse {
         self.drain_event_log();
-        self.poll_background_team()
+        let single = self.poll_background_single_task();
+        if single != BackendResponse::default() {
+            if self.application.is_available() {
+                self.poll_session_title();
+            }
+            return single;
+        }
+        let response = self.poll_background_team();
+        if self.application.is_available() {
+            self.poll_session_title();
+        }
+        response
     }
 }
 
@@ -6357,7 +7336,141 @@ fn event_scope_summary(entry: &EventEnvelope) -> String {
 struct StartupSessionSummary {
     id: SessionId,
     title: String,
-    updated_at_millis: i64,
+}
+
+fn short_session_id(session_id: &SessionId) -> String {
+    let digest = format!("{:x}", Sha256::digest(session_id.as_str().as_bytes()));
+    digest[..8].to_owned()
+}
+
+fn short_session_label(session_id: &SessionId) -> String {
+    format!("#{}", short_session_id(session_id))
+}
+
+fn truncate_startup_label(value: &str, max_characters: usize) -> String {
+    let characters = value.chars().collect::<Vec<_>>();
+    if characters.len() <= max_characters {
+        return value.to_owned();
+    }
+    if max_characters <= 1 {
+        return "…".to_owned();
+    }
+    characters
+        .into_iter()
+        .take(max_characters - 1)
+        .chain(std::iter::once('…'))
+        .collect()
+}
+
+fn pick_startup_session(
+    sessions: &[StartupSessionSummary],
+) -> Result<SessionId, Box<dyn std::error::Error>> {
+    use crossterm::cursor::{Hide, MoveTo, Show};
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
+    use crossterm::terminal::{
+        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode, size,
+    };
+    use crossterm::{execute, queue};
+
+    struct PickerGuard;
+    impl Drop for PickerGuard {
+        fn drop(&mut self) {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), Show, LeaveAlternateScreen, ResetColor);
+        }
+    }
+
+    enable_raw_mode()?;
+    execute!(io::stdout(), EnterAlternateScreen, Hide)?;
+    let _guard = PickerGuard;
+    let mut selected = 0_usize;
+    loop {
+        let (width, height) = size().unwrap_or((80, 24));
+        let visible = usize::from(height.saturating_sub(7).max(1)).min(sessions.len());
+        let start = selected
+            .saturating_sub(visible.saturating_sub(1))
+            .min(sessions.len().saturating_sub(visible));
+        let mut stdout = io::stdout();
+        queue!(
+            stdout,
+            MoveTo(0, 0),
+            Clear(ClearType::All),
+            SetForegroundColor(Color::Cyan),
+            SetAttribute(Attribute::Bold),
+            Print("Kernary · 恢复会话"),
+            SetAttribute(Attribute::Reset),
+            ResetColor,
+            Print("\r\n\r\n"),
+            SetForegroundColor(Color::DarkGrey),
+            Print("↑/↓ 选择  ·  Enter 恢复  ·  Esc 取消"),
+            ResetColor,
+            Print("\r\n\r\n")
+        )?;
+        for (index, session) in sessions.iter().enumerate().skip(start).take(visible) {
+            let available = usize::from(width).saturating_sub(18).max(8);
+            let title = truncate_startup_label(&session.title, available);
+            if index == selected {
+                queue!(
+                    stdout,
+                    SetForegroundColor(Color::Cyan),
+                    SetAttribute(Attribute::Bold),
+                    Print(format!(
+                        "› {:<width$}  {}",
+                        title,
+                        short_session_label(&session.id),
+                        width = available
+                    )),
+                    SetAttribute(Attribute::Reset),
+                    ResetColor
+                )?;
+            } else {
+                queue!(
+                    stdout,
+                    Print(format!(
+                        "  {:<width$}  {}",
+                        title,
+                        short_session_label(&session.id),
+                        width = available
+                    ))
+                )?;
+            }
+            queue!(stdout, Print("\r\n"))?;
+        }
+        queue!(
+            stdout,
+            Print("\r\n"),
+            SetForegroundColor(Color::DarkGrey),
+            Print(format!("{} 个会话", sessions.len())),
+            ResetColor
+        )?;
+        stdout.flush()?;
+
+        let event = event::read()?;
+        let Event::Key(key) = event else {
+            continue;
+        };
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            continue;
+        }
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                selected = selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                selected = (selected + 1).min(sessions.len() - 1);
+            }
+            KeyCode::Home => selected = 0,
+            KeyCode::End => selected = sessions.len() - 1,
+            KeyCode::Enter => return Ok(sessions[selected].id.clone()),
+            KeyCode::Esc => return Err("已取消恢复会话".into()),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Err("已取消恢复会话".into());
+            }
+            _ => {}
+        }
+    }
 }
 
 fn load_startup_sessions(
@@ -6376,7 +7489,6 @@ fn load_startup_sessions(
             Ok(StartupSessionSummary {
                 id,
                 title: state.title.unwrap_or_else(|| "未命名会话".to_owned()),
-                updated_at_millis: state.updated_at_millis,
             })
         })
         .collect()
@@ -6402,33 +7514,23 @@ fn resolve_startup_session(
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return Err("非交互终端必须使用 `kernary -r <session-id-or-title>`".into());
         }
-        println!("当前项目 Sessions：");
-        for (index, session) in sessions.iter().enumerate() {
-            println!(
-                "  {}) {} · {} · updated={}",
-                index + 1,
-                session.title,
-                session.id,
-                session.updated_at_millis
-            );
-        }
-        print!("选择序号：");
-        io::stdout().flush()?;
-        let mut selection = String::new();
-        io::stdin().read_line(&mut selection)?;
-        let index = selection
-            .trim()
-            .parse::<usize>()
-            .ok()
-            .filter(|index| (1..=sessions.len()).contains(index))
-            .ok_or("Session 序号无效")?;
-        return Ok(Some(sessions[index - 1].id.clone()));
+        return pick_startup_session(&sessions).map(Some);
     }
     if let Some(session) = sessions
         .iter()
         .find(|session| session.id.as_str() == target)
     {
         return Ok(Some(session.id.clone()));
+    }
+    let short_target = target.strip_prefix('#').unwrap_or(target);
+    let short_matches = sessions
+        .iter()
+        .filter(|session| short_session_id(&session.id) == short_target)
+        .collect::<Vec<_>>();
+    match short_matches.as_slice() {
+        [session] => return Ok(Some(session.id.clone())),
+        [] => {}
+        _ => return Err("Session 短 ID 冲突，请使用完整 ID 或标题".into()),
     }
     let matches = sessions
         .iter()
@@ -6772,18 +7874,55 @@ fn load_provider_catalog(
     project_root: &Path,
 ) -> Result<ProviderCatalog, Box<dyn std::error::Error>> {
     let mut catalog = ProviderCatalog::built_in()?;
-    let path = configured_path(project_root, "KERNARY_PROVIDER_CONFIG")
-        .unwrap_or_else(|| default_project_catalog_path(project_root));
-    if path.exists()
-        && let Err(error) = catalog.load_project_file(&path)
+    let active_path = resolved_provider_config_path(project_root);
+    let legacy_project_path = default_project_catalog_path(project_root);
+    let mut paths = Vec::new();
+    if !global_config_isolated()
+        && let Some(canonical) = canonical_global_provider_config_path()
     {
-        eprintln!(
-            "[WARN] Provider config isolated · {} · {}",
-            path.display(),
-            error
-        );
+        paths.push(canonical);
+    }
+    paths.extend([active_path, legacy_project_path]);
+    let mut seen = BTreeSet::new();
+    for path in paths {
+        if !seen.insert(path.clone()) || !path.exists() {
+            continue;
+        }
+        let mut isolated = ProviderCatalog::built_in()?;
+        if let Err(error) = isolated.load_project_file(&path) {
+            eprintln!(
+                "[WARN] Provider config isolated · {} · {}",
+                path.display(),
+                error
+            );
+        } else {
+            for provider in isolated
+                .list()
+                .into_iter()
+                .filter(|provider| provider.source == ProviderSource::Project)
+            {
+                match catalog.get(&provider.id) {
+                    None => catalog.upsert_project(provider)?,
+                    Some(current) if current == &provider => {}
+                    Some(_) => eprintln!(
+                        "[WARN] Provider {} 在多个目录定义；保留先加载的定义",
+                        provider.id
+                    ),
+                }
+            }
+        }
     }
     Ok(catalog)
+}
+
+fn resolved_provider_config_path(project_root: &Path) -> PathBuf {
+    configured_path(project_root, "KERNARY_PROVIDER_CONFIG")
+        .or_else(|| {
+            (!internal_test_model_enabled())
+                .then(default_global_provider_config_path)
+                .flatten()
+        })
+        .unwrap_or_else(|| default_project_catalog_path(project_root))
 }
 
 fn load_provider_model_cache(project_root: &Path) -> ProviderModelCache {
@@ -7143,7 +8282,35 @@ fn build_backend(
         );
     }
     let test_model_enabled = internal_test_model_enabled();
-    let persisted_selection = model_seed
+    let requested_global_model_config_path = default_global_model_config_path()
+        .ok_or("无法确定全局模型配置目录；可设置 KERNARY_GLOBAL_MODEL_CONFIG")?;
+    if !requested_global_model_config_path.is_absolute() {
+        return Err("KERNARY_GLOBAL_MODEL_CONFIG 必须是绝对路径".into());
+    }
+    let mut model_paths = vec![requested_global_model_config_path.clone()];
+    if !global_config_isolated()
+        && let Some(canonical) = canonical_global_model_config_path()
+        && !model_paths.contains(&canonical)
+    {
+        model_paths.push(canonical);
+    }
+    let mut global_model_config_path = requested_global_model_config_path;
+    let mut loaded_global_selection = None;
+    for path in model_paths {
+        match load_global_model_selection(&path) {
+            Ok(Some(selection)) => {
+                global_model_config_path = path;
+                loaded_global_selection = Some(selection);
+                break;
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "[WARN] global model selection isolated · {} · {error}",
+                path.display()
+            ),
+        }
+    }
+    let session_selection = persisted
         .model
         .provider_id
         .clone()
@@ -7152,6 +8319,27 @@ fn build_backend(
             !is_unconfigured_model(provider, model)
                 && (test_model_enabled || !is_internal_test_model(provider, model))
         });
+    let global_selection = loaded_global_selection.filter(|(provider, model)| {
+        !is_unconfigured_model(provider, model)
+            && (test_model_enabled || !is_internal_test_model(provider, model))
+    });
+    let legacy_project_selection = (persisted.version == 0)
+        .then(|| {
+            model_seed
+                .model
+                .provider_id
+                .clone()
+                .zip(model_seed.model.model_id.clone())
+        })
+        .flatten()
+        .filter(|(provider, model)| {
+            !is_unconfigured_model(provider, model)
+                && (test_model_enabled || !is_internal_test_model(provider, model))
+        });
+    let inherited_selection = global_selection
+        .clone()
+        .or_else(|| session_selection.clone())
+        .or_else(|| legacy_project_selection.clone());
     let requested_selection = requested_model.map(parse_model_selection).transpose()?;
     if let Some((provider, model)) = requested_selection.as_ref()
         && is_hidden_internal_model(provider, model)
@@ -7161,7 +8349,7 @@ fn build_backend(
     }
     let initial_selection = requested_selection
         .clone()
-        .or_else(|| persisted_selection.clone())
+        .or_else(|| inherited_selection.clone())
         .unwrap_or_else(|| {
             if test_model_enabled {
                 (
@@ -7178,8 +8366,7 @@ fn build_backend(
 
     let credentials: Arc<dyn CredentialStore> =
         Arc::new(OsCredentialStore::new("dev.openai.harness")?);
-    let provider_config_path = configured_path(project_root, "KERNARY_PROVIDER_CONFIG")
-        .unwrap_or_else(|| default_project_catalog_path(project_root));
+    let provider_config_path = resolved_provider_config_path(project_root);
     let vector_config_path = default_global_vector_config_path()
         .ok_or("无法确定全局 Vector 配置目录；可设置 KERNARY_GLOBAL_VECTOR_CONFIG")?;
     if !vector_config_path.is_absolute() {
@@ -7211,10 +8398,50 @@ fn build_backend(
         }
     }
     let mut provider_catalog = load_provider_catalog(project_root)?;
-    for (provider_id, model_id) in requested_selection.iter().chain(persisted_selection.iter()) {
+    for (provider_id, model_id) in requested_selection.iter().chain(inherited_selection.iter()) {
         if provider_catalog.get(provider_id).is_some() {
             provider_catalog.extend_explicit_single_route_model(provider_id, model_id.clone())?;
         }
+    }
+    let initial_selection = if requested_selection.is_none()
+        && !selection_is_routable(
+            &provider_catalog,
+            &initial_selection.0,
+            &initial_selection.1,
+            test_model_enabled,
+        ) {
+        eprintln!(
+            "[WARN] 全局默认模型当前不可路由：{}/{}；本窗口回退为未配置",
+            initial_selection.0, initial_selection.1
+        );
+        (
+            ProviderId::from(UNCONFIGURED_PROVIDER_ID),
+            ModelId::from(UNCONFIGURED_MODEL_ID),
+        )
+    } else {
+        initial_selection
+    };
+    if global_selection.is_none()
+        && requested_selection.is_none()
+        && let Some((provider_id, model_id)) = legacy_project_selection.as_ref()
+        && !is_hidden_internal_model(provider_id, model_id)
+        && selection_is_routable(&provider_catalog, provider_id, model_id, test_model_enabled)
+        && let Err(error) = (|| {
+            if provider_catalog
+                .get(provider_id)
+                .is_some_and(|provider| provider.source == ProviderSource::Project)
+            {
+                provider_catalog
+                    .save_project_file(&provider_config_path)
+                    .map_err(|error| error.to_string())?;
+            }
+            save_global_model_selection(&global_model_config_path, provider_id, model_id)
+        })()
+    {
+        eprintln!(
+            "[WARN] 旧会话默认模型迁移到全局失败 · {} · {error}",
+            global_model_config_path.display()
+        );
     }
     let model_ready = selection_is_ready(
         &provider_catalog,
@@ -7257,7 +8484,7 @@ fn build_backend(
             provider_name,
             model_env,
             requested_selection.as_ref(),
-            persisted_selection.as_ref(),
+            inherited_selection.as_ref(),
         );
         if models.is_empty() {
             continue;
@@ -7798,13 +9025,14 @@ fn build_backend(
         UiLanguage::parse(&application.config().settings.ui_language).unwrap_or(UiLanguage::ZhCn);
     Ok((
         AppBackend {
-            application,
+            application: application.into(),
             registry: CommandRegistry::with_language(language),
             project_root: project_root.display().to_string(),
             project_branch: project_branch_label(project_root),
             agent_instructions,
             seed_session_settings,
             provider_config_path,
+            global_model_config_path,
             vector_config_path,
             mcp_config_path,
             mcp_configs,
@@ -7812,7 +9040,14 @@ fn build_backend(
             permission_rules,
             event_log_subscription,
             event_log: VecDeque::new(),
+            prompt_cache_input_tokens: 0,
+            prompt_cache_read_tokens: 0,
+            prompt_cache_write_tokens: 0,
             background_team: None,
+            background_single: None,
+            async_single_tasks: false,
+            background_session_title: None,
+            session_title_attempts: BTreeMap::new(),
             pending_credential: None,
             pending_setup: None,
             model_ready,
@@ -7835,6 +9070,131 @@ fn parse_model_selection(value: &str) -> Result<(ProviderId, ModelId), Box<dyn s
     Ok((ProviderId::from(provider), ModelId::from(model)))
 }
 
+fn load_global_model_selection(path: &Path) -> Result<Option<(ProviderId, ModelId)>, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("global-model-config-io: {error}")),
+    };
+    if !metadata.file_type().is_file() || metadata.len() > MAX_GLOBAL_MODEL_SELECTION_BYTES {
+        return Err(format!(
+            "global-model-config-size-or-type: {}",
+            path.display()
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(path).map_err(|error| format!("global-model-config-io: {error}"))?,
+    )
+    .map_err(|error| format!("global-model-config-json: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "global-model-config-object-required".to_owned())?;
+    let allowed = ["schemaVersion", "providerId", "modelId"]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if object.len() != allowed.len() || object.keys().any(|key| !allowed.contains(key.as_str())) {
+        return Err("global-model-config-unknown-field".to_owned());
+    }
+    if object
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        != Some(GLOBAL_MODEL_SELECTION_SCHEMA_VERSION)
+    {
+        return Err("global-model-config-schema-unsupported".to_owned());
+    }
+    let provider = object
+        .get("providerId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "global-model-config-provider-invalid".to_owned())?;
+    let model = object
+        .get("modelId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "global-model-config-model-invalid".to_owned())?;
+    parse_model_selection(&format!("{provider}/{model}"))
+        .map(Some)
+        .map_err(|error| format!("global-model-config-selection-invalid: {error}"))
+}
+
+fn save_global_model_selection(
+    path: &Path,
+    provider_id: &ProviderId,
+    model_id: &ModelId,
+) -> Result<(), String> {
+    if is_hidden_internal_model(provider_id, model_id) {
+        return Err("内部占位/测试模型不能保存为全局默认".to_owned());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "global-model-config-parent-missing".to_owned())?;
+    fs::create_dir_all(parent).map_err(|error| format!("global-model-config-io: {error}"))?;
+    if path.exists()
+        && !fs::symlink_metadata(path)
+            .map_err(|error| format!("global-model-config-io: {error}"))?
+            .file_type()
+            .is_file()
+    {
+        return Err("global-model-config-target-type".to_owned());
+    }
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schemaVersion": GLOBAL_MODEL_SELECTION_SCHEMA_VERSION,
+        "providerId": provider_id,
+        "modelId": model_id,
+    }))
+    .map_err(|error| format!("global-model-config-json: {error}"))?;
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    let backup = path.with_extension(format!("{}.previous", std::process::id()));
+    if temporary.exists() || backup.exists() {
+        return Err("global-model-config-staging-exists".to_owned());
+    }
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| format!("global-model-config-io: {error}"))?;
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("global-model-config-io: {error}"))?;
+        if path.exists() {
+            fs::rename(path, &backup)
+                .map_err(|error| format!("global-model-config-backup: {error}"))?;
+        }
+        if let Err(error) = fs::rename(&temporary, path) {
+            if backup.exists() {
+                let _ = fs::rename(&backup, path);
+            }
+            return Err(format!("global-model-config-commit: {error}"));
+        }
+        if backup.exists() {
+            let _ = fs::remove_file(&backup);
+        }
+        Ok(())
+    })();
+    if result.is_err() && temporary.exists() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn clear_global_model_selection_for_provider(
+    path: &Path,
+    provider_id: &ProviderId,
+) -> Result<bool, String> {
+    let Some((selected_provider, _)) = load_global_model_selection(path)? else {
+        return Ok(false);
+    };
+    if selected_provider != *provider_id {
+        return Ok(false);
+    }
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| format!("global-model-config-io: {error}"))?;
+    if !metadata.file_type().is_file() {
+        return Err("global-model-config-target-type".to_owned());
+    }
+    fs::remove_file(path).map_err(|error| format!("global-model-config-io: {error}"))?;
+    Ok(true)
+}
+
 /// 新品牌环境变量优先；旧 HARNESS_* 在一个兼容周期内作为 fallback。
 fn compat_env_var(name: &str) -> Result<String, std::env::VarError> {
     let Some(suffix) = name.strip_prefix("HARNESS_") else {
@@ -7852,6 +9212,12 @@ fn compat_env_var_os(name: &str) -> Option<std::ffi::OsString> {
         return std::env::var_os(name);
     };
     std::env::var_os(format!("KERNARY_{suffix}")).or_else(|| std::env::var_os(name))
+}
+
+fn global_config_isolated() -> bool {
+    compat_env_var("HARNESS_ISOLATE_GLOBAL_CONFIG")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
 }
 
 fn load_runtime_config(
@@ -7918,6 +9284,12 @@ fn default_global_config_path() -> Option<PathBuf> {
         return std::env::var_os("APPDATA")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from)
+                    .map(|root| root.join("AppData/Roaming"))
+            })
             .map(|root| root.join("Kernary").join("config.toml"));
     }
     std::env::var_os("XDG_CONFIG_HOME")
@@ -7930,6 +9302,27 @@ fn default_global_config_path() -> Option<PathBuf> {
                 .map(PathBuf::from)
                 .map(|root| root.join(".config").join("kernary").join("config.toml"))
         })
+}
+
+fn default_global_model_config_path() -> Option<PathBuf> {
+    compat_env_var_os("HARNESS_GLOBAL_MODEL_CONFIG")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(canonical_global_model_config_path)
+}
+
+fn default_global_provider_config_path() -> Option<PathBuf> {
+    canonical_global_provider_config_path()
+}
+
+fn canonical_global_model_config_path() -> Option<PathBuf> {
+    default_global_config_path()
+        .and_then(|config| config.parent().map(|parent| parent.join("model.json")))
+}
+
+fn canonical_global_provider_config_path() -> Option<PathBuf> {
+    default_global_config_path()
+        .and_then(|config| config.parent().map(|parent| parent.join("providers.toml")))
 }
 
 fn default_global_vector_config_path() -> Option<PathBuf> {
@@ -8520,6 +9913,7 @@ fn run_interactive(
     let is_tty = io::stdin().is_terminal() && io::stdout().is_terminal();
     let capabilities = TerminalCapabilities::detect(is_tty, force_ascii, force_no_color);
     if matches!(ui_mode, UiMode::Full) || (matches!(ui_mode, UiMode::Auto) && is_tty) {
+        backend.async_single_tasks = true;
         let registry = backend.registry;
         run_tui(
             &mut backend,
@@ -8629,6 +10023,11 @@ fn doctor(
         TerminalCapabilities::detect(io::stdout().is_terminal(), force_ascii, force_no_color);
     let store = SqliteKernelStore::open_in_memory()?;
     let global_vector_config = default_global_vector_config_path();
+    let global_model_config = default_global_model_config_path();
+    let global_default_model = global_model_config
+        .as_deref()
+        .and_then(|path| load_global_model_selection(path).ok().flatten())
+        .map(|(provider, model)| format!("{provider}/{model}"));
     let embedding_model_configured = compat_env_var("HARNESS_EMBEDDING_MODEL")
         .ok()
         .is_some_and(|value| !value.trim().is_empty())
@@ -8648,8 +10047,7 @@ fn doctor(
     let lsp_config_valid =
         lsp_config_present && LspManager::load(&lsp_config_path, project_root).is_ok();
     let provider_catalog = load_provider_catalog(project_root)?;
-    let provider_config_path = configured_path(project_root, "KERNARY_PROVIDER_CONFIG")
-        .unwrap_or_else(|| default_project_catalog_path(project_root));
+    let provider_config_path = resolved_provider_config_path(project_root);
     let provider_model_cache_path = default_model_cache_path(project_root);
     let provider_model_cache = load_provider_model_cache(project_root);
     let providers = provider_catalog.list();
@@ -8694,9 +10092,17 @@ fn doctor(
         },
         "model": "unconfigured",
         "provider": serde_json::Value::Null,
+        "defaultModel": {
+            "scope": "global-user",
+            "configured": global_default_model.is_some(),
+            "selection": global_default_model,
+            "configPath": global_model_config
+        },
         "providers": {
             "catalogCount": providers.len(),
             "customConfigPresent": provider_config_path.is_file(),
+            "scope": "global-user-with-legacy-project-import",
+            "configPath": provider_config_path,
             "protocols": ["openai-responses", "openai-chat", "anthropic-messages"],
             "discovery": {
                 "configured": discovery_configured,
@@ -8716,14 +10122,16 @@ fn doctor(
             "mcp": "oauth-pkce-streamable-http-legacy-sse-lazy",
             "plugin": "isolated-process-lazy",
             "skill": "metadata-first-lazy",
-            "agents": "stage-11-complete-role-dag-tools-approval-recovery",
+            "agents": "thirty-deep-profiles-fullstack-specialist-dag",
             "providers": "catalog-protocol-mux-secure-connect-dynamic-discovery",
             "lsp": "safe-workspace-edit-preview-filelease-patchset-3.18",
             "command": "kernary-primary-harness-byte-identical-alias",
             "observability": "bounded-event-log-traceid-profile-why-inspect",
             "automation": "strict-noninteractive-exec-single-json-atomic-output",
             "sessionControl": "list-goal-history-clear-checkpoint-reset-forget",
-            "management": "persistent-mcp-crud-permission-modes-and-rules"
+            "management": "persistent-mcp-crud-permission-modes-and-rules",
+            "contextCompaction": "evidence-grounded-hybrid-vector-checkpoint-cas",
+            "interaction": "async-stream-coalesced-tools-transient-notices"
         },
         "vector": {
             "activationRule": "requires-non-empty-embedding-model",
@@ -8745,8 +10153,8 @@ fn doctor(
             "repositoryFusion": "file-hash-bound-symbols-diagnostics-evidence",
             "patchPreview": "rename-codeaction-preview-second-approval-recoverable-set"
         },
-        "stage": 23,
-        "stageTrack": "27-vector-provider-and-model-catalog",
+        "stage": 38,
+        "stageTrack": "42-responsive-streaming-tui",
     });
     if json {
         println!("{report}");
@@ -8763,4 +10171,112 @@ fn doctor(
         println!("Model: unconfigured (由 Session 或 --model 在运行时选择)");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_provider_protocols_build_distinct_routes_and_discovery_auth() {
+        let cases = [
+            (
+                ProviderProtocol::OpenaiResponses,
+                "/responses",
+                ProviderDiscoveryFormat::OpenaiModels,
+                ProviderDiscoveryAuth::Bearer,
+            ),
+            (
+                ProviderProtocol::OpenaiChat,
+                "/chat/completions",
+                ProviderDiscoveryFormat::OpenaiModels,
+                ProviderDiscoveryAuth::Bearer,
+            ),
+            (
+                ProviderProtocol::AnthropicMessages,
+                "/messages",
+                ProviderDiscoveryFormat::AnthropicModels,
+                ProviderDiscoveryAuth::AnthropicApiKey,
+            ),
+        ];
+        for (protocol, suffix, format, auth) in cases {
+            let (base, route, discovery, actual_format, actual_auth) =
+                custom_provider_route("https://relay.example/v1", protocol).expect("route");
+            assert_eq!(base, "https://relay.example/v1");
+            assert_eq!(route, format!("https://relay.example/v1{suffix}"));
+            assert_eq!(discovery, "https://relay.example/v1/models");
+            assert_eq!(actual_format, format);
+            assert_eq!(actual_auth, auth);
+        }
+    }
+
+    #[test]
+    fn custom_provider_url_accepts_a_full_messages_endpoint_without_duplication() {
+        let (base, route, _, _, _) = custom_provider_route(
+            "https://relay.example/v1/messages",
+            ProviderProtocol::AnthropicMessages,
+        )
+        .expect("route");
+        assert_eq!(base, "https://relay.example/v1");
+        assert_eq!(route, "https://relay.example/v1/messages");
+    }
+
+    #[test]
+    fn session_display_ids_are_short_stable_and_distinct() {
+        let first = SessionId::from("session:1788000000000:1234");
+        let second = SessionId::from("session:1788000000001:1234");
+        assert_eq!(short_session_label(&first).len(), 9);
+        assert_eq!(short_session_label(&first), short_session_label(&first));
+        assert_ne!(short_session_label(&first), short_session_label(&second));
+        assert_eq!(truncate_startup_label("一二三四五", 4), "一二三…");
+    }
+
+    #[test]
+    fn provider_key_replacement_rolls_back_on_validation_failure() {
+        let store = harness_auth::MemoryCredentialStore::new();
+        let credential_id = "provider:test:rollback";
+        store
+            .put(
+                &CredentialId::new(credential_id),
+                SecretString::new("old-key"),
+            )
+            .expect("old key");
+        let error = replace_credential_transactionally(
+            &store,
+            credential_id,
+            SecretString::new("bad-new-key"),
+            || Err::<(), _>("provider rejected key".to_owned()),
+        )
+        .expect_err("validation must fail");
+        assert_eq!(error, "provider rejected key");
+        let retained = store
+            .get(&CredentialId::new(credential_id))
+            .expect("credential read")
+            .expect("old key retained");
+        assert_eq!(retained.expose_secret().expect("utf8"), "old-key");
+
+        replace_credential_transactionally(
+            &store,
+            credential_id,
+            SecretString::new("valid-new-key"),
+            || Ok(()),
+        )
+        .expect("valid replacement");
+        let replaced = store
+            .get(&CredentialId::new(credential_id))
+            .expect("credential read")
+            .expect("new key retained");
+        assert_eq!(replaced.expose_secret().expect("utf8"), "valid-new-key");
+    }
+
+    #[test]
+    fn provider_key_picker_only_accepts_providers_with_existing_credentials() {
+        let catalog = ProviderCatalog::built_in().expect("catalog");
+        let openai = catalog.get(&ProviderId::from("openai")).expect("openai");
+        let ollama = catalog.get(&ProviderId::from("ollama")).expect("ollama");
+        assert!(!provider_key_update_candidate(openai, "", false));
+        assert!(provider_key_update_candidate(openai, "", true));
+        assert!(!provider_key_update_candidate(ollama, "", true));
+        assert!(!provider_key_update_candidate(openai, "anth", true));
+    }
 }

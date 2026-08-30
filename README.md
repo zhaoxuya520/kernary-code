@@ -1,68 +1,228 @@
-# Kernary Code
+<p align="center">
+  <img src="assets/kernary-kern.svg" width="128" alt="Kernary mascot">
+</p>
 
-Kernary Code 是一个纯终端、Rust 实现的多 Agent AI Coding Harness。它不是聊天 CLI 外壳，而是由可恢复 Kernel、Context/Memory Engine、Tool/Permission/Sandbox、MCP、Plugin、LSP 和 Agent 调度器组成的本地优先运行时。
+<h1 align="center">Kernary Code</h1>
 
-## 安装
+<p align="center">
+  一个本地优先、可恢复、带证据链的多 Agent AI Coding Harness。<br>
+  One kernel. Every model. Safe to ship.
+</p>
 
-Windows x64 与 Linux x64 glibc：
+<p align="center">
+  <a href="https://github.com/zhaoxuya520/kernary-code/actions/workflows/ci.yml"><img src="https://github.com/zhaoxuya520/kernary-code/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Apache-2.0"></a>
+  <img src="https://img.shields.io/badge/version-0.13.3-gold.svg" alt="0.13.3">
+</p>
 
-```bash
-npm install -g kernary-code
-kernary --help
-```
+> [!IMPORTANT]
+> Kernary 正在公开开发中，`kernary-code` 尚未发布到 npm。当前请从源码构建；不要把仓库中的 npm 包目录当作已发布安装入口。
 
-也可以从 GitHub Releases 下载便携包。`harness` 作为兼容命令保留一个迁移周期，与 `kernary` 共用状态和凭证。
+Kernary 不是给模型套一层聊天界面。它把会话、任务、Agent、工具调用、审批、上下文、记忆和恢复状态放进同一个本地 Kernel，让模型可以真正读取项目、修改文件、运行命令、调用专家 Agent，并留下可检查的证据。
+
+## 为什么是 Kernary
+
+| 设计目标 | Kernary 的做法 |
+|---|---|
+| 长任务可恢复 | Session、Mission、Tool Journal、Context 与 Agent 状态持久化到项目 `.harness/` |
+| 多 Agent 不跑偏 | Staffing Router 按能力分配；Coordinator 处理依赖、冲突与交接；专家默认休眠 |
+| 不把过程刷成日志墙 | Codex 风格 Transcript；当前阶段在输入框上方原位更新，完成后自动消失 |
+| 文件修改可追踪 | 读写、进程退出、Patch、Undo 与审批都有结构化事件和证据 |
+| 模型与中转站可替换 | OpenAI Responses、Chat Completions、Anthropic Messages 和自定义 Provider |
+| 向量能力可选 | 未配置时走 lexical；配置后才启用项目级语义记忆、仓库重排和压缩锚点 |
+| 权限不是一句提示词 | Approval Policy 与操作系统 Sandbox 分离，危险边界不会因模型同意而消失 |
 
 ## 快速开始
 
+### 1. 从源码构建
+
+需要 Git、Rust `1.98.0` 和平台原生构建工具。仓库的 CI 覆盖 Windows、Linux 与 macOS；当前 npm 平台包只准备了 Windows x64 和 Linux x64 glibc，尚未发布。
+
 ```bash
-kernary
-kernary providers
-kernary models --provider opencode-go
+git clone https://github.com/zhaoxuya520/kernary-code.git
+cd kernary-code
+cargo build --release --locked -p harness-cli --bin kernary
 ```
 
-Kernary 不会在未配置模型时用测试模型伪造结果。第一次进入终端后：
+Windows：
+
+```powershell
+.\target\release\kernary.exe --version
+.\target\release\kernary.exe
+```
+
+Linux / macOS：
+
+```bash
+./target/release/kernary --version
+./target/release/kernary
+```
+
+### 2. 连接模型
+
+Kernary 不会在未配置模型时偷偷使用测试模型。第一次启动后，可以连接内置 Provider，也可以添加自己的中转站：
 
 ```text
-/connect
-/model
+/connect             # 选择内置 Provider 并安全输入 Key
+/provider add        # 名称 → 协议 → URL → Key → 拉取模型 → 默认模型
+/provider switch     # 切换 Provider
+/provider key        # 验证成功后原子更换 Key，失败恢复旧 Key
+/model               # 切换当前 Provider 的模型
 ```
 
-添加自定义 OpenAI-compatible 中转站时使用：
+自定义 Provider 支持三种协议：
+
+| 协议 | 默认端点 | 认证方式 |
+|---|---|---|
+| OpenAI Responses | `/responses` | Bearer |
+| OpenAI Chat Completions | `/chat/completions` | Bearer |
+| Anthropic Messages | `/messages` | `x-api-key` + `anthropic-version` |
+
+Provider、Key 引用和默认文本模型属于用户全局配置；Key 只进入操作系统 Credential Store。显式 `--model provider/model` 只覆盖当前启动。
+
+### 3. 提交第一个任务
 
 ```text
-/provider add
+请读取这个项目，找到测试失败的原因，修复后运行相关测试。
 ```
 
-向导依次要求自定义 Provider 名称（后续切换使用）、API Base URL、Secure Key，随后自动请求同源 `/models`，让用户选择默认模型，并原子保存到 `kernary.providers.toml`。切换分为两层：
+运行中，Kernary 会在输入框上方原位更新当前阶段，例如“连接模型”“分析上下文”“读取文件”“等待审批”；会话只保留用户消息、最终回答和有价值的工具证据。
+
+## 它是怎样工作的
+
+```mermaid
+flowchart LR
+  user[Developer] --> tui[Terminal UI]
+
+  subgraph runtime[Kernary runtime]
+    tui --> kernel[Recoverable kernel]
+    kernel --> context[Context broker]
+    kernel --> scheduler[Mission scheduler]
+    scheduler --> router[Staffing router]
+    router --> agents[Sleeping specialist agents]
+    agents <--> coordinator[Coordinator]
+    agents --> models[Model runtime]
+    agents --> tools[Tool runtime]
+    context <--> memory[Memory and repository index]
+  end
+
+  models --> providers[OpenAI / Anthropic / custom relays]
+  tools --> permissions[Approval policy]
+  permissions --> sandbox[OS sandbox]
+  sandbox --> workspace[Project workspace]
+  kernel --> project_db[(Project .harness SQLite)]
+  memory -. optional .-> embeddings[Embedding provider]
+```
+
+核心边界：
+
+- **Kernel 决定状态**：模型输出不会直接成为“任务完成”；Mission 与 Evidence Gate 决定是否接受。
+- **Agent 按需唤醒**：主 Agent 只拆任务，不读取所有专家说明；Staffing Router 根据结构化能力元数据选人。
+- **Coordinator 不写代码**：它主持讨论、记录冲突、组织交接并生成必要的 Merge 工作项。
+- **工具统一过门**：单 Agent 和子 Agent 都经过同一个 Tool Runtime、审批策略、沙箱和 Journal。
+- **记忆按项目隔离**：向量 Provider 可以全局复用，但 Memory、Repository、Query Cache 和向量投影都留在当前项目。
+
+## 常用任务
+
+### 恢复和切换会话
+
+每次直接运行 `kernary` 都创建新的项目本地 Session。历史只跟随当前文件夹，不会混入其他项目。
 
 ```text
-/provider switch       # 切换提供商并采用其默认模型
-/model                  # 只列当前提供商的模型
-/model <model-id>       # 当前提供商内快速切换
-/provider remove <id>   # 删除项目级 Provider 与凭证引用
+kernary -c                 # 继续当前项目最近会话
+kernary -r                 # 用方向键选择历史会话
+kernary -r <id-or-title>   # 按短 ID 或标题恢复
+
+/session                   # 会话选择页
+/session new
+/session rename <title>
 ```
 
-向量模型使用独立的全局 Provider Catalog：
+首条消息先生成本地临时标题；首轮完整回答后，当前模型在后台生成短标题。手动重命名永远不会被后台结果覆盖。
+
+### 选择权限与沙箱
+
+权限模式决定“何时询问”，Sandbox 决定“系统实际允许什么”。二者不会互相绕过。
+
+| 模式 | 行为 |
+|---|---|
+| `manual` | 所有 Tool 操作都确认 |
+| `edit` | 项目文件编辑自动；终端与外部操作确认 |
+| `auto` | 沙箱内低风险自动；高风险确认 |
+| `full` | 沙箱内自动；Workspace Patch 仍确认 |
+| `bypass` | 取消手动确认；必须显式确认，仍受 Sandbox hard deny |
+
+```text
+/permissions manual|edit|auto|full|bypass
+/sandbox read-only|workspace-write|danger-full-access
+```
+
+`Shift+Tab` 在 `manual → edit → auto → full` 之间静默切换。Windows 使用受限 Token、ACL、私有 Desktop 与 Job Object；Linux 使用 bubblewrap namespace，缺少可信 `bwrap` 时 fail closed。
+
+### 启动多 Agent 工作流
+
+Kernary 内置 30 个版本化 Agent Profile，覆盖控制面、需求、架构、前端、后端、API、SQL、测试、安全、性能、发布、SRE、文档、本地化和产品分析。它们不是 30 份同名提示词：每个 Profile 都定义使命、非目标、输入、SOP、工具边界、证据合同、失败升级、记忆策略和模型预算。
+
+```text
+/agents tree                         # 查看控制面与 Worker 树
+/agent <agent-id>                    # 查看角色合同和公开方法论
+/team adaptive 2 <objective>         # 按任务选择专家并构建 Evidence DAG
+```
+
+包含“全栈”“完整产品”或“从零上线”的目标会构建专职交付 DAG；普通任务只唤醒真正需要的角色。
+
+### 配置可选向量能力
 
 ```text
 /vector setup
-/vector providers              # 查看已配置的向量 Provider
-/vector provider [provider-id] # 先切换 Provider，再选择它的模型
-/vector model [model-id]       # 切换当前 Provider 的向量模型
+/vector providers
+/vector provider <provider-id>
+/vector model <model-id>
+/vector status
 ```
 
-`/vector setup` 按以下顺序提供三种选择：
+内置 Voyage AI 与 Jina AI 模型目录；Custom 支持 OpenAI-compatible Embeddings。Kernary 会发送真实 Embedding 请求，验证响应为非空有限数值向量，并自动检测维度；聊天模型不能冒充向量模型。
 
-1. Voyage AI：只输入 Key；内置 `voyage-4-lite`、`voyage-4`、`voyage-4-large`、`voyage-code-4`。
-2. Jina AI：只输入 Key；内置 Jina v5 文本、Jina Code 以及 v3/v4 模型 ID。
-3. Custom：输入自定义厂商名、OpenAI-compatible Base URL、Key，以及一个或多个逗号分隔的模型 ID。
+| 未配置向量 | 配置并验证后 |
+|---|---|
+| Lexical memory / repository search | Hybrid retrieval 与语义重排 |
+| 本地 extractive 压缩锚点 | 与 Goal/Task 相关的旧证据锚点 |
+| 无 Embedding 请求和向量表 | 按 generation、namespace、内容哈希缓存 |
 
-内置目录不依赖 `/models` 接口。Kernary 会对所选模型发送真实 Embedding 请求，只有返回单个非空、有限数值向量时才保存为可用模型；聊天模型或其他非向量模型无法通过。维度先从不带维度覆盖的响应自动识别；如果兼容端点要求显式维度，再进入手动维度步骤并验证返回长度。Voyage 使用其 `output_dimension` 协议，Jina 使用 `dimensions`，固定维度模型后续不发送覆盖字段。
+向量不可用不会阻止项目启动；系统会明确降级为 lexical-only。顶部状态栏常驻显示 `向量 未配置 / 待激活 / 已激活 / 异常`。
 
-Provider/模型目录保存在全局 Kernary 配置目录的 `vector.toml`（Windows 默认 `%APPDATA%\Kernary\vector.toml`；Linux 默认 `$XDG_CONFIG_HOME/kernary/vector.toml` 或 `~/.config/kernary/vector.toml`），也可用 `KERNARY_HOME` 或 `KERNARY_GLOBAL_VECTOR_CONFIG` 指定。每家厂商的 Key 分别只进入 OS Credential Store；所有项目复用目录与凭证。每次进入项目都会用当前 Provider/模型发送固定、无项目内容的健康检查，并在 `/vector status` 显示结果。Memory、Repository 和向量投影仍只位于当前项目 `.harness/`，不会跨项目混存。旧版单 Provider 配置会自动迁移为名为 `custom-legacy` 的目录项。`/vector clear` 需要二次确认，因为它会移除全部全局向量 Provider 与凭证；当前项目投影会同时清除。
+### 管理上下文和项目知识
 
-界面语言支持高度定制的命令目录、快捷键提示和设置向导：
+```text
+/context
+/checkpoint <name>
+/compact auto|safe|aggressive
+/memory stats
+/memory search lexical|hybrid <query>
+/index status|build|update|search
+```
+
+压缩前先建立 durable checkpoint。Goal、当前 Task、Pin、Constraint、Decision、Error、完整 Tool 对和 in-flight continuation 原文保留；模型摘要必须引用真实 Context ID，否则回退到本地 extractive 路径。Transcript 不会因压缩而删除。
+
+## Provider、缓存和推理摘要
+
+- OpenAI Responses 使用稳定 `prompt_cache_key`；支持时启用显式缓存选项。
+- Anthropic Messages 缓存稳定 system/tool 前缀，并保留增长中的对话缓存。
+- Agent Profile、项目规则和确定性 Tool ABI 位于稳定前缀；任务 ID、检索结果和用户输入位于动态尾部。
+- 底部常驻显示 Provider 报告的 Prompt Cache 命中率；`/cache` 区分 Provider Cache 与本地 L1/L2。
+- Kernary 只显示公开 reasoning summary 或可审计阶段摘要，不展示、推测或伪造模型私有思维链。
+
+## 配置与本地数据
+
+| 数据 | Windows | Linux / macOS | 范围 |
+|---|---|---|---|
+| 文本 Provider、默认模型 | `%APPDATA%\Kernary\` | `$XDG_CONFIG_HOME/kernary/` 或 `~/.config/kernary/` | 用户全局 |
+| Embedding Provider 目录 | 同上 `vector.toml` | 同上 `vector.toml` | 用户全局 |
+| Key | OS Credential Store | OS Credential Store | 用户全局，不写项目 |
+| Session、Context、Agent、Memory、Vector | `<project>/.harness/` | `<project>/.harness/` | 当前项目 |
+| 项目指令 | `<project>/.harness/agent.md` | `<project>/.harness/agent.md` | 覆盖全局 `~/.kernary/agent.md` |
+
+界面语言：
 
 ```text
 /language en
@@ -71,169 +231,39 @@ Provider/模型目录保存在全局 Kernary 配置目录的 `vector.toml`（Win
 /language ja
 ```
 
-## 产品级终端界面
+## 自动化和扩展
 
-交互界面采用 transcript-first 信息架构：顶部只保留项目、Git 分支、模型、模式、Context 进度和运行中的 Agent；主区域只显示用户消息、Agent 工作、工具、权限、错误与最终结果。`SystemReady`、`Usage`、`Plan`、`Context` 等内部遥测继续进入可审计 Event Log，但不再淹没主对话。
-
-- 命令面板以悬浮层出现，不改变对话区高度；
-- 输入框区分普通输入、设置向导与 Secure Key 三种语义状态；
-- `PgUp` / `PgDn` 回看长对话，输入与新输出保持在固定位置；
-- 宽屏显示完整运行信息，窄屏自动收缩模型名、进度条和次要状态；
-- 颜色使用语义 token 且继承终端默认前景/背景，`--no-color` 保留完整可读性。
-
-`/connect` 使用不回显的安全输入通道保存 Provider Key；`/model` 只选择真实或本地模型。完成后即可提交普通任务，或运行：
+严格非交互模式适合 CI：
 
 ```bash
 kernary --model openai/gpt-5.6-sol exec --json "运行测试并总结结果"
 ```
 
-未配置可用模型时，普通输入与 Headless/Exec 会明确返回 `MODEL_NOT_CONFIGURED`，不会创建 Agent Mission 或模拟 Usage。
+扩展能力包括 MCP stdio / HTTP / SSE / OAuth、Plugin、Skill、Browser Runtime、LSP 3.18、Git intelligence、Patch Preview 和安全 Undo。Browser、LSP 与 MCP 默认保持惰性，只有命令或 Agent 明确需要时才启动。
 
-## 项目隔离的多会话
-
-直接运行 `kernary` 每次创建新的项目本地 Session。Session 使用独立 ID、不可变 Transcript、Context、标题和设置；第一次有效用户对话会在本地生成不超过 48 字符的标题，不额外调用模型。Context 压缩不会删除 Session Transcript。
-
-```text
-kernary                    # 新 Session
-kernary -c                 # 继续当前项目最近 Session
-kernary -r                 # 当前项目 Session 选择器
-kernary -r <id-or-title>   # 按 ID 或唯一标题恢复
-
-/session                   # 会话内选择器
-/session list
-/session new
-/session switch <id-or-title>
-/session rename <title>
-```
-
-Session 只从当前工作目录的 `.harness/kernel.sqlite` 读取；不会搜索或显示其他项目的历史。
-
-## 权限等级
-
-权限策略与 Sandbox 技术边界保持分离：
-
-- `manual`：所有 Tool 操作确认；
-- `edit`：项目文件编辑自动，终端命令与外部操作确认；
-- `auto`：Sandbox 内低风险自动，高风险或越界操作确认；
-- `full`：Sandbox 内自动执行，Workspace Patch 仍二次确认；
-- `bypass`：Sandbox 内取消手动确认，包括 Patch；必须输入确认短语或传 `--confirm-bypass`。
-
-```text
-/permissions manual|edit|auto|full|bypass
-kernary --permission-mode edit
-kernary --permission-mode bypass --confirm-bypass
-```
-
-TUI 中可用 `Shift+Tab` 在 `manual → edit → auto → full` 之间循环；`bypass` 不进入快捷循环。
-
-任何等级都不能绕过 denied roots、项目边界和 Sandbox hard deny。
-
-## 系统级安全沙箱
-
-Kernary 默认使用 `workspace-write`，所有 `process.exec` 派生命令都继承同一边界；这不是只靠提示词或路径字符串检查：
-
-- Windows：受限 Primary Token、项目 capability SID、继承 ACL、私有 Desktop 和 Job Object；项目可写，但 `.git`、`.harness` 与项目外路径不可写；
-- Linux：系统 `bubblewrap` 的 mount/user/network namespace，根文件系统只读，只显式绑定项目写目录和隔离 `/tmp`；未安装 `bwrap` 时受限命令 fail closed；
-- `read-only`：项目只读，只保留隔离临时目录；
-- `danger-full-access`：关闭系统边界，必须输入确认短语或同时传入确认参数；
-- 网络默认关闭。Linux 是 network namespace 强制隔离；Windows unelevated 后端使用离线环境兼容层并在 `/sandbox` 中明确提示不是 WFP 防火墙级隔离。
-
-```text
-/sandbox
-/sandbox read-only
-/sandbox workspace-write
-/sandbox network-on        # 二次确认
-/sandbox network-off
-/sandbox danger-full-access # 二次确认
-
-kernary --sandbox read-only
-kernary --sandbox danger-full-access --confirm-dangerous-sandbox
-kernary --sandbox-network-access
-```
-
-Approval 只决定何时询问，Sandbox 决定操作系统实际允许什么；审批放行不会自动取消沙箱边界。
-
-Windows 首次运行受限命令时会给项目和隔离临时目录写入项目专属、幂等的 capability ACE；普通用户 Token 不含该 SID。若当前账户对项目没有 `WRITE_DAC`，命令会安全失败并显示错误，不会退回无沙箱执行。
-
-## 私有 agent.md
-
-Kernary 使用本机辅助指令文件 `agent.md`：项目私有 `.harness/agent.md` 存在时覆盖全局 `~/.kernary/agent.md`，否则读取全局文件。它们不会叠加，避免冲突和 Context 膨胀。
-
-```text
-/agentmd status
-/agentmd show
-/agentmd init-project
-/agentmd init-global
-```
-
-Kernary 会把 `/.harness/`、旧项目向量配置 `/kernary.vector.toml` 和 `/agent.md` 写入当前仓库的 `.git/info/exclude`。旧 `.harness/vector.toml` 会在全局配置不存在时自动迁移，但项目 Memory/Vector 数据始终留在 `.harness/`。
-
-## 内置 Agent 与 Adaptive 工作流
-
-Kernary 内置 15 个按职责、上下文、工具权限和证据责任划分的 Agent；空闲时全部 Sleeping。除原有 Staffing Router、Coordinator、Planner、Coder、Reviewer、Tester、Debugger、Researcher、Merge Agent 外，还包含：
-
-- Requirements Analyst：范围、非目标、歧义和确定性验收标准；
-- Explorer：隔离主会话的只读代码库入口、符号、依赖和数据流探索；
-- Architect：边界、契约、失败模式、迁移兼容和 ADR；
-- Security Auditor：独立威胁模型、漏洞和供应链证据门；
-- Performance Engineer：基线、负载、瓶颈与回归阈值证据门；
-- Release Manager：版本、产物、校验和与回滚就绪证据门。
-
-高保障任务使用能力路由工作流：
-
-```text
-/team adaptive 2 <objective>
-```
-
-Requirements 与 Explorer 首波并行，Architect 和 Planner 依赖其压缩结果；Coder 完成后 Reviewer 与命中的 Security/Performance 审计并行，Tester 汇总全部证据，发布类任务最后再经过 Release Manager。Security、Performance 和 Release 由目标关键词确定性激活，不会为无关任务凑数。Staffing Router 只读取结构化 capability/capacity/cost 元数据，不把完整 Agent 说明注入主会话。
-
-## 终端输入
-
-- `←` / `→`：按 Unicode 字符移动光标；`Ctrl+←` / `Ctrl+→`：按单词移动；
-- `Home` / `End`、`Delete` / `Backspace`：在任意输入位置编辑；
-- `Ctrl+A` / `Ctrl+E`、`Ctrl+U` / `Ctrl+K` / `Ctrl+W`：兼容常用 Shell 行编辑；
-- 输入 `/`：打开完整可滚动命令面板；`↑` / `↓` 选择，`Tab` 补全，`Esc` 关闭；
-- `PgUp` / `PgDn`：滚动主对话，不干扰输入历史和命令候选；
-- `/connect ` 与 `/model `：动态列出 Provider 与模型；
-- Bracketed Paste 会作为单行文本插入，不会因换行意外提交多条命令。
-
-## 核心能力
-
-- OpenAI Responses / OpenAI Chat / Anthropic Messages 协议与自定义中转站；
-- OpenCode Go、DeepSeek、OpenRouter、Ollama 等 Provider Catalog；
-- Lite / Balanced / Full / Custom 真实资源模式；
-- 15 个最小权限内置 Agent、能力路由 Adaptive DAG 与独立 Evidence Gate；
-- Context Broker、结构化压缩、Checkpoint、Rollback 与 Prompt Canonicalization；
-- MCP stdio/HTTP/SSE/OAuth、Plugin、Skill、Browser、LSP 3.18；
-- Permission Rule、Windows restricted-token/Linux bubblewrap 系统沙箱、Tool Journal、Patch Preview 与安全 Undo；
-- 严格非交互 `kernary exec`，适合 CI 和自动化。
-
-## Optional Vector 硬门
-
-未配置全局 `vector.toml` 的有效 Provider/模型（或兼容环境变量 `KERNARY_EMBEDDING_MODEL`）时，Kernary 不构造 Embedding Provider/Vector Backend，不创建向量表、generation 或 job。当前全局 Provider/模型通过项目启动健康检查后进入 Ready；第一次 semantic/hybrid 请求才惰性激活当前项目投影。检查失败时项目仍可启动，并明确降级为 lexical-only。
-
-## 从源码构建
+## 开发与验证
 
 ```bash
-cargo build --release -p harness-cli --bins
-cargo test --workspace --locked
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked --no-fail-fast
+npm test
+npm run fixtures:check
 ```
 
-Rust toolchain 版本见 `rust-toolchain.toml`。
+CI 还会构建 Windows x64、Linux x64 和 macOS arm64 便携产物，验证 `kernary` / `harness` 兼容命令、`doctor --json`、归档校验和及启动性能预算。
 
-## npm 包结构
+## 当前限制
 
-`kernary-code` 是无原生代码的启动器，通过 npm 原生 optional dependencies 选择平台包：
-
-- `kernary-code-win32-x64`
-- `kernary-code-linux-x64-gnu`
-
-安装脚本不会在 `postinstall` 阶段从网络下载可执行文件。
+- npm 包结构已经准备完成，但 `kernary-code` 尚未发布。
+- OpenAI-compatible Chat 路由只有在 Provider 明确支持时才有公开推理摘要；否则显示 Kernary 的阶段摘要。
+- Windows 的默认网络限制不是 WFP 防火墙级隔离，`/sandbox` 会如实显示实际后端强度。
+- 同一项目目录默认只允许一个 Kernary 进程持有状态锁；其他项目目录可以并行运行。
 
 ## 安全
 
-凭证进入操作系统 Credential Store，不写入项目文件。发现安全问题请不要公开 Issue，按 [SECURITY.md](SECURITY.md) 中的方式私下报告。
+凭证不进入项目文件或日志。发现安全问题请不要公开 Issue，按 [SECURITY.md](SECURITY.md) 私下报告。
 
 ## License
 
-Apache-2.0
+Apache-2.0。参见 [LICENSE-APACHE](LICENSE-APACHE) 与 [NOTICE](NOTICE)。

@@ -321,7 +321,8 @@ impl ModeProfile {
             RuntimeMode::Balanced | RuntimeMode::Custom => Self {
                 mode: settings.mode,
                 max_agents: 8,
-                max_parallel_agents: 4,
+                // OpenAI Multi-agent recommends three active subagents for most workloads.
+                max_parallel_agents: 3,
                 max_total_tokens: 100_000,
                 max_tool_calls: 128,
                 max_runtime_millis: 30 * 60 * 1_000,

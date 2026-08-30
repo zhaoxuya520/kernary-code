@@ -489,6 +489,7 @@ mod tests {
             response_format: ResponseFormat::Text,
             max_output_tokens: 100,
             previous_response_id: Some(ResponseId::from("resp_previous")),
+            prompt_cache: None,
             store: false,
             timeout: Duration::from_secs(10),
         }

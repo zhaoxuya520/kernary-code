@@ -113,6 +113,18 @@ pub fn build_responses_request(
     if let Some(previous_response_id) = &request.previous_response_id {
         body["previous_response_id"] = serde_json::json!(previous_response_id);
     }
+    if let Some(prompt_cache) = &request.prompt_cache {
+        // 先验证 ABI 边界，避免把动态任务误标为稳定前缀。
+        let _ = prompt_cache.dynamic_tail(&request.instructions)?;
+        body["prompt_cache_key"] = serde_json::json!(prompt_cache.key);
+        if request.model_id.as_str().starts_with("gpt-5.6") {
+            // GPT-5.6+ 明确声明隐式断点；旧模型只发送兼容的 cache key。
+            body["prompt_cache_options"] = serde_json::json!({
+                "mode": "implicit",
+                "ttl": "30m"
+            });
+        }
+    }
     Ok(body)
 }
 
@@ -182,7 +194,8 @@ mod tests {
     use std::time::Duration;
 
     use harness_model::{
-        ModelInputItem, ModelMessageRole, ReasoningLevel, ResponseFormat, ToolDefinition,
+        ModelInputItem, ModelMessageRole, PromptCachePolicy, ReasoningLevel, ResponseFormat,
+        ToolDefinition,
     };
     use harness_types::{ModelId, ResponseId, ToolCallId};
 
@@ -212,6 +225,7 @@ mod tests {
             response_format: ResponseFormat::Text,
             max_output_tokens: 100,
             previous_response_id: Some(ResponseId::from("response:1")),
+            prompt_cache: None,
             store: false,
             timeout: Duration::from_secs(10),
         }
@@ -226,6 +240,23 @@ mod tests {
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
+    }
+
+    #[test]
+    fn gpt_56_request_uses_stable_cache_key_and_implicit_breakpoint() {
+        let mut request = request();
+        request.model_id = ModelId::from("gpt-5.6");
+        request.prompt_cache = Some(
+            PromptCachePolicy::for_request(&request.instructions, &request.tools)
+                .expect("cache policy"),
+        );
+        let body = build_responses_request(&request, Some(ReasoningLevel::Off)).expect("body");
+        assert_eq!(
+            body["prompt_cache_key"],
+            request.prompt_cache.as_ref().expect("policy").key
+        );
+        assert_eq!(body["prompt_cache_options"]["mode"], "implicit");
+        assert_eq!(body["prompt_cache_options"]["ttl"], "30m");
     }
 
     #[test]
