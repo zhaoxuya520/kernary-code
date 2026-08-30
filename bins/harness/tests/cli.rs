@@ -1584,8 +1584,12 @@ models = ["late-coder"]
 fn canonical_global_provider_and_model_survive_empty_process_path_overrides() {
     let temporary = tempdir().expect("tempdir");
     let project = temporary.path().join("project");
-    let appdata = temporary.path().join("roaming");
-    let canonical_directory = appdata.join("Kernary");
+    let config_home = temporary.path().join("config-home");
+    let canonical_directory = if cfg!(windows) {
+        config_home.join("Kernary")
+    } else {
+        config_home.join("kernary")
+    };
     std::fs::create_dir_all(&project).expect("project");
     std::fs::create_dir_all(&canonical_directory).expect("canonical directory");
     std::fs::write(
@@ -1616,7 +1620,6 @@ models = ["canonical-coder"]
     command
         .current_dir(&project)
         .env_remove("KERNARY_ISOLATE_GLOBAL_CONFIG")
-        .env("APPDATA", &appdata)
         .env(
             "KERNARY_PROVIDER_CONFIG",
             temporary.path().join("override/missing-providers.toml"),
@@ -1624,7 +1627,13 @@ models = ["canonical-coder"]
         .env(
             "KERNARY_GLOBAL_MODEL_CONFIG",
             temporary.path().join("override/missing-model.json"),
-        )
+        );
+    if cfg!(windows) {
+        command.env("APPDATA", &config_home);
+    } else {
+        command.env("XDG_CONFIG_HOME", &config_home);
+    }
+    command
         .args(["--ui", "plain", "--ascii"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
