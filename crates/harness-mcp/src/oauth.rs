@@ -20,6 +20,10 @@ const MAX_METADATA_BYTES: usize = 1024 * 1024;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct McpOAuthConfig {
     pub client_id: String,
+    #[serde(default)]
+    pub client_secret_credential_id: Option<String>,
+    #[serde(default)]
+    pub token_endpoint_auth_method: Option<String>,
     pub resource_metadata_url: String,
     pub credential_id: String,
     #[serde(default)]
@@ -52,6 +56,15 @@ struct AuthorizationMetadata {
     issuer: String,
     authorization_endpoint: String,
     token_endpoint: String,
+    registration_endpoint: Option<String>,
+    token_endpoint_auth_methods: Vec<String>,
+    scopes_supported: Vec<String>,
+}
+
+struct RegisteredClient {
+    client_id: String,
+    client_secret: Option<String>,
+    token_endpoint_auth_method: String,
 }
 
 struct PendingOAuth {
@@ -60,6 +73,8 @@ struct PendingOAuth {
     redirect_uri: String,
     resource: String,
     metadata: AuthorizationMetadata,
+    client: RegisteredClient,
+    scopes: Vec<String>,
     receiver: mpsc::Receiver<Result<OAuthCallback, McpError>>,
     expires_at_millis: i64,
 }
@@ -67,7 +82,7 @@ struct PendingOAuth {
 struct OAuthCallback {
     code: String,
     state: String,
-    issuer: String,
+    issuer: Option<String>,
 }
 
 pub struct McpOAuthCoordinator {
@@ -103,7 +118,6 @@ impl McpOAuthCoordinator {
             return Err(McpError::new("mcp-oauth-already-pending", server_id));
         }
         validate_oauth_config(resource_endpoint, config)?;
-        let (resource, metadata) = self.discover(resource_endpoint, config)?;
         let listener = TcpListener::bind(("127.0.0.1", config.callback_port.unwrap_or(0)))
             .map_err(|error| McpError::new("mcp-oauth-callback-bind", error.to_string()))?;
         let callback_port = listener
@@ -111,6 +125,13 @@ impl McpOAuthCoordinator {
             .map_err(|error| McpError::new("mcp-oauth-callback-address", error.to_string()))?
             .port();
         let redirect_uri = format!("http://127.0.0.1:{callback_port}/callback");
+        let (resource, metadata) = self.discover(resource_endpoint, config)?;
+        let client = self.resolve_client(config, &metadata, &redirect_uri)?;
+        let scopes = if config.scopes.is_empty() {
+            metadata.scopes_supported.clone()
+        } else {
+            config.scopes.clone()
+        };
         let state = random_base64url(32)?;
         let verifier = random_base64url(32)?;
         let challenge = base64url(&Sha256::digest(verifier.as_bytes()));
@@ -120,14 +141,14 @@ impl McpOAuthCoordinator {
             let mut query = authorization_url.query_pairs_mut();
             query
                 .append_pair("response_type", "code")
-                .append_pair("client_id", &config.client_id)
+                .append_pair("client_id", &client.client_id)
                 .append_pair("redirect_uri", &redirect_uri)
                 .append_pair("state", &state)
                 .append_pair("code_challenge", &challenge)
                 .append_pair("code_challenge_method", "S256")
                 .append_pair("resource", &resource);
-            if !config.scopes.is_empty() {
-                query.append_pair("scope", &config.scopes.join(" "));
+            if !scopes.is_empty() {
+                query.append_pair("scope", &scopes.join(" "));
             }
         }
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -149,6 +170,8 @@ impl McpOAuthCoordinator {
                 redirect_uri: redirect_uri.clone(),
                 resource,
                 metadata,
+                client,
+                scopes,
                 receiver,
                 expires_at_millis,
             },
@@ -191,20 +214,27 @@ impl McpOAuthCoordinator {
         if !constant_time_eq(callback.state.as_bytes(), pending.state.as_bytes()) {
             return Err(McpError::new("mcp-oauth-state-mismatch", server_id));
         }
-        if callback.issuer != pending.metadata.issuer {
-            return Err(McpError::new("mcp-oauth-issuer-mismatch", callback.issuer));
+        if callback
+            .issuer
+            .as_ref()
+            .is_some_and(|issuer| issuer != &pending.metadata.issuer)
+        {
+            return Err(McpError::new(
+                "mcp-oauth-issuer-mismatch",
+                callback.issuer.unwrap_or_default(),
+            ));
         }
-        let token = self.exchange_token(
-            &pending.metadata,
-            vec![
-                ("grant_type".to_owned(), "authorization_code".to_owned()),
-                ("code".to_owned(), callback.code),
-                ("redirect_uri".to_owned(), pending.redirect_uri),
-                ("client_id".to_owned(), config.client_id.clone()),
-                ("code_verifier".to_owned(), pending.verifier),
-                ("resource".to_owned(), pending.resource),
-            ],
-        )?;
+        let mut token_fields = vec![
+            ("grant_type".to_owned(), "authorization_code".to_owned()),
+            ("code".to_owned(), callback.code),
+            ("redirect_uri".to_owned(), pending.redirect_uri),
+            ("code_verifier".to_owned(), pending.verifier),
+            ("resource".to_owned(), pending.resource),
+        ];
+        if !pending.scopes.is_empty() {
+            token_fields.push(("scope".to_owned(), pending.scopes.join(" ")));
+        }
+        let token = self.exchange_token(&pending.metadata, token_fields, &pending.client)?;
         self.store_tokens(config, token)?;
         self.status(server_id, Some(config))
     }
@@ -226,15 +256,52 @@ impl McpOAuthCoordinator {
             .expose_secret()
             .map(str::to_owned)
             .map_err(|error| McpError::new(error.code, error.message))?;
+        let client = RegisteredClient {
+            client_id: config.client_id.clone(),
+            client_secret: None,
+            token_endpoint_auth_method: "none".to_owned(),
+        };
         let token = self.exchange_token(
             &metadata,
             vec![
                 ("grant_type".to_owned(), "refresh_token".to_owned()),
                 ("refresh_token".to_owned(), refresh),
-                ("client_id".to_owned(), config.client_id.clone()),
                 ("resource".to_owned(), resource),
             ],
+            &client,
         )?;
+        self.store_tokens(config, token)?;
+        self.status(server_id, Some(config))
+    }
+
+    pub fn client_credentials(
+        &self,
+        server_id: &str,
+        resource_endpoint: &str,
+        config: &McpOAuthConfig,
+    ) -> Result<McpOAuthStatus, McpError> {
+        validate_oauth_config(resource_endpoint, config)?;
+        if config.client_id.trim().is_empty() {
+            return Err(McpError::new(
+                "mcp-oauth-client-credentials-client-id-missing",
+                server_id,
+            ));
+        }
+        let (resource, metadata) = self.discover(resource_endpoint, config)?;
+        let client = self.resolve_client(config, &metadata, "")?;
+        let scopes = if config.scopes.is_empty() {
+            metadata.scopes_supported.clone()
+        } else {
+            config.scopes.clone()
+        };
+        let mut fields = vec![
+            ("grant_type".to_owned(), "client_credentials".to_owned()),
+            ("resource".to_owned(), resource),
+        ];
+        if !scopes.is_empty() {
+            fields.push(("scope".to_owned(), scopes.join(" ")));
+        }
+        let token = self.exchange_token(&metadata, fields, &client)?;
         self.store_tokens(config, token)?;
         self.status(server_id, Some(config))
     }
@@ -271,52 +338,93 @@ impl McpOAuthCoordinator {
         resource_endpoint: &str,
         config: &McpOAuthConfig,
     ) -> Result<(String, AuthorizationMetadata), McpError> {
-        let protected = fetch_json(
-            &self.transport,
-            &config.resource_metadata_url,
-            Duration::from_secs(15),
-        )?;
-        let resource = protected
-            .get("resource")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| McpError::new("mcp-oauth-resource-missing", "resource metadata"))?
-            .to_owned();
-        if normalize_url(&resource)? != normalize_url(resource_endpoint)? {
-            return Err(McpError::new("mcp-oauth-resource-mismatch", resource));
-        }
-        let servers = protected
-            .get("authorization_servers")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| {
-                McpError::new(
-                    "mcp-oauth-authorization-server-missing",
-                    "resource metadata",
-                )
-            })?;
-        let issuer = if let Some(expected) = &config.expected_issuer {
-            let expected_normalized = normalize_url(expected)?;
-            servers
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .find(|server| {
-                    normalize_url(server).is_ok_and(|server| server == expected_normalized)
-                })
-                .ok_or_else(|| McpError::new("mcp-oauth-issuer-mismatch", expected))?
-                .to_owned()
+        let (resource, issuer, protected) = if config.resource_metadata_url.is_empty() {
+            let endpoint = Url::parse(resource_endpoint)
+                .map_err(|error| McpError::new("mcp-oauth-resource-url", error.to_string()))?;
+            let issuer = config
+                .expected_issuer
+                .clone()
+                .unwrap_or_else(|| endpoint.origin().ascii_serialization());
+            (normalize_url(resource_endpoint)?, issuer, None)
         } else {
-            servers
-                .first()
+            let protected = fetch_json(
+                &self.transport,
+                &config.resource_metadata_url,
+                Duration::from_secs(15),
+            )?;
+            let resource = protected
+                .get("resource")
                 .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| McpError::new("mcp-oauth-resource-missing", "resource metadata"))?
+                .to_owned();
+            if !resource_matches_endpoint(&resource, resource_endpoint)? {
+                return Err(McpError::new("mcp-oauth-resource-mismatch", resource));
+            }
+            let servers = protected
+                .get("authorization_servers")
+                .and_then(serde_json::Value::as_array)
                 .ok_or_else(|| {
                     McpError::new(
                         "mcp-oauth-authorization-server-missing",
                         "resource metadata",
                     )
-                })?
-                .to_owned()
+                })?;
+            let issuer = if let Some(expected) = &config.expected_issuer {
+                let expected_normalized = normalize_url(expected)?;
+                servers
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .find(|server| {
+                        normalize_url(server).is_ok_and(|server| server == expected_normalized)
+                    })
+                    .ok_or_else(|| McpError::new("mcp-oauth-issuer-mismatch", expected))?
+                    .to_owned()
+            } else {
+                servers
+                    .first()
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        McpError::new(
+                            "mcp-oauth-authorization-server-missing",
+                            "resource metadata",
+                        )
+                    })?
+                    .to_owned()
+            };
+            (resource, issuer, Some(protected))
         };
         let metadata_url = authorization_metadata_url(&issuer)?;
-        let authorization = fetch_json(&self.transport, &metadata_url, Duration::from_secs(15))?;
+        let authorization =
+            match fetch_json(&self.transport, &metadata_url, Duration::from_secs(15)) {
+                Ok(metadata) => metadata,
+                Err(error)
+                    if error.code == "mcp-oauth-metadata-status" && error.message == "404" =>
+                {
+                    match fetch_json(
+                        &self.transport,
+                        &openid_metadata_url(&issuer)?,
+                        Duration::from_secs(15),
+                    ) {
+                        Ok(metadata) => metadata,
+                        Err(error)
+                            if error.code == "mcp-oauth-metadata-status"
+                                && error.message == "404"
+                                && config.resource_metadata_url.is_empty() =>
+                        {
+                            serde_json::json!({
+                                "issuer":issuer,
+                                "authorization_endpoint":format!("{issuer}/authorize"),
+                                "token_endpoint":format!("{issuer}/token"),
+                                "registration_endpoint":format!("{issuer}/register"),
+                                "code_challenge_methods_supported":["S256"],
+                                "token_endpoint_auth_methods_supported":["none"]
+                            })
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) => return Err(error),
+            };
         let returned_issuer = required_url_field(&authorization, "issuer")?;
         if normalize_url(&returned_issuer)? != normalize_url(&issuer)? {
             return Err(McpError::new(
@@ -331,6 +439,52 @@ impl McpOAuthCoordinator {
         if !methods.iter().any(|method| method.as_str() == Some("S256")) {
             return Err(McpError::new("mcp-oauth-pkce-s256-required", issuer));
         }
+        let registration_endpoint = authorization
+            .get("registration_endpoint")
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| {
+                        McpError::new(
+                            "mcp-oauth-registration-endpoint-invalid",
+                            "registration_endpoint",
+                        )
+                    })
+                    .and_then(|endpoint| {
+                        validate_https_or_loopback(endpoint)?;
+                        Ok(endpoint.to_owned())
+                    })
+            })
+            .transpose()?;
+        let token_endpoint_auth_methods = authorization
+            .get("token_endpoint_auth_methods_supported")
+            .and_then(serde_json::Value::as_array)
+            .map(|methods| {
+                methods
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|methods| !methods.is_empty())
+            .unwrap_or_else(|| vec!["none".to_owned()]);
+        let scopes_supported = authorization
+            .get("scopes_supported")
+            .or_else(|| {
+                protected
+                    .as_ref()
+                    .and_then(|protected| protected.get("scopes_supported"))
+            })
+            .and_then(serde_json::Value::as_array)
+            .map(|scopes| {
+                scopes
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter(|scope| !scope.is_empty() && !scope.contains(char::is_whitespace))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         Ok((
             resource,
             AuthorizationMetadata {
@@ -340,22 +494,179 @@ impl McpOAuthCoordinator {
                     "authorization_endpoint",
                 )?,
                 token_endpoint: required_url_field(&authorization, "token_endpoint")?,
+                registration_endpoint,
+                token_endpoint_auth_methods,
+                scopes_supported,
             },
         ))
+    }
+
+    fn resolve_client(
+        &self,
+        config: &McpOAuthConfig,
+        metadata: &AuthorizationMetadata,
+        redirect_uri: &str,
+    ) -> Result<RegisteredClient, McpError> {
+        if !config.client_id.trim().is_empty() {
+            let client_secret = config
+                .client_secret_credential_id
+                .as_ref()
+                .map(|credential_id| {
+                    self.credentials
+                        .get(&CredentialId::new(credential_id.clone()))
+                        .map_err(|error| McpError::new(error.code, error.message))?
+                        .ok_or_else(|| {
+                            McpError::new("mcp-oauth-client-secret-missing", credential_id)
+                        })?
+                        .expose_secret()
+                        .map(str::to_owned)
+                        .map_err(|error| McpError::new(error.code, error.message))
+                })
+                .transpose()?;
+            let token_endpoint_auth_method = config
+                .token_endpoint_auth_method
+                .clone()
+                .or_else(|| {
+                    client_secret.as_ref().and_then(|_| {
+                        ["client_secret_basic", "client_secret_post"]
+                            .into_iter()
+                            .find(|method| {
+                                metadata
+                                    .token_endpoint_auth_methods
+                                    .iter()
+                                    .any(|supported| supported == method)
+                            })
+                            .map(str::to_owned)
+                    })
+                })
+                .unwrap_or_else(|| "none".to_owned());
+            if !metadata
+                .token_endpoint_auth_methods
+                .iter()
+                .any(|supported| supported == &token_endpoint_auth_method)
+            {
+                return Err(McpError::new(
+                    "mcp-oauth-token-auth-unsupported",
+                    token_endpoint_auth_method,
+                ));
+            }
+            return Ok(RegisteredClient {
+                client_id: config.client_id.clone(),
+                client_secret,
+                token_endpoint_auth_method,
+            });
+        }
+        let registration_endpoint = metadata.registration_endpoint.as_ref().ok_or_else(|| {
+            McpError::new(
+                "mcp-oauth-dynamic-registration-unavailable",
+                &metadata.issuer,
+            )
+        })?;
+        let preferred_method = ["none", "client_secret_basic", "client_secret_post"]
+            .into_iter()
+            .find(|method| {
+                metadata
+                    .token_endpoint_auth_methods
+                    .iter()
+                    .any(|supported| supported == method)
+            })
+            .ok_or_else(|| {
+                McpError::new(
+                    "mcp-oauth-token-auth-unsupported",
+                    metadata.token_endpoint_auth_methods.join(","),
+                )
+            })?;
+        let response = self
+            .transport
+            .send(StreamingHttpRequest::json(
+                registration_endpoint.clone(),
+                serde_json::json!({
+                    "client_name":"Kernary",
+                    "redirect_uris":[redirect_uri],
+                    "grant_types":["authorization_code","refresh_token"],
+                    "response_types":["code"],
+                    "token_endpoint_auth_method":preferred_method
+                }),
+                Duration::from_secs(30),
+            ))
+            .map_err(|error| McpError::new(error.code, error.message).retryable(error.timeout))?;
+        if !matches!(response.status, 200 | 201) {
+            return Err(McpError::new(
+                "mcp-oauth-registration-status",
+                response.status.to_string(),
+            ));
+        }
+        let value = read_json_response(response.body)?;
+        let client_id = value
+            .get("client_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| McpError::new("mcp-oauth-registration-client-id-missing", "client_id"))?
+            .to_owned();
+        let client_secret = value
+            .get("client_secret")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let token_endpoint_auth_method = value
+            .get("token_endpoint_auth_method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(preferred_method)
+            .to_owned();
+        if !metadata
+            .token_endpoint_auth_methods
+            .iter()
+            .any(|supported| supported == &token_endpoint_auth_method)
+        {
+            return Err(McpError::new(
+                "mcp-oauth-registration-auth-method-mismatch",
+                token_endpoint_auth_method,
+            ));
+        }
+        Ok(RegisteredClient {
+            client_id,
+            client_secret,
+            token_endpoint_auth_method,
+        })
     }
 
     fn exchange_token(
         &self,
         metadata: &AuthorizationMetadata,
-        fields: Vec<(String, String)>,
+        mut fields: Vec<(String, String)>,
+        client: &RegisteredClient,
     ) -> Result<TokenResponse, McpError> {
+        let mut request = StreamingHttpRequest::form(
+            metadata.token_endpoint.clone(),
+            fields.clone(),
+            Duration::from_secs(30),
+        );
+        match client.token_endpoint_auth_method.as_str() {
+            "none" => fields.push(("client_id".to_owned(), client.client_id.clone())),
+            "client_secret_post" => {
+                fields.push(("client_id".to_owned(), client.client_id.clone()));
+                fields.push((
+                    "client_secret".to_owned(),
+                    client.client_secret.clone().ok_or_else(|| {
+                        McpError::new("mcp-oauth-client-secret-missing", "client_secret_post")
+                    })?,
+                ));
+            }
+            "client_secret_basic" => {
+                let secret = client.client_secret.as_ref().ok_or_else(|| {
+                    McpError::new("mcp-oauth-client-secret-missing", "client_secret_basic")
+                })?;
+                let encoded = base64_standard(format!("{}:{secret}", client.client_id).as_bytes());
+                request = request.with_sensitive_header(
+                    "Authorization",
+                    SecretString::new(format!("Basic {encoded}")),
+                );
+            }
+            method => return Err(McpError::new("mcp-oauth-token-auth-unsupported", method)),
+        }
+        request.body = harness_http::HttpBody::Form(fields);
         let response = self
             .transport
-            .send(StreamingHttpRequest::form(
-                metadata.token_endpoint.clone(),
-                fields,
-                Duration::from_secs(30),
-            ))
+            .send(request)
             .map_err(|error| McpError::new(error.code, error.message).retryable(error.timeout))?;
         if !(200..300).contains(&response.status) {
             return Err(McpError::new(
@@ -532,8 +843,7 @@ fn read_callback(mut stream: TcpStream) -> Result<OAuthCallback, McpError> {
         issuer: query
             .get("iss")
             .filter(|value| value.len() <= 2048)
-            .cloned()
-            .ok_or_else(|| McpError::new("mcp-oauth-issuer-missing", "callback"))?,
+            .cloned(),
     };
     write_callback_response(&mut stream, true);
     Ok(callback)
@@ -555,11 +865,21 @@ fn write_callback_response(stream: &mut TcpStream, success: bool) {
 
 fn validate_oauth_config(resource_endpoint: &str, config: &McpOAuthConfig) -> Result<(), McpError> {
     validate_https_or_loopback(resource_endpoint)?;
-    validate_https_or_loopback(&config.resource_metadata_url)?;
-    if config.client_id.trim().is_empty() || config.credential_id.trim().is_empty() {
+    if config.resource_metadata_url.is_empty() {
+        let issuer = config.expected_issuer.as_deref().ok_or_else(|| {
+            McpError::new(
+                "mcp-oauth-legacy-issuer-required",
+                "expectedIssuer is required when PRM is unavailable",
+            )
+        })?;
+        validate_https_or_loopback(issuer)?;
+    } else {
+        validate_https_or_loopback(&config.resource_metadata_url)?;
+    }
+    if config.credential_id.trim().is_empty() {
         return Err(McpError::new(
             "mcp-oauth-config-invalid",
-            "clientId/credentialId required",
+            "credentialId required",
         ));
     }
     if config
@@ -596,6 +916,18 @@ fn authorization_metadata_url(issuer: &str) -> Result<String, McpError> {
     Ok(metadata.into())
 }
 
+fn openid_metadata_url(issuer: &str) -> Result<String, McpError> {
+    let issuer = Url::parse(issuer)
+        .map_err(|error| McpError::new("mcp-oauth-issuer-url", error.to_string()))?;
+    validate_https_or_loopback(issuer.as_str())?;
+    let mut metadata = issuer.clone();
+    let issuer_path = issuer.path().trim_end_matches('/');
+    metadata.set_path(&format!("{issuer_path}/.well-known/openid-configuration"));
+    metadata.set_query(None);
+    metadata.set_fragment(None);
+    Ok(metadata.into())
+}
+
 fn normalize_url(value: &str) -> Result<String, McpError> {
     let mut url = Url::parse(value)
         .map_err(|error| McpError::new("mcp-oauth-url-invalid", error.to_string()))?;
@@ -605,6 +937,19 @@ fn normalize_url(value: &str) -> Result<String, McpError> {
         url.set_path(&trimmed);
     }
     Ok(url.into())
+}
+
+fn resource_matches_endpoint(resource: &str, endpoint: &str) -> Result<bool, McpError> {
+    if normalize_url(resource)? == normalize_url(endpoint)? {
+        return Ok(true);
+    }
+    let resource = Url::parse(resource)
+        .map_err(|error| McpError::new("mcp-oauth-resource-url", error.to_string()))?;
+    let endpoint = Url::parse(endpoint)
+        .map_err(|error| McpError::new("mcp-oauth-resource-url", error.to_string()))?;
+    Ok(resource.origin() == endpoint.origin()
+        && matches!(resource.path(), "" | "/")
+        && resource.query().is_none())
 }
 
 fn validate_https_or_loopback(value: &str) -> Result<(), McpError> {
@@ -645,6 +990,30 @@ fn base64url(bytes: &[u8]) -> String {
         if chunk.len() > 2 {
             output.push(TABLE[(value & 63) as usize] as char);
         }
+    }
+    output
+}
+
+fn base64_standard(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let a = u32::from(chunk[0]);
+        let b = u32::from(*chunk.get(1).unwrap_or(&0));
+        let c = u32::from(*chunk.get(2).unwrap_or(&0));
+        let value = (a << 16) | (b << 8) | c;
+        output.push(TABLE[((value >> 18) & 63) as usize] as char);
+        output.push(TABLE[((value >> 12) & 63) as usize] as char);
+        output.push(if chunk.len() > 1 {
+            TABLE[((value >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        output.push(if chunk.len() > 2 {
+            TABLE[(value & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     output
 }
@@ -718,6 +1087,8 @@ mod tests {
     fn oauth_config() -> McpOAuthConfig {
         McpOAuthConfig {
             client_id: "public-client".to_owned(),
+            client_secret_credential_id: None,
+            token_endpoint_auth_method: None,
             resource_metadata_url: "https://mcp.example.test/.well-known/oauth-protected-resource"
                 .to_owned(),
             credential_id: "mcp:test:access".to_owned(),

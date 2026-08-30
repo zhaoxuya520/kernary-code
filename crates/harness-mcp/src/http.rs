@@ -31,6 +31,7 @@ pub struct StreamableHttpMcpTransport {
     session_id: Mutex<Option<String>>,
     protocol_version: Mutex<Option<String>>,
     last_event_id: Mutex<Option<String>>,
+    authorization_challenge: Mutex<Option<String>>,
     closed: AtomicBool,
 }
 
@@ -72,6 +73,7 @@ impl StreamableHttpMcpTransport {
             session_id: Mutex::new(None),
             protocol_version: Mutex::new(None),
             last_event_id: Mutex::new(None),
+            authorization_challenge: Mutex::new(None),
             closed: AtomicBool::new(false),
         }))
     }
@@ -105,6 +107,14 @@ impl StreamableHttpMcpTransport {
             return Ok(None);
         }
         if matches!(response.status, 401 | 403) {
+            if let Some(challenge) = response.headers.get("www-authenticate") {
+                validate_header_value(challenge, "www-authenticate")?;
+                *self
+                    .authorization_challenge
+                    .lock()
+                    .map_err(|_| McpError::new("mcp-authorization-challenge-poisoned", "lock"))? =
+                    Some(challenge.clone());
+            }
             return Err(McpError::new(
                 "mcp-http-authorization-required",
                 response.status.to_string(),
@@ -255,6 +265,13 @@ impl StreamableHttpMcpTransport {
             None,
         )?;
         Ok(())
+    }
+
+    pub fn authorization_challenge(&self) -> Result<Option<String>, McpError> {
+        self.authorization_challenge
+            .lock()
+            .map_err(|_| McpError::new("mcp-authorization-challenge-poisoned", "lock"))
+            .map(|challenge| challenge.clone())
     }
 
     fn remember_last_event_id(&self, event_id: Option<String>) -> Result<(), McpError> {

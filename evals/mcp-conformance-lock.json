@@ -17,25 +17,35 @@
     "sse-retry",
     "elicitation-sep1034-client-defaults"
   ],
-  "pendingAuthScenarios": [
+  "requiredAuthScenarios": [
     "auth/metadata-default",
     "auth/metadata-var1",
-    "auth/metadata-var2",
-    "auth/metadata-var3",
-    "auth/basic-cimd",
     "auth/2025-03-26-oauth-metadata-backcompat",
     "auth/2025-03-26-oauth-endpoint-fallback",
     "auth/scope-from-www-authenticate",
     "auth/scope-from-scopes-supported",
     "auth/scope-omitted-when-undefined",
-    "auth/scope-step-up",
-    "auth/scope-retry-limit",
     "auth/token-endpoint-auth-basic",
     "auth/token-endpoint-auth-post",
     "auth/token-endpoint-auth-none",
     "auth/resource-mismatch",
     "auth/pre-registration",
-    "auth/client-credentials-jwt",
     "auth/client-credentials-basic"
+  ],
+  "knownRefereeDefects": [
+    {
+      "scenario": "auth/metadata-var2",
+      "reason": "PRM authorization_servers identifies /tenant1, but returned metadata issuer is the origin root; Kernary preserves exact issuer validation."
+    },
+    {
+      "scenario": "auth/metadata-var3",
+      "reason": "PRM authorization_servers identifies /tenant1, but returned OIDC metadata issuer is the origin root; Kernary preserves exact issuer validation."
+    }
+  ],
+  "pendingAuthScenarios": [
+    "auth/basic-cimd",
+    "auth/scope-step-up",
+    "auth/scope-retry-limit",
+    "auth/client-credentials-jwt"
   ]
 }

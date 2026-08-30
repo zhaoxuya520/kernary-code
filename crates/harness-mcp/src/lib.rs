@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
 pub use http::{McpInboundStream, McpStreamableHttpConfig, StreamableHttpMcpTransport};
-pub use oauth::{McpOAuthConfig, McpOAuthStart, McpOAuthStatus};
+pub use oauth::{McpOAuthConfig, McpOAuthCoordinator, McpOAuthStart, McpOAuthStatus};
 pub use protocol::{
     LATEST_STABLE_PROTOCOL_VERSION, McpCallToolResult, McpClient, McpError, McpPromptDescriptor,
     McpResourceDescriptor, McpServerInfo, McpTaskSupport, McpToolAnnotations, McpToolDescriptor,

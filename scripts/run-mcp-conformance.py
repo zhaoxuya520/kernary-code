@@ -52,7 +52,9 @@ def main() -> int:
     ).resolve(strict=True)
     client = args.client.resolve(strict=True)
     results = []
-    for scenario in lock["requiredCoreScenarios"]:
+    core_scenarios = lock["requiredCoreScenarios"]
+    auth_scenarios = lock.get("requiredAuthScenarios", [])
+    for scenario in [*core_scenarios, *auth_scenarios]:
         command = [
             "node",
             str(referee),
@@ -82,6 +84,7 @@ def main() -> int:
         results.append(
             {
                 "scenario": scenario,
+                "category": "auth" if scenario in auth_scenarios else "core",
                 "passed": passed,
                 "returnCode": completed.returncode,
                 "durationSeconds": duration,
@@ -89,29 +92,39 @@ def main() -> int:
             }
         )
 
-    passed = sum(1 for result in results if result["passed"])
+    core_results = [result for result in results if result["category"] == "core"]
+    auth_results = [result for result in results if result["category"] == "auth"]
+    core_passed = sum(1 for result in core_results if result["passed"])
+    auth_passed = sum(1 for result in auth_results if result["passed"])
     report = {
         "schemaVersion": 1,
         "referee": lock["referee"],
         "sdkOverride": lock["sdkOverride"],
         "core": {
-            "passed": passed,
-            "total": len(results),
-            "complete": passed == len(results),
+            "passed": core_passed,
+            "total": len(core_results),
+            "complete": core_passed == len(core_results),
         },
         "results": results,
         "auth": {
-            "passed": 0,
-            "total": len(lock["pendingAuthScenarios"]),
-            "status": "pending",
-            "scenarios": lock["pendingAuthScenarios"],
+            "passed": auth_passed,
+            "required": len(auth_results),
+            "total": len(auth_results) + len(lock["pendingAuthScenarios"]) + len(lock.get("knownRefereeDefects", [])),
+            "status": "partial",
+            "pendingScenarios": lock["pendingAuthScenarios"],
+            "knownRefereeDefects": lock.get("knownRefereeDefects", []),
         },
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"MCP core: {passed}/{len(results)}; auth: 0/{len(lock['pendingAuthScenarios'])} pending")
+    print(
+        f"MCP core: {core_passed}/{len(core_results)}; "
+        f"auth required: {auth_passed}/{len(auth_results)}; "
+        f"pending: {len(lock['pendingAuthScenarios'])}; "
+        f"referee defects: {len(lock.get('knownRefereeDefects', []))}"
+    )
     print(f"Report: {args.output}")
-    return 0 if passed == len(results) else 1
+    return 0 if core_passed == len(core_results) and auth_passed == len(auth_results) else 1
 
 
 if __name__ == "__main__":
