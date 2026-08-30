@@ -60,6 +60,15 @@ impl WorkspacePathGuard {
         Ok(canonical)
     }
 
+    /// 只供 typed `files.read` 使用的跨工作区只读解析。
+    /// Process cwd、Browser upload 和所有写工具继续受 workspace root 限制。
+    pub fn resolve_file_read(&self, requested: &Path) -> Result<PathBuf, ToolError> {
+        let lexical = self.lexical_target(requested)?;
+        let canonical = fs::canonicalize(&lexical)
+            .map_err(|error| io_error("filesystem-read-canonicalize", error))?;
+        Ok(canonical)
+    }
+
     pub fn resolve_write(&self, requested: &Path) -> Result<PathBuf, ToolError> {
         let lexical = self.lexical_target(requested)?;
         if lexical.exists() {
@@ -577,7 +586,7 @@ impl SandboxPort for WorkspaceSandbox {
         match permission_action {
             PermissionAction::InternalCompute { .. } => {}
             PermissionAction::FilesystemRead { path } => {
-                self.guard.resolve_read(path)?;
+                self.guard.resolve_file_read(path)?;
             }
             PermissionAction::FilesystemWrite { path } => {
                 self.guard.resolve_write(path)?;
@@ -822,8 +831,10 @@ struct FileReadTool {
 
 impl ToolProvider for FileReadTool {
     fn validate_args(&self, value: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
-        path_arg(value)?;
-        Ok(value.clone())
+        let canonical = self.guard.resolve_file_read(&path_arg(value)?)?;
+        let mut normalized = value.clone();
+        normalized["path"] = serde_json::json!(canonical);
+        Ok(normalized)
     }
 
     fn validate_result(&self, value: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
@@ -846,7 +857,7 @@ impl ToolProvider for FileReadTool {
 
     fn permission_action(&self, args: &serde_json::Value) -> Result<PermissionAction, ToolError> {
         Ok(PermissionAction::FilesystemRead {
-            path: self.guard.resolve_read(&path_arg(args)?)?,
+            path: self.guard.resolve_file_read(&path_arg(args)?)?,
         })
     }
 
@@ -854,7 +865,7 @@ impl ToolProvider for FileReadTool {
         if input.cancellation.is_cancelled() {
             return Err(ToolError::new("tool-cancelled", "files.read cancelled"));
         }
-        let path = self.guard.resolve_read(&path_arg(&input.args)?)?;
+        let path = self.guard.resolve_file_read(&path_arg(&input.args)?)?;
         let metadata =
             fs::metadata(&path).map_err(|error| io_error("files-read-metadata", error))?;
         if !metadata.is_file() {
@@ -1408,13 +1419,76 @@ mod tests {
         let temporary = tempdir().expect("tempdir");
         let root = temporary.path().join("project");
         fs::create_dir_all(&root).expect("root");
+        let outside = temporary.path().join("outside.txt");
+        fs::write(&outside, "readable").expect("outside fixture");
         let guard = WorkspacePathGuard::new(&root).expect("guard");
+        assert!(guard.resolve_read(&outside).is_err());
+        assert_eq!(
+            guard
+                .resolve_file_read(&outside)
+                .expect("external file read"),
+            fs::canonicalize(&outside).expect("canonical outside")
+        );
         assert!(guard.resolve_write(Path::new("../escape.txt")).is_err());
         assert!(
             guard
                 .resolve_write(&temporary.path().join("project-other/file.txt"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn workspace_write_reads_external_file_but_cannot_write_it() {
+        let temporary = tempdir().expect("tempdir");
+        let root = temporary.path().join("project");
+        fs::create_dir_all(&root).expect("root");
+        let outside = temporary.path().join("outside-readme.md");
+        fs::write(&outside, "# External README\n").expect("outside fixture");
+        let guard = WorkspacePathGuard::new(&root).expect("guard");
+        let mut registry = ToolRegistry::new();
+        register_file_tools(&mut registry, guard.clone(), 1024).expect("register");
+        let runtime = ToolRuntime::new(
+            registry,
+            PermissionEngine::new(
+                workspace_write_profile(guard.root().to_path_buf()),
+                ApprovalPolicy::NeverWithinSandbox,
+            ),
+            Arc::new(MemoryToolJournal::new()),
+            Arc::new(WorkspaceSandbox::new(guard)),
+        );
+        let read = runtime
+            .invoke(ToolInvokeRequest {
+                invocation_id: ToolInvocationId::from("invocation:external-read"),
+                approval_request_id: PermissionRequestId::from("approval:external-read"),
+                idempotency_key: "external-read:1".to_owned(),
+                envelope: envelope(),
+                tool_name: "files.read".to_owned(),
+                args: serde_json::json!({"path":outside}),
+                now_millis: 1,
+            })
+            .expect("external read");
+        assert_eq!(read.invocation.status, ToolInvocationStatus::Completed);
+        assert_eq!(
+            read.invocation
+                .result
+                .as_ref()
+                .and_then(|value| value.get("content"))
+                .and_then(serde_json::Value::as_str),
+            Some("# External README\n")
+        );
+
+        let error = runtime
+            .invoke(ToolInvokeRequest {
+                invocation_id: ToolInvocationId::from("invocation:external-write"),
+                approval_request_id: PermissionRequestId::from("approval:external-write"),
+                idempotency_key: "external-write:1".to_owned(),
+                envelope: envelope(),
+                tool_name: "files.write".to_owned(),
+                args: serde_json::json!({"path":outside,"content":"blocked"}),
+                now_millis: 2,
+            })
+            .expect_err("external write must stay blocked");
+        assert_eq!(error.code, "workspace-path-escape");
     }
 
     #[test]

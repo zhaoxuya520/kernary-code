@@ -1,0 +1,126 @@
+{
+  "schemaVersion": 1,
+  "localGates": [
+    {
+      "id": "format",
+      "category": "build-quality",
+      "weight": 5,
+      "profiles": ["quick", "full"],
+      "command": ["{cargo}", "fmt", "--all", "--", "--check"]
+    },
+    {
+      "id": "strict-clippy",
+      "category": "build-quality",
+      "weight": 10,
+      "profiles": ["full"],
+      "command": ["{cargo}", "clippy", "--workspace", "--all-targets", "--locked", "--offline", "--", "-D", "warnings"]
+    },
+    {
+      "id": "rust-workspace",
+      "category": "correctness",
+      "weight": 10,
+      "profiles": ["full"],
+      "command": ["{cargo}", "test", "--workspace", "--locked", "--offline", "--quiet"]
+    },
+    {
+      "id": "release-performance",
+      "category": "performance",
+      "weight": 5,
+      "profiles": ["quick", "full"],
+      "command": ["{python}", "scripts/benchmark-release.py", "{binary}", "--iterations", "20"]
+    },
+    {
+      "id": "typescript-oracle",
+      "category": "cross-implementation-contract",
+      "weight": 10,
+      "profiles": ["full"],
+      "command": ["{npm}", "test", "--", "--runInBand"]
+    },
+    {
+      "id": "fixture-parity",
+      "category": "cross-implementation-contract",
+      "weight": 5,
+      "profiles": ["full"],
+      "command": ["{npm}", "run", "fixtures:check"]
+    },
+    {
+      "id": "sandbox-permission-tools",
+      "category": "security",
+      "weight": 15,
+      "profiles": ["quick", "full"],
+      "command": ["{cargo}", "test", "-p", "harness-permission", "-p", "harness-builtin-tools", "-p", "harness-sandbox", "--locked", "--offline", "--quiet"]
+    },
+    {
+      "id": "mcp-runtime",
+      "category": "mcp",
+      "weight": 15,
+      "profiles": ["quick", "full"],
+      "command": ["{cargo}", "test", "-p", "harness-mcp", "--locked", "--offline", "--quiet"]
+    },
+    {
+      "id": "recovery-agent",
+      "category": "reliability",
+      "weight": 10,
+      "profiles": ["full"],
+      "command": ["{cargo}", "test", "-p", "harness-kernel", "-p", "harness-storage", "-p", "harness-agent", "-p", "harness-application", "--locked", "--offline", "--quiet"]
+    },
+    {
+      "id": "context-memory-cache",
+      "category": "context-memory",
+      "weight": 10,
+      "profiles": ["full"],
+      "command": ["{cargo}", "test", "-p", "harness-context", "-p", "harness-memory", "-p", "harness-cache", "--locked", "--offline", "--quiet"]
+    },
+    {
+      "id": "terminal-provider",
+      "category": "interaction-protocol",
+      "weight": 5,
+      "profiles": ["quick", "full"],
+      "command": ["{cargo}", "test", "-p", "harness-terminal", "-p", "harness-provider-openai", "-p", "harness-provider-anthropic", "-p", "harness-provider-compatible", "--locked", "--offline", "--quiet"]
+    }
+  ],
+  "externalBenchmarks": [
+    {
+      "id": "mcp-conformance-stable",
+      "metric": "unexpected failures",
+      "target": "0 across stable client suites",
+      "status": "not-run"
+    },
+    {
+      "id": "terminal-bench-harbor",
+      "metric": "task reward",
+      "target": "paired same-model score above Codex CLI and Claude Code with 95% bootstrap confidence",
+      "status": "not-run"
+    },
+    {
+      "id": "claw-swe-bench-lite",
+      "metric": "resolved instances and cost per resolution",
+      "target": "paired same-model resolve rate above both baselines without higher median cost",
+      "status": "not-run"
+    },
+    {
+      "id": "swe-bench-multilingual",
+      "metric": "resolve rate across 9 languages",
+      "target": "no language below baseline; macro average above both baselines",
+      "status": "not-run"
+    },
+    {
+      "id": "aider-polyglot",
+      "metric": "pass@1, pass@2, well-formed edit rate",
+      "target": "pass@2 above both baselines and 100% well-formed edits",
+      "status": "not-run"
+    },
+    {
+      "id": "bfcl-v4-agentic",
+      "metric": "tool selection, executable accuracy, multi-turn recovery",
+      "target": "same-model harness delta positive in every reported category",
+      "status": "not-run"
+    },
+    {
+      "id": "tau-bench",
+      "metric": "pass^1 and pass^k policy compliance",
+      "target": "same-model pass^1 above both baselines with no policy regression",
+      "status": "not-run"
+    }
+  ]
+}

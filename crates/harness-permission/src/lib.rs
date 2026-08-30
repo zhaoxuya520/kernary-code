@@ -174,6 +174,9 @@ pub struct PermissionProfile {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FilesystemPolicy {
+    /// 与 Codex workspace-write 一致：读取可跨工作区，写入仍由 write_roots 限制。
+    #[serde(default)]
+    pub read_all: bool,
     pub read_roots: Vec<PathBuf>,
     pub write_roots: Vec<PathBuf>,
     pub denied_roots: Vec<PathBuf>,
@@ -1097,11 +1100,14 @@ fn allowed_by_profile(
 ) -> Result<bool, PermissionError> {
     Ok(match action {
         PermissionAction::InternalCompute { .. } => true,
-        PermissionAction::FilesystemRead { path } => profile
-            .filesystem
-            .read_roots
-            .iter()
-            .any(|root| is_inside(root, path).unwrap_or(false)),
+        PermissionAction::FilesystemRead { path } => {
+            profile.filesystem.read_all
+                || profile
+                    .filesystem
+                    .read_roots
+                    .iter()
+                    .any(|root| is_inside(root, path).unwrap_or(false))
+        }
         PermissionAction::FilesystemWrite { path } => profile
             .filesystem
             .write_roots
@@ -1254,6 +1260,7 @@ pub fn workspace_write_profile(project_root: PathBuf) -> PermissionProfile {
         id: "workspace-write".to_owned(),
         name: "Workspace write".to_owned(),
         filesystem: FilesystemPolicy {
+            read_all: true,
             read_roots: vec![project_root.clone()],
             write_roots: vec![project_root],
             denied_roots: vec![],
@@ -1324,6 +1331,41 @@ mod tests {
             )
             .expect("outside");
         assert!(matches!(outside, PermissionDecision::RequestApproval(_)));
+    }
+
+    #[test]
+    fn workspace_write_allows_external_reads_but_external_denied_roots_stay_hard() {
+        let temporary = tempdir().expect("tempdir");
+        let root = temporary.path().join("project");
+        let external = temporary.path().join("external/readme.md");
+        let mut profile = workspace_write_profile(root);
+        let mut engine = PermissionEngine::new(profile.clone(), ApprovalPolicy::NeverWithinSandbox);
+        let allowed = engine
+            .evaluate(
+                PermissionAction::FilesystemRead {
+                    path: external.clone(),
+                },
+                &envelope("run:external-read"),
+                PermissionRequestId::from("approval:external-read"),
+                1,
+            )
+            .expect("external read decision");
+        assert!(matches!(allowed, PermissionDecision::Allow { .. }));
+
+        profile.filesystem.denied_roots = vec![temporary.path().join("external")];
+        let mut denied = PermissionEngine::new(profile, ApprovalPolicy::NeverWithinSandbox);
+        let decision = denied
+            .evaluate(
+                PermissionAction::FilesystemRead { path: external },
+                &envelope("run:external-denied"),
+                PermissionRequestId::from("approval:external-denied"),
+                2,
+            )
+            .expect("external denied decision");
+        assert!(matches!(
+            decision,
+            PermissionDecision::Deny { hard: true, .. }
+        ));
     }
 
     #[test]

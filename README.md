@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/zhaoxuya520/kernary-code/actions/workflows/ci.yml"><img src="https://github.com/zhaoxuya520/kernary-code/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Apache-2.0"></a>
-  <img src="https://img.shields.io/badge/version-0.13.4-gold.svg" alt="0.13.4">
+  <img src="https://img.shields.io/badge/version-0.13.5-gold.svg" alt="0.13.5">
 </p>
 
 > [!IMPORTANT]
@@ -159,6 +159,8 @@ kernary -r <id-or-title>   # 按短 ID 或标题恢复
 
 `Shift+Tab` 在 `manual → edit → auto → full` 之间静默切换。Windows 使用受限 Token、ACL、私有 Desktop 与 Job Object；Linux 使用 bubblewrap namespace，缺少可信 `bwrap` 时 fail closed。
 
+`workspace-write` 与 Codex 保持“跨工作区可读、仅当前项目可写”的边界：只有 typed `files.read` 能读取用户明确指定的外部文件；Process cwd、Browser upload 和所有写工具仍受项目根限制。外部文件内容可能进入当前模型上下文，因此只应提供愿意发送给已配置模型的路径。
+
 ### 启动多 Agent 工作流
 
 Kernary 内置 30 个版本化 Agent Profile，覆盖控制面、需求、架构、前端、后端、API、SQL、测试、安全、性能、发布、SRE、文档、本地化和产品分析。它们不是 30 份同名提示词：每个 Profile 都定义使命、非目标、输入、SOP、工具边界、证据合同、失败升级、记忆策略和模型预算。
@@ -250,6 +252,15 @@ cargo test --workspace --locked --no-fail-fast
 npm test
 npm run fixtures:check
 ```
+
+可审计评分使用两层成绩单：
+
+```bash
+python scripts/evaluate-cli.py --profile quick
+python scripts/evaluate-cli.py --profile full
+```
+
+本地工程分与行业 Agent 分严格分离；未运行的 Terminal-Bench、SWE-bench、MCP Conformance 等基准不会冒充领先证据。完整矩阵和同模型配对规则见 [Kernary Evaluation](evals/README.md)。
 
 CI 还会构建 Windows x64、Linux x64 和 macOS arm64 便携产物，验证 `kernary` / `harness` 兼容命令、`doctor --json`、归档校验和及启动性能预算。
 

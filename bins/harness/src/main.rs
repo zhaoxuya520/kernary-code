@@ -8939,6 +8939,10 @@ fn build_backend(
         guard.root().join(".env"),
     ]
     .into_iter()
+    .flat_map(|path| {
+        let canonical = fs::canonicalize(&path).ok();
+        std::iter::once(path).chain(canonical)
+    })
     .collect();
     permission_profile.subprocess.allowed_executables = sandbox_executables.clone();
     permission_profile.browser.enabled = browser_runtime.is_some();
