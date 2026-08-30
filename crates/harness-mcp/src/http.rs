@@ -1,6 +1,7 @@
 use std::io::{BufRead, Read};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use harness_auth::{CredentialId, CredentialStore, SecretString};
@@ -31,6 +32,15 @@ pub struct StreamableHttpMcpTransport {
     protocol_version: Mutex<Option<String>>,
     last_event_id: Mutex<Option<String>>,
     closed: AtomicBool,
+}
+
+/// 一条已建立的 Server→Client SSE 通道。每次 `next_message` 只返回一个完整
+/// JSON-RPC message；调用者处理并响应后可以继续读取下一条。
+pub struct McpInboundStream {
+    owner: Arc<StreamableHttpMcpTransport>,
+    body: Box<dyn BufRead + Send>,
+    consumed: usize,
+    max_bytes: usize,
 }
 
 impl StreamableHttpMcpTransport {
@@ -124,7 +134,12 @@ impl StreamableHttpMcpTransport {
             let id = request_id.ok_or_else(|| {
                 McpError::new("mcp-http-notification-sse-unexpected", "notification")
             })?;
-            return parse_sse_response(&mut response.body, id, self.response_limit()).map(Some);
+            let parsed = parse_sse_response(&mut response.body, id, self.response_limit())?;
+            self.remember_last_event_id(parsed.last_event_id)?;
+            return parsed.result.map_or_else(
+                || self.resume_sse_response(id, parsed.retry_millis).map(Some),
+                |result| Ok(Some(result)),
+            );
         }
         Err(McpError::new("mcp-http-content-type-invalid", content_type))
     }
@@ -182,6 +197,187 @@ impl StreamableHttpMcpTransport {
                 Some(session_id.clone());
         }
         Ok(())
+    }
+
+    pub fn open_inbound_stream(self: &Arc<Self>) -> Result<McpInboundStream, McpError> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(McpError::new("mcp-transport-closed", "streamable-http"));
+        }
+        let request = StreamingHttpRequest::get(self.config.endpoint.clone(), self.timeout())
+            .with_header("Accept", "text/event-stream");
+        let request = self.prepare_request(request)?;
+        let response = self
+            .transport
+            .send(request)
+            .map_err(|error| McpError::new(error.code, error.message).retryable(error.timeout))?;
+        self.capture_session(&response.headers)?;
+        if !(200..300).contains(&response.status) {
+            return Err(McpError::new(
+                "mcp-http-inbound-status",
+                response.status.to_string(),
+            ));
+        }
+        if !response
+            .headers
+            .get("content-type")
+            .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/event-stream"))
+        {
+            return Err(McpError::new(
+                "mcp-http-inbound-content-type",
+                response
+                    .headers
+                    .get("content-type")
+                    .cloned()
+                    .unwrap_or_default(),
+            ));
+        }
+        Ok(McpInboundStream {
+            owner: self.clone(),
+            body: response.body,
+            consumed: 0,
+            max_bytes: self.response_limit(),
+        })
+    }
+
+    pub fn send_jsonrpc_result(
+        &self,
+        id: serde_json::Value,
+        result: serde_json::Value,
+    ) -> Result<(), McpError> {
+        if !(id.is_string() || id.is_number()) {
+            return Err(McpError::new(
+                "mcp-jsonrpc-response-id-invalid",
+                id.to_string(),
+            ));
+        }
+        self.send(
+            serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}),
+            None,
+        )?;
+        Ok(())
+    }
+
+    fn remember_last_event_id(&self, event_id: Option<String>) -> Result<(), McpError> {
+        if let Some(event_id) = event_id {
+            validate_header_value(&event_id, "last-event-id")?;
+            *self
+                .last_event_id
+                .lock()
+                .map_err(|_| McpError::new("mcp-event-id-poisoned", "lock"))? = Some(event_id);
+        }
+        Ok(())
+    }
+
+    fn resume_sse_response(
+        &self,
+        request_id: u64,
+        mut retry_millis: Option<u64>,
+    ) -> Result<serde_json::Value, McpError> {
+        const MAX_RESUME_ATTEMPTS: usize = 3;
+        for _ in 0..MAX_RESUME_ATTEMPTS {
+            let delay = retry_millis.unwrap_or(1_000).min(60_000);
+            thread::sleep(Duration::from_millis(delay));
+            let mut request =
+                StreamingHttpRequest::get(self.config.endpoint.clone(), self.timeout())
+                    .with_header("Accept", "text/event-stream");
+            if let Some(last_event_id) = self
+                .last_event_id
+                .lock()
+                .map_err(|_| McpError::new("mcp-event-id-poisoned", "lock"))?
+                .clone()
+            {
+                request = request.with_header("Last-Event-ID", last_event_id);
+            }
+            let request = self.prepare_request(request)?;
+            let mut response = self.transport.send(request).map_err(|error| {
+                McpError::new(error.code, error.message).retryable(error.timeout)
+            })?;
+            self.capture_session(&response.headers)?;
+            if !(200..300).contains(&response.status) {
+                return Err(
+                    McpError::new("mcp-http-resume-status", response.status.to_string())
+                        .retryable(response.status == 429 || response.status >= 500),
+                );
+            }
+            if !response
+                .headers
+                .get("content-type")
+                .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/event-stream"))
+            {
+                return Err(McpError::new(
+                    "mcp-http-resume-content-type",
+                    response
+                        .headers
+                        .get("content-type")
+                        .cloned()
+                        .unwrap_or_default(),
+                ));
+            }
+            let parsed = parse_sse_response(&mut response.body, request_id, self.response_limit())?;
+            self.remember_last_event_id(parsed.last_event_id)?;
+            if let Some(result) = parsed.result {
+                return Ok(result);
+            }
+            retry_millis = parsed.retry_millis.or(retry_millis);
+        }
+        Err(McpError::new("mcp-http-sse-resume-exhausted", request_id.to_string()).retryable(true))
+    }
+}
+
+impl McpInboundStream {
+    pub fn next_message(&mut self) -> Result<serde_json::Value, McpError> {
+        let mut data_lines = Vec::new();
+        let mut current_id = None::<String>;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = self
+                .body
+                .read_line(&mut line)
+                .map_err(|error| McpError::new("mcp-http-inbound-read", error.to_string()))?;
+            if read == 0 {
+                return Err(
+                    McpError::new("mcp-http-inbound-eof", "SSE stream closed").retryable(true)
+                );
+            }
+            self.consumed = self.consumed.saturating_add(read);
+            if self.consumed > self.max_bytes {
+                return Err(McpError::new(
+                    "mcp-http-inbound-too-large",
+                    self.max_bytes.to_string(),
+                ));
+            }
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                if let Some(event_id) = current_id.take() {
+                    self.owner.remember_last_event_id(Some(event_id))?;
+                }
+                if data_lines.is_empty() || data_lines.iter().all(String::is_empty) {
+                    data_lines.clear();
+                    continue;
+                }
+                let value = serde_json::from_str::<serde_json::Value>(&data_lines.join("\n"))
+                    .map_err(|error| {
+                        McpError::new("mcp-http-inbound-json-invalid", error.to_string())
+                    })?;
+                if value.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
+                    return Err(McpError::new(
+                        "mcp-http-inbound-jsonrpc-invalid",
+                        value.to_string(),
+                    ));
+                }
+                return Ok(value);
+            }
+            if let Some(data) = trimmed.strip_prefix("data:") {
+                data_lines.push(data.strip_prefix(' ').unwrap_or(data).to_owned());
+            } else if let Some(id) = trimmed.strip_prefix("id:") {
+                let id = id.strip_prefix(' ').unwrap_or(id);
+                if id.contains('\0') {
+                    return Err(McpError::new("mcp-http-sse-event-id-invalid", "NUL"));
+                }
+                current_id = Some(id.to_owned());
+            }
+        }
     }
 }
 
@@ -298,7 +494,7 @@ impl McpTransport for StreamableHttpMcpTransport {
             let response = self.transport.send(request).map_err(|error| {
                 McpError::new(error.code, error.message).retryable(error.timeout)
             })?;
-            if !matches!(response.status, 200 | 202 | 204 | 404) {
+            if !matches!(response.status, 200 | 202 | 204 | 404 | 405) {
                 return Err(McpError::new(
                     "mcp-http-session-close-status",
                     response.status.to_string(),
@@ -309,13 +505,22 @@ impl McpTransport for StreamableHttpMcpTransport {
     }
 }
 
+struct ParsedSseResponse {
+    result: Option<serde_json::Value>,
+    last_event_id: Option<String>,
+    retry_millis: Option<u64>,
+}
+
 fn parse_sse_response(
     reader: &mut Box<dyn BufRead + Send>,
     request_id: u64,
     max_bytes: usize,
-) -> Result<serde_json::Value, McpError> {
+) -> Result<ParsedSseResponse, McpError> {
     let mut consumed = 0_usize;
     let mut data_lines = Vec::new();
+    let mut current_id = None::<String>;
+    let mut last_event_id = None::<String>;
+    let mut retry_millis = None::<u64>;
     let mut line = String::new();
     loop {
         line.clear();
@@ -323,10 +528,14 @@ fn parse_sse_response(
             .read_line(&mut line)
             .map_err(|error| McpError::new("mcp-http-sse-read", error.to_string()))?;
         if read == 0 {
-            return Err(McpError::new(
-                "mcp-http-sse-response-missing",
-                request_id.to_string(),
-            ));
+            if current_id.is_some() {
+                last_event_id = current_id;
+            }
+            return Ok(ParsedSseResponse {
+                result: None,
+                last_event_id,
+                retry_millis,
+            });
         }
         consumed = consumed.saturating_add(read);
         if consumed > max_bytes {
@@ -337,7 +546,12 @@ fn parse_sse_response(
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
-            if data_lines.is_empty() {
+            if current_id.is_some() {
+                last_event_id.clone_from(&current_id);
+            }
+            current_id = None;
+            if data_lines.is_empty() || data_lines.iter().all(String::is_empty) {
+                data_lines.clear();
                 continue;
             }
             let data = data_lines.join("\n");
@@ -345,10 +559,27 @@ fn parse_sse_response(
             let value = serde_json::from_str::<serde_json::Value>(&data)
                 .map_err(|error| McpError::new("mcp-http-sse-json-invalid", error.to_string()))?;
             if let Some(result) = parse_response(value, request_id)? {
-                return Ok(result);
+                return Ok(ParsedSseResponse {
+                    result: Some(result),
+                    last_event_id,
+                    retry_millis,
+                });
             }
         } else if let Some(data) = trimmed.strip_prefix("data:") {
             data_lines.push(data.strip_prefix(' ').unwrap_or(data).to_owned());
+        } else if let Some(id) = trimmed.strip_prefix("id:") {
+            let id = id.strip_prefix(' ').unwrap_or(id);
+            if id.contains('\0') {
+                return Err(McpError::new("mcp-http-sse-event-id-invalid", "NUL"));
+            }
+            current_id = Some(id.to_owned());
+        } else if let Some(retry) = trimmed.strip_prefix("retry:") {
+            let retry = retry.strip_prefix(' ').unwrap_or(retry);
+            retry_millis = Some(
+                retry
+                    .parse::<u64>()
+                    .map_err(|_| McpError::new("mcp-http-sse-retry-invalid", retry))?,
+            );
         }
     }
 }
@@ -492,43 +723,24 @@ fn validate_header_value(value: &str, name: &'static str) -> Result<(), McpError
 }
 
 fn validate_endpoint(endpoint: &str) -> Result<(), McpError> {
-    let (scheme, remainder) = endpoint
-        .strip_prefix("https://")
-        .map(|remainder| ("https", remainder))
-        .or_else(|| {
-            endpoint
-                .strip_prefix("http://")
-                .map(|remainder| ("http", remainder))
-        })
-        .ok_or_else(|| {
-            McpError::new(
-                "mcp-http-endpoint-invalid",
-                "Endpoint 必须以 https:// 或 http:// 开头",
-            )
-        })?;
-    let (authority, path) = remainder
-        .split_once('/')
-        .ok_or_else(|| McpError::new("mcp-http-endpoint-path", "Endpoint 缺少 path"))?;
-    if authority.is_empty()
-        || authority.contains('@')
-        || endpoint.contains('?')
-        || endpoint.contains('#')
-        || path.is_empty()
+    let parsed = url::Url::parse(endpoint)
+        .map_err(|error| McpError::new("mcp-http-endpoint-invalid", error.to_string()))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| McpError::new("mcp-http-endpoint-invalid", "Endpoint 缺少 host"))?;
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !matches!(parsed.scheme(), "http" | "https")
     {
         return Err(McpError::new(
             "mcp-http-endpoint-invalid",
             "Endpoint 不允许空主机、userinfo、query 或 fragment",
         ));
     }
-    let host = if let Some(ipv6) = authority.strip_prefix('[') {
-        ipv6.split_once(']')
-            .map(|(host, _)| host)
-            .unwrap_or_default()
-    } else {
-        authority.split(':').next().unwrap_or_default()
-    };
     let loopback = matches!(host, "localhost" | "127.0.0.1" | "::1");
-    if scheme != "https" && !(scheme == "http" && loopback) {
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
         return Err(McpError::new(
             "mcp-http-endpoint-insecure",
             "远程 MCP 必须 HTTPS；HTTP 只允许精确 loopback",
@@ -548,6 +760,16 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn endpoint_accepts_root_path_and_keeps_remote_http_denied() {
+        assert!(validate_endpoint("http://localhost:3210").is_ok());
+        assert!(validate_endpoint("http://127.0.0.1:3210/").is_ok());
+        assert!(validate_endpoint("https://mcp.example.test").is_ok());
+        assert!(validate_endpoint("http://mcp.example.test/mcp").is_err());
+        assert!(validate_endpoint("https://mcp.example.test/mcp?token=bad").is_err());
+        assert!(validate_endpoint("https://user@mcp.example.test/mcp").is_err());
+    }
 
     struct CapturedRequest {
         method: HttpMethod,
@@ -699,6 +921,50 @@ mod tests {
             .is_err()
         );
         assert!(validate_header_value("bad\r\nheader", "session").is_err());
+    }
+
+    #[test]
+    fn request_sse_graceful_close_respects_retry_and_resumes_with_event_id() {
+        let priming = response(
+            200,
+            "text/event-stream",
+            "id: event-1\nretry: 1\ndata: \n\n",
+        );
+        let resumed = response(
+            200,
+            "text/event-stream",
+            "id: event-2\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n",
+        );
+        let mock = Arc::new(MockHttpTransport {
+            responses: Mutex::new([priming, resumed].into_iter().collect()),
+            requests: Mutex::new(vec![]),
+        });
+        let transport = StreamableHttpMcpTransport::new(
+            McpStreamableHttpConfig {
+                endpoint: "https://example.test/mcp".to_owned(),
+                bearer_credential_id: None,
+                oauth: None,
+                legacy_sse_fallback: false,
+                request_timeout_millis: Some(1_000),
+                max_response_bytes: Some(16 * 1024),
+            },
+            Arc::new(MemoryCredentialStore::new()),
+            mock.clone(),
+        )
+        .expect("transport");
+        assert_eq!(
+            transport
+                .request("tools/call", serde_json::json!({}))
+                .expect("resumed response")["ok"],
+            true
+        );
+        let requests = mock.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].method, HttpMethod::Get);
+        assert_eq!(
+            requests[1].headers.get("Last-Event-ID").map(String::as_str),
+            Some("event-1")
+        );
     }
 
     #[test]

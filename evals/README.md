@@ -26,6 +26,15 @@ python scripts/evaluate-cli.py --profile full
 7. 公开原始轨迹、失败分类、版本哈希和完整运行命令；
 8. 未运行一律标记 `not-run`，不得用本地单测代替。
 
+MCP 官方核心场景使用固定 referee 复跑：
+
+```bash
+cargo build -p harness-mcp --bin kernary-mcp-conformance-client
+python scripts/run-mcp-conformance.py
+```
+
+Referee 与 SDK integrity 固定在 `evals/mcp-conformance-lock.json`。Core 与 OAuth 分开计分；OAuth 未完成时不得声称 MCP 全量通过。
+
 ## 必须通过的行业基准
 
 | 基准 | 证明内容 | Kernary 验收条件 |

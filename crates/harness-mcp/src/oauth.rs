@@ -800,7 +800,19 @@ mod tests {
             .expect("callback response");
         assert!(response.contains("Authorization received"));
 
-        let status = coordinator.finish("test", &config).expect("finish");
+        let started_wait = std::time::Instant::now();
+        let status = loop {
+            match coordinator.finish("test", &config) {
+                Ok(status) => break status,
+                Err(error)
+                    if error.code == "mcp-oauth-callback-pending"
+                        && started_wait.elapsed() < Duration::from_secs(2) =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("finish: {error:?}"),
+            }
+        };
         assert!(status.authenticated);
         assert_eq!(
             credentials

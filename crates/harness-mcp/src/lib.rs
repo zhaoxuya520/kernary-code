@@ -25,7 +25,7 @@ use harness_tool::{
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
-pub use http::{McpStreamableHttpConfig, StreamableHttpMcpTransport};
+pub use http::{McpInboundStream, McpStreamableHttpConfig, StreamableHttpMcpTransport};
 pub use oauth::{McpOAuthConfig, McpOAuthStart, McpOAuthStatus};
 pub use protocol::{
     LATEST_STABLE_PROTOCOL_VERSION, McpCallToolResult, McpClient, McpError, McpPromptDescriptor,

@@ -131,14 +131,40 @@ pub struct McpClient {
 
 impl McpClient {
     pub fn initialize(transport: Arc<dyn McpTransport>) -> Result<Self, McpError> {
+        Self::initialize_with_version(transport, LATEST_STABLE_PROTOCOL_VERSION)
+    }
+
+    pub fn initialize_with_version(
+        transport: Arc<dyn McpTransport>,
+        requested_protocol_version: &str,
+    ) -> Result<Self, McpError> {
+        Self::initialize_with_version_and_capabilities(
+            transport,
+            requested_protocol_version,
+            serde_json::json!({}),
+        )
+    }
+
+    pub fn initialize_with_version_and_capabilities(
+        transport: Arc<dyn McpTransport>,
+        requested_protocol_version: &str,
+        client_capabilities: serde_json::Value,
+    ) -> Result<Self, McpError> {
+        if !SUPPORTED_PROTOCOL_VERSIONS.contains(&requested_protocol_version) {
+            return Err(McpError::new(
+                "mcp-requested-protocol-version-unsupported",
+                requested_protocol_version,
+            ));
+        }
+        object(&client_capabilities, "mcp-client-capabilities")?;
         let result = transport.request(
             "initialize",
             serde_json::json!({
-                "protocolVersion":LATEST_STABLE_PROTOCOL_VERSION,
-                "capabilities":{},
+                "protocolVersion":requested_protocol_version,
+                "capabilities":client_capabilities,
                 "clientInfo":{
-                    "name":"harness-terminal",
-                    "title":"Harness Terminal",
+                    "name":"kernary",
+                    "title":"Kernary",
                     "version":env!("CARGO_PKG_VERSION")
                 }
             }),

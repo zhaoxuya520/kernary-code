@@ -32,5 +32,12 @@ test = false
 bench = false
 doc = false
 
+[[bin]]
+name = "kernary-mcp-conformance-client"
+path = "src/bin/kernary_mcp_conformance_client.rs"
+test = false
+bench = false
+doc = false
+
 [lints]
 workspace = true

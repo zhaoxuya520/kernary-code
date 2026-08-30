@@ -84,7 +84,7 @@
       "id": "mcp-conformance-stable",
       "metric": "unexpected failures",
       "target": "0 across stable client suites",
-      "status": "not-run"
+      "status": "partial: core 4/4 passed; auth 0/19 pending"
     },
     {
       "id": "terminal-bench-harbor",
