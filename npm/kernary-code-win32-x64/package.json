@@ -1,6 +1,6 @@
 {
   "name": "kernary-code-win32-x64",
-  "version": "0.13.7",
+  "version": "0.13.8",
   "description": "Kernary Code native binary for Windows x64",
   "license": "Apache-2.0",
   "repository": {
@@ -9,6 +9,6 @@
   },
   "os": ["win32"],
   "cpu": ["x64"],
-  "files": ["bin", "LICENSE-APACHE", "NOTICE"],
+  "files": ["bin/kernary.exe", "LICENSE-APACHE", "NOTICE"],
   "publishConfig": { "access": "public" }
 }

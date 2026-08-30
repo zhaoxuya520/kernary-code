@@ -13,8 +13,10 @@ harness-http = { path = "../harness-http" }
 harness-permission = { path = "../harness-permission" }
 harness-tool = { path = "../harness-tool" }
 harness-types = { path = "../harness-types" }
+base64.workspace = true
 getrandom.workspace = true
 process-wrap.workspace = true
+ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

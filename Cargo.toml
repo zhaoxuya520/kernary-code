@@ -36,7 +36,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.13.7"
+version = "0.13.8"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
@@ -62,6 +62,8 @@ process-wrap = { version = "9.1", default-features = false, features = ["std", "
 semver = "1.0"
 toml = "0.9"
 getrandom = "0.3"
+base64 = "0.23"
+ring = "0.17"
 url = "2.5"
 windows-sys = "0.61"
 

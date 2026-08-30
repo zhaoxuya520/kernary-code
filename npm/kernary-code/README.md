@@ -43,4 +43,6 @@ Spawned commands default to an OS-enforced `workspace-write` sandbox. Windows us
 
 The package installs a native binary selected by npm for Windows x64 or Linux x64 glibc. It does not download executables during `postinstall`.
 
+MCP supports stdio, Streamable HTTP/SSE, PKCE, Protected Resource Metadata and OIDC discovery, CIMD before DCR, pre-registration, bounded scope step-up, offline access, `client_secret_basic` / `client_secret_post`, ES256/RS256 `private_key_jwt`, and SEP-990 Cross-App Access. Private keys, client secrets, IdP tokens, and bearer tokens are referenced through the OS credential store rather than project configuration. The pinned official `@modelcontextprotocol/conformance 0.1.16` client suite passes 26/26 scenarios and 282/282 checks with no baseline, pending scenario, or referee exception.
+
 Source, documentation and checksums: https://github.com/zhaoxuya520/kernary-code

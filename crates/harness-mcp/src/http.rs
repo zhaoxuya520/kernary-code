@@ -16,7 +16,7 @@ use crate::protocol::{McpError, McpTransport};
 pub struct McpStreamableHttpConfig {
     pub endpoint: String,
     pub bearer_credential_id: Option<String>,
-    pub oauth: Option<McpOAuthConfig>,
+    pub oauth: Option<Box<McpOAuthConfig>>,
     #[serde(default)]
     pub legacy_sse_fallback: bool,
     pub request_timeout_millis: Option<u64>,

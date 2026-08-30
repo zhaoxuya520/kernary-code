@@ -122,6 +122,8 @@ kernary models --refresh ollama
 
 把 `examples/kernary.mcp.toml` 复制到项目根目录，或使用 `/mcp add-stdio`、`/mcp add-http`、`/mcp enable`、`/mcp disable`、`/mcp remove` 原子更新。Add 只写 metadata，不会隐式连接；API Key/OAuth token 不写 TOML。
 
+HTTP MCP 支持 PKCE、Protected Resource Metadata、OIDC fallback、CIMD、动态/预注册客户端、scope step-up 与有界重试、offline access、Client Credentials（`client_secret_basic` / `client_secret_post` / ES256/RS256 `private_key_jwt`）和 SEP-990 Cross-App Access。所有 Secret 只保存为 OS Credential Store 引用，不进入项目 TOML、Session 或评测报告。
+
 ## 非交互自动化
 
 `kernary exec` 不会请求交互式 Key 或审批，支持单 JSON document、quiet 和原子输出：

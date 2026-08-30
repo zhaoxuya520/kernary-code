@@ -26,7 +26,9 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
 pub use http::{McpInboundStream, McpStreamableHttpConfig, StreamableHttpMcpTransport};
-pub use oauth::{McpOAuthConfig, McpOAuthCoordinator, McpOAuthStart, McpOAuthStatus};
+pub use oauth::{
+    McpCrossAppAccessConfig, McpOAuthConfig, McpOAuthCoordinator, McpOAuthStart, McpOAuthStatus,
+};
 pub use protocol::{
     LATEST_STABLE_PROTOCOL_VERSION, McpCallToolResult, McpClient, McpError, McpPromptDescriptor,
     McpResourceDescriptor, McpServerInfo, McpTaskSupport, McpToolAnnotations, McpToolDescriptor,
@@ -435,7 +437,7 @@ impl McpManager {
     pub fn oauth_status(&self, server_id: &str) -> Result<McpOAuthStatus, McpError> {
         let server = self.server(server_id)?;
         let config = match &server.config.transport {
-            McpTransportConfig::StreamableHttp(http) => http.oauth.as_ref(),
+            McpTransportConfig::StreamableHttp(http) => http.oauth.as_deref(),
             McpTransportConfig::Stdio(_) => None,
         };
         self.oauth.status(server_id, config)

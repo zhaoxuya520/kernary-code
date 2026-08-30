@@ -452,7 +452,7 @@ fn doctor_json_reports_storage_and_terminal_capabilities() {
     );
     assert_eq!(
         value["extensions"]["mcp"],
-        "oauth-pkce-streamable-http-legacy-sse-lazy"
+        "oauth-pkce-cimd-scope-step-up-private-key-jwt-cross-app-streamable-http-sse-lazy"
     );
     assert_eq!(value["vector"]["configured"], false);
     assert_eq!(value["browser"]["configured"], false);

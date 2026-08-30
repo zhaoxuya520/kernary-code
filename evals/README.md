@@ -26,14 +26,14 @@ python scripts/evaluate-cli.py --profile full
 7. 公开原始轨迹、失败分类、版本哈希和完整运行命令；
 8. 未运行一律标记 `not-run`，不得用本地单测代替。
 
-MCP 官方核心场景使用固定 referee 复跑：
+MCP 官方完整客户端套件使用固定 referee 复跑：
 
 ```bash
 cargo build -p harness-mcp --bin kernary-mcp-conformance-client
 python scripts/run-mcp-conformance.py
 ```
 
-Referee 与 SDK integrity 固定在 `evals/mcp-conformance-lock.json`。Core 与 OAuth 分开计分；OAuth 未完成时不得声称 MCP 全量通过。
+Referee 与 SDK integrity 固定在 `evals/mcp-conformance-lock.json`，runner 会先核验实际安装的版本与 integrity，并在保存日志前脱敏私钥、Client Secret 和 IdP Token。当前锁定的 `@modelcontextprotocol/conformance 0.1.16` 已通过 26/26 客户端场景、282/282 checks，零 baseline、零 pending、零 referee defect；后续升级裁判后必须重新归零。
 
 ## 必须通过的行业基准
 

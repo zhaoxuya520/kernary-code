@@ -776,7 +776,8 @@ pub fn register_file_tools_with_patch_store(
         ToolDescriptor {
             canonical_name: "files.read".to_owned(),
             version: "1".to_owned(),
-            description: "读取 workspace 内 UTF-8 文件".to_owned(),
+            description: "只读本地 UTF-8 文件；可读取 workspace 外的明确路径，但不能借此写入"
+                .to_owned(),
             effect_class: ToolEffectClass::ReadOnlyRetryable,
             source: ToolSource::Builtin,
             prompt_loading: ToolPromptLoading::Eager,

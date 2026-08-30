@@ -42,6 +42,34 @@ jobs:
       - run: npm test
       - run: npm run fixtures:check
 
+  mcp-conformance:
+    name: MCP Client Conformance 26/26
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+      - run: rustup show
+      - name: Install locked official referee without lifecycle scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix evals/mcp-conformance
+      - name: Build Kernary conformance adapter
+        run: cargo build --locked -p harness-mcp --bin kernary-mcp-conformance-client
+      - name: Run all pinned client scenarios
+        run: >-
+          python scripts/run-mcp-conformance.py
+          --referee-dir evals/mcp-conformance
+          --output output/evals/mcp-conformance-0.1.16.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mcp-conformance-client-report
+          path: output/evals/mcp-conformance-0.1.16.json
+          if-no-files-found: error
+
   browser-e2e:
     name: Playwright Browser E2E
     runs-on: ubuntu-latest

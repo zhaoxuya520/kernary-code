@@ -84,7 +84,7 @@
       "id": "mcp-conformance-stable",
       "metric": "unexpected failures",
       "target": "0 across stable client suites",
-      "status": "partial: core 4/4 passed; auth 13/19 passed; 2 referee issuer defects; 4 pending"
+      "status": "complete: @modelcontextprotocol/conformance 0.1.16 client 26/26 scenarios and 282/282 checks passed; 0 pending; 0 referee defects"
     },
     {
       "id": "terminal-bench-harbor",

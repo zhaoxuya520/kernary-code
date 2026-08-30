@@ -7,9 +7,11 @@ use std::time::{Duration, Instant};
 use harness_auth::{CredentialId, CredentialStore, MemoryCredentialStore, SecretString};
 use harness_http::{StreamingHttpRequest, StreamingHttpTransport, UreqStreamingTransport};
 use harness_mcp::{
-    LATEST_STABLE_PROTOCOL_VERSION, McpClient, McpOAuthConfig, McpOAuthCoordinator,
-    McpStreamableHttpConfig, StreamableHttpMcpTransport,
+    LATEST_STABLE_PROTOCOL_VERSION, McpClient, McpCrossAppAccessConfig, McpOAuthConfig,
+    McpOAuthCoordinator, McpStreamableHttpConfig, StreamableHttpMcpTransport,
 };
+
+const CONFORMANCE_CLIENT_METADATA_URL: &str = "https://conformance-test.local/client-metadata.json";
 
 fn main() {
     if let Err(error) = run() {
@@ -149,9 +151,22 @@ fn run_oauth_conformance(
         credentials.clone(),
         http.clone(),
     )?;
-    let error = McpClient::initialize_with_version(unauthenticated.clone(), protocol_version)
-        .err()
-        .ok_or("OAuth endpoint unexpectedly accepted anonymous initialize")?;
+    let error = match McpClient::initialize_with_version(unauthenticated.clone(), protocol_version)
+    {
+        Ok(client) if matches!(scenario, "auth/scope-step-up" | "auth/scope-retry-limit") => {
+            return run_scope_challenge_conformance(
+                endpoint,
+                scenario,
+                protocol_version,
+                client,
+                unauthenticated,
+                credentials,
+                http,
+            );
+        }
+        Ok(_) => return Err("OAuth endpoint unexpectedly accepted anonymous initialize".into()),
+        Err(error) => error,
+    };
     if error.code != "mcp-http-authorization-required" {
         return Err(error.into());
     }
@@ -189,19 +204,105 @@ fn run_oauth_conformance(
             Ok::<String, String>(credential_id)
         })
         .transpose()?;
+    let private_key_jwt_credential_id = context
+        .get("private_key_pem")
+        .and_then(serde_json::Value::as_str)
+        .map(|private_key| {
+            let credential_id = "mcp:conformance:private-key".to_owned();
+            credentials
+                .put(
+                    &CredentialId::new(credential_id.clone()),
+                    SecretString::new(private_key),
+                )
+                .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            Ok::<String, String>(credential_id)
+        })
+        .transpose()?;
+    let private_key_jwt_signing_algorithm = context
+        .get("signing_algorithm")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let idp_id_token_credential_id = context
+        .get("idp_id_token")
+        .and_then(serde_json::Value::as_str)
+        .map(|id_token| {
+            let credential_id = "mcp:conformance:idp-id-token".to_owned();
+            credentials
+                .put(
+                    &CredentialId::new(credential_id.clone()),
+                    SecretString::new(id_token),
+                )
+                .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            Ok::<String, String>(credential_id)
+        })
+        .transpose()?;
     let candidates = resource_metadata_candidates(endpoint, challenge.as_deref())?;
     let coordinator = McpOAuthCoordinator::new(credentials.clone(), http.clone());
-    if scenario == "auth/client-credentials-basic" {
+    if scenario == "auth/cross-app-access-complete-flow" {
+        let cross_app = McpCrossAppAccessConfig {
+            idp_issuer: context_string(&context, "idp_issuer")?,
+            idp_token_endpoint: Some(context_string(&context, "idp_token_endpoint")?),
+            idp_client_id: context_string(&context, "idp_client_id")?,
+            idp_id_token_credential_id: idp_id_token_credential_id
+                .ok_or("cross-app ID token missing")?,
+        };
         for resource_metadata_url in &candidates {
             let config = McpOAuthConfig {
                 client_id: configured_client_id.clone(),
+                client_metadata_url: None,
                 client_secret_credential_id: client_secret_credential_id.clone(),
+                private_key_jwt_credential_id: None,
+                private_key_jwt_signing_algorithm: None,
+                private_key_jwt_key_id: None,
                 token_endpoint_auth_method: Some("client_secret_basic".to_owned()),
                 resource_metadata_url: resource_metadata_url.clone(),
                 credential_id: "mcp:conformance:access".to_owned(),
                 scopes: challenge_scopes.clone(),
                 callback_port: None,
                 expected_issuer: None,
+                legacy_same_origin_issuer_discovery: false,
+            };
+            match coordinator.cross_app_access("conformance", endpoint, &config, &cross_app) {
+                Ok(status) if status.authenticated => {
+                    return verify_authenticated(
+                        endpoint,
+                        protocol_version,
+                        &config.credential_id,
+                        credentials,
+                        http,
+                    );
+                }
+                Ok(_) => return Err("cross-app access did not authenticate".into()),
+                Err(error) if error.code == "mcp-oauth-metadata-status" => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        return Err("cross-app access metadata discovery failed".into());
+    }
+    if matches!(
+        scenario,
+        "auth/client-credentials-basic" | "auth/client-credentials-jwt"
+    ) {
+        for resource_metadata_url in &candidates {
+            let token_endpoint_auth_method = if scenario == "auth/client-credentials-jwt" {
+                "private_key_jwt"
+            } else {
+                "client_secret_basic"
+            };
+            let config = McpOAuthConfig {
+                client_id: configured_client_id.clone(),
+                client_metadata_url: None,
+                client_secret_credential_id: client_secret_credential_id.clone(),
+                private_key_jwt_credential_id: private_key_jwt_credential_id.clone(),
+                private_key_jwt_signing_algorithm: private_key_jwt_signing_algorithm.clone(),
+                private_key_jwt_key_id: None,
+                token_endpoint_auth_method: Some(token_endpoint_auth_method.to_owned()),
+                resource_metadata_url: resource_metadata_url.clone(),
+                credential_id: "mcp:conformance:access".to_owned(),
+                scopes: challenge_scopes.clone(),
+                callback_port: None,
+                expected_issuer: None,
+                legacy_same_origin_issuer_discovery: false,
             };
             match coordinator.client_credentials("conformance", endpoint, &config) {
                 Ok(status) if status.authenticated => {
@@ -224,13 +325,19 @@ fn run_oauth_conformance(
     for resource_metadata_url in candidates {
         let config = McpOAuthConfig {
             client_id: configured_client_id.clone(),
+            client_metadata_url: (scenario == "auth/basic-cimd")
+                .then(|| CONFORMANCE_CLIENT_METADATA_URL.to_owned()),
             client_secret_credential_id: client_secret_credential_id.clone(),
+            private_key_jwt_credential_id: None,
+            private_key_jwt_signing_algorithm: None,
+            private_key_jwt_key_id: None,
             token_endpoint_auth_method: None,
             resource_metadata_url,
             credential_id: "mcp:conformance:access".to_owned(),
             scopes: challenge_scopes.clone(),
             callback_port: None,
             expected_issuer: None,
+            legacy_same_origin_issuer_discovery: false,
         };
         match coordinator.start("conformance", endpoint, &config) {
             Ok(start) => {
@@ -251,13 +358,19 @@ fn run_oauth_conformance(
         let endpoint_url = url::Url::parse(endpoint)?;
         let config = McpOAuthConfig {
             client_id: configured_client_id,
+            client_metadata_url: None,
             client_secret_credential_id,
+            private_key_jwt_credential_id: None,
+            private_key_jwt_signing_algorithm: None,
+            private_key_jwt_key_id: None,
             token_endpoint_auth_method: None,
             resource_metadata_url: String::new(),
             credential_id: "mcp:conformance:access".to_owned(),
             scopes: challenge_scopes,
             callback_port: None,
             expected_issuer: Some(endpoint_url.origin().ascii_serialization()),
+            legacy_same_origin_issuer_discovery: scenario
+                == "auth/2025-03-26-oauth-metadata-backcompat",
         };
         let start = coordinator.start("conformance", endpoint, &config)?;
         selected = Some((config, start));
@@ -295,6 +408,184 @@ fn run_oauth_conformance(
         credentials,
         http,
     )
+}
+
+fn run_scope_challenge_conformance(
+    endpoint: &str,
+    scenario: &str,
+    protocol_version: &str,
+    anonymous_client: McpClient,
+    anonymous_transport: Arc<StreamableHttpMcpTransport>,
+    credentials: Arc<MemoryCredentialStore>,
+    http: Arc<UreqStreamingTransport>,
+) -> Result<(), Box<dyn Error>> {
+    let initial_error = anonymous_client
+        .list_tools()
+        .expect_err("scope scenario must challenge tools/list");
+    if initial_error.code != "mcp-http-authorization-required" {
+        return Err(initial_error.into());
+    }
+    let initial_challenge = anonymous_transport
+        .authorization_challenge()?
+        .ok_or("scope challenge missing WWW-Authenticate")?;
+    let credential_id = perform_scope_authorization(
+        endpoint,
+        &initial_challenge,
+        credentials.clone(),
+        http.clone(),
+    )?;
+    let (client, transport) = authenticated_client(
+        endpoint,
+        protocol_version,
+        &credential_id,
+        credentials.clone(),
+        http.clone(),
+    )?;
+    if scenario == "auth/scope-step-up" {
+        let tools = client.list_tools()?;
+        let tool_name = tools
+            .iter()
+            .find(|tool| tool.name == "test-tool")
+            .map(|tool| tool.name.clone())
+            .ok_or("scope step-up test tool missing")?;
+        let error = client
+            .call_tool(&tool_name, serde_json::json!({}))
+            .expect_err("scope step-up tools/call must challenge");
+        if error.code != "mcp-http-authorization-required" {
+            return Err(error.into());
+        }
+        let challenge = transport
+            .authorization_challenge()?
+            .ok_or("scope escalation challenge missing")?;
+        perform_scope_authorization(endpoint, &challenge, credentials.clone(), http.clone())?;
+        let (elevated, _) = authenticated_client(
+            endpoint,
+            protocol_version,
+            &credential_id,
+            credentials,
+            http,
+        )?;
+        let result = elevated.call_tool(&tool_name, serde_json::json!({}))?;
+        if result.is_error {
+            return Err("scope-elevated tool returned isError".into());
+        }
+        elevated.close()?;
+        return Ok(());
+    }
+
+    let error = client
+        .list_tools()
+        .expect_err("scope retry scenario must continue challenging");
+    if error.code != "mcp-http-authorization-required" {
+        return Err(error.into());
+    }
+    let challenge = transport
+        .authorization_challenge()?
+        .ok_or("scope retry challenge missing")?;
+    perform_scope_authorization(endpoint, &challenge, credentials.clone(), http.clone())?;
+    let (retried, _) = authenticated_client(
+        endpoint,
+        protocol_version,
+        &credential_id,
+        credentials,
+        http,
+    )?;
+    let _ = retried.list_tools();
+    // Two authorization attempts prove retry behavior while remaining below the hard maximum of 3.
+    Ok(())
+}
+
+fn perform_scope_authorization(
+    endpoint: &str,
+    challenge: &str,
+    credentials: Arc<MemoryCredentialStore>,
+    http: Arc<UreqStreamingTransport>,
+) -> Result<String, Box<dyn Error>> {
+    let scopes: Vec<String> = challenge_parameter(challenge, "scope")
+        .map(|value| value.split_whitespace().map(str::to_owned).collect())
+        .unwrap_or_default();
+    let candidates = resource_metadata_candidates(endpoint, Some(challenge))?;
+    let coordinator = McpOAuthCoordinator::new(credentials, http.clone());
+    for resource_metadata_url in candidates {
+        let config = McpOAuthConfig {
+            client_id: String::new(),
+            client_metadata_url: None,
+            client_secret_credential_id: None,
+            private_key_jwt_credential_id: None,
+            private_key_jwt_signing_algorithm: None,
+            private_key_jwt_key_id: None,
+            token_endpoint_auth_method: None,
+            resource_metadata_url,
+            credential_id: "mcp:conformance:access".to_owned(),
+            scopes: scopes.clone(),
+            callback_port: None,
+            expected_issuer: None,
+            legacy_same_origin_issuer_discovery: false,
+        };
+        match coordinator.start("scope", endpoint, &config) {
+            Ok(start) => {
+                complete_authorization(&coordinator, "scope", &config, start, &http)?;
+                return Ok(config.credential_id);
+            }
+            Err(error) if error.code == "mcp-oauth-metadata-status" => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err("scope OAuth metadata discovery failed".into())
+}
+
+fn complete_authorization(
+    coordinator: &McpOAuthCoordinator,
+    server_id: &str,
+    config: &McpOAuthConfig,
+    start: harness_mcp::McpOAuthStart,
+    http: &Arc<UreqStreamingTransport>,
+) -> Result<(), Box<dyn Error>> {
+    let mut authorization = http
+        .send(StreamingHttpRequest::get(
+            start.authorization_url,
+            Duration::from_secs(30),
+        ))
+        .map_err(|error| format!("{}: {}", error.code, error.message))?;
+    let mut body = Vec::new();
+    authorization.body.read_to_end(&mut body)?;
+    let wait_started = Instant::now();
+    loop {
+        match coordinator.finish(server_id, config) {
+            Ok(status) if status.authenticated => return Ok(()),
+            Ok(_) => return Err("OAuth finish did not authenticate".into()),
+            Err(error)
+                if error.code == "mcp-oauth-callback-pending"
+                    && wait_started.elapsed() < Duration::from_secs(3) =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn authenticated_client(
+    endpoint: &str,
+    protocol_version: &str,
+    credential_id: &str,
+    credentials: Arc<MemoryCredentialStore>,
+    http: Arc<UreqStreamingTransport>,
+) -> Result<(McpClient, Arc<StreamableHttpMcpTransport>), Box<dyn Error>> {
+    let transport = StreamableHttpMcpTransport::new(
+        McpStreamableHttpConfig {
+            endpoint: endpoint.to_owned(),
+            bearer_credential_id: Some(credential_id.to_owned()),
+            oauth: None,
+            legacy_sse_fallback: false,
+            request_timeout_millis: Some(30_000),
+            max_response_bytes: Some(4 * 1024 * 1024),
+        },
+        credentials,
+        http,
+    )?;
+    let client = McpClient::initialize_with_version(transport.clone(), protocol_version)?;
+    Ok((client, transport))
 }
 
 fn verify_authenticated(
@@ -349,7 +640,20 @@ fn resource_metadata_candidates(
 fn challenge_parameter(challenge: &str, name: &str) -> Option<String> {
     challenge.split(',').find_map(|part| {
         let part = part.trim();
+        let part = part
+            .strip_prefix("Bearer ")
+            .or_else(|| part.strip_prefix("bearer "))
+            .unwrap_or(part);
         let value = part.strip_prefix(&format!("{name}="))?;
         Some(value.trim_matches('"').to_owned())
     })
+}
+
+fn context_string(context: &serde_json::Value, name: &str) -> Result<String, Box<dyn Error>> {
+    context
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("conformance context missing {name}").into())
 }

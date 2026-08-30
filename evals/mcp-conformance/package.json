@@ -1,0 +1,10 @@
+{
+  "name": "kernary-mcp-conformance-referee",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Pinned official MCP referee used only by Kernary CI",
+  "dependencies": {
+    "@modelcontextprotocol/conformance": "0.1.16",
+    "@modelcontextprotocol/sdk": "1.27.1"
+  }
+}

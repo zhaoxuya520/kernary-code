@@ -5,8 +5,13 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use harness_auth::{CredentialId, CredentialStore, SecretString};
 use harness_http::{StreamingHttpRequest, StreamingHttpTransport};
+use ring::{
+    rand::SystemRandom,
+    signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, RSA_PKCS1_SHA256, RsaKeyPair},
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -20,8 +25,21 @@ const MAX_METADATA_BYTES: usize = 1024 * 1024;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct McpOAuthConfig {
     pub client_id: String,
+    /// HTTPS URL used as the OAuth client ID when the authorization server
+    /// advertises Client ID Metadata Document support (SEP-991).
+    #[serde(default)]
+    pub client_metadata_url: Option<String>,
     #[serde(default)]
     pub client_secret_credential_id: Option<String>,
+    /// OS credential-store reference containing a PKCS#8 PEM private key.
+    #[serde(default)]
+    pub private_key_jwt_credential_id: Option<String>,
+    /// JWS algorithm for `private_key_jwt`; currently ES256 and RS256.
+    #[serde(default)]
+    pub private_key_jwt_signing_algorithm: Option<String>,
+    /// Optional JWS `kid` header supplied by the client's out-of-band registration.
+    #[serde(default)]
+    pub private_key_jwt_key_id: Option<String>,
     #[serde(default)]
     pub token_endpoint_auth_method: Option<String>,
     pub resource_metadata_url: String,
@@ -30,6 +48,10 @@ pub struct McpOAuthConfig {
     pub scopes: Vec<String>,
     pub callback_port: Option<u16>,
     pub expected_issuer: Option<String>,
+    /// 2025-03-26 compatibility: root metadata may identify a same-origin
+    /// authorization-server issuer with a path component.
+    #[serde(default)]
+    pub legacy_same_origin_issuer_discovery: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,19 +73,36 @@ pub struct McpOAuthStatus {
     pub credential_id: Option<String>,
 }
 
+/// SEP-990 enterprise cross-app access inputs. Secret values stay in the
+/// credential store; this serializable config only carries stable references.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpCrossAppAccessConfig {
+    pub idp_issuer: String,
+    #[serde(default)]
+    pub idp_token_endpoint: Option<String>,
+    pub idp_client_id: String,
+    pub idp_id_token_credential_id: String,
+}
+
 #[derive(Clone, Debug)]
 struct AuthorizationMetadata {
     issuer: String,
     authorization_endpoint: String,
     token_endpoint: String,
     registration_endpoint: Option<String>,
+    client_id_metadata_document_supported: bool,
     token_endpoint_auth_methods: Vec<String>,
+    token_endpoint_auth_signing_algorithms: Vec<String>,
     scopes_supported: Vec<String>,
 }
 
 struct RegisteredClient {
     client_id: String,
-    client_secret: Option<String>,
+    client_secret: Option<SecretString>,
+    private_key: Option<SecretString>,
+    private_key_signing_algorithm: Option<String>,
+    private_key_id: Option<String>,
     token_endpoint_auth_method: String,
 }
 
@@ -259,6 +298,9 @@ impl McpOAuthCoordinator {
         let client = RegisteredClient {
             client_id: config.client_id.clone(),
             client_secret: None,
+            private_key: None,
+            private_key_signing_algorithm: None,
+            private_key_id: None,
             token_endpoint_auth_method: "none".to_owned(),
         };
         let token = self.exchange_token(
@@ -302,6 +344,149 @@ impl McpOAuthCoordinator {
             fields.push(("scope".to_owned(), scopes.join(" ")));
         }
         let token = self.exchange_token(&metadata, fields, &client)?;
+        self.store_tokens(config, token)?;
+        self.status(server_id, Some(config))
+    }
+
+    pub fn cross_app_access(
+        &self,
+        server_id: &str,
+        resource_endpoint: &str,
+        config: &McpOAuthConfig,
+        cross_app: &McpCrossAppAccessConfig,
+    ) -> Result<McpOAuthStatus, McpError> {
+        validate_oauth_config(resource_endpoint, config)?;
+        validate_cross_app_config(cross_app)?;
+        if config.client_id.trim().is_empty() {
+            return Err(McpError::new(
+                "mcp-oauth-cross-app-client-id-missing",
+                server_id,
+            ));
+        }
+        let (resource, authorization_metadata) = self.discover(resource_endpoint, config)?;
+        let client = self.resolve_client(config, &authorization_metadata, "")?;
+        if !matches!(
+            client.token_endpoint_auth_method.as_str(),
+            "client_secret_basic" | "client_secret_post"
+        ) {
+            return Err(McpError::new(
+                "mcp-oauth-cross-app-client-auth-unsupported",
+                client.token_endpoint_auth_method,
+            ));
+        }
+
+        let idp_metadata = fetch_json(
+            &self.transport,
+            &openid_metadata_url(&cross_app.idp_issuer)?,
+            Duration::from_secs(15),
+        )?;
+        let discovered_idp_issuer = required_url_field(&idp_metadata, "issuer")?;
+        if normalize_url(&discovered_idp_issuer)? != normalize_url(&cross_app.idp_issuer)? {
+            return Err(McpError::new(
+                "mcp-oauth-cross-app-idp-issuer-mismatch",
+                discovered_idp_issuer,
+            ));
+        }
+        let discovered_token_endpoint = required_url_field(&idp_metadata, "token_endpoint")?;
+        let idp_token_endpoint = if let Some(configured) = &cross_app.idp_token_endpoint {
+            if normalize_url(configured)? != normalize_url(&discovered_token_endpoint)? {
+                return Err(McpError::new(
+                    "mcp-oauth-cross-app-idp-token-endpoint-mismatch",
+                    configured,
+                ));
+            }
+            configured.clone()
+        } else {
+            discovered_token_endpoint
+        };
+        let id_token = self
+            .credentials
+            .get(&CredentialId::new(
+                cross_app.idp_id_token_credential_id.clone(),
+            ))
+            .map_err(|error| McpError::new(error.code, error.message))?
+            .ok_or_else(|| {
+                McpError::new(
+                    "mcp-oauth-cross-app-id-token-missing",
+                    &cross_app.idp_id_token_credential_id,
+                )
+            })?;
+        let id_token = id_token
+            .expose_secret()
+            .map_err(|error| McpError::new(error.code, error.message))?;
+        let idp_response = self
+            .transport
+            .send(StreamingHttpRequest::form(
+                idp_token_endpoint,
+                vec![
+                    (
+                        "grant_type".to_owned(),
+                        "urn:ietf:params:oauth:grant-type:token-exchange".to_owned(),
+                    ),
+                    ("subject_token".to_owned(), id_token.to_owned()),
+                    (
+                        "subject_token_type".to_owned(),
+                        "urn:ietf:params:oauth:token-type:id_token".to_owned(),
+                    ),
+                    (
+                        "requested_token_type".to_owned(),
+                        "urn:ietf:params:oauth:token-type:id-jag".to_owned(),
+                    ),
+                    ("audience".to_owned(), authorization_metadata.issuer.clone()),
+                    ("resource".to_owned(), resource.clone()),
+                    ("client_id".to_owned(), cross_app.idp_client_id.clone()),
+                ],
+                Duration::from_secs(30),
+            ))
+            .map_err(|error| McpError::new(error.code, error.message).retryable(error.timeout))?;
+        if !(200..300).contains(&idp_response.status) {
+            return Err(McpError::new(
+                "mcp-oauth-cross-app-token-exchange-status",
+                idp_response.status.to_string(),
+            ));
+        }
+        let identity_grant: IdentityTokenExchangeResponse =
+            serde_json::from_value(read_json_response(idp_response.body)?).map_err(|error| {
+                McpError::new("mcp-oauth-cross-app-token-invalid", error.to_string())
+            })?;
+        if identity_grant.access_token.is_empty()
+            || identity_grant.issued_token_type != "urn:ietf:params:oauth:token-type:id-jag"
+        {
+            return Err(McpError::new(
+                "mcp-oauth-cross-app-token-type-invalid",
+                identity_grant.issued_token_type,
+            ));
+        }
+        if identity_grant.access_token.len() > 256 * 1024 {
+            return Err(McpError::new(
+                "mcp-oauth-cross-app-token-too-large",
+                identity_grant.access_token.len().to_string(),
+            ));
+        }
+        let identity_grant = SecretString::new(identity_grant.access_token);
+        let mut fields = vec![
+            (
+                "grant_type".to_owned(),
+                "urn:ietf:params:oauth:grant-type:jwt-bearer".to_owned(),
+            ),
+            (
+                "assertion".to_owned(),
+                identity_grant
+                    .expose_secret()
+                    .map(str::to_owned)
+                    .map_err(|error| McpError::new(error.code, error.message))?,
+            ),
+            ("resource".to_owned(), resource),
+        ];
+        let scopes = if config.scopes.is_empty() {
+            authorization_metadata.scopes_supported.clone()
+        } else {
+            config.scopes.clone()
+        };
+        if !scopes.is_empty() {
+            fields.push(("scope".to_owned(), scopes.join(" ")));
+        }
+        let token = self.exchange_token(&authorization_metadata, fields, &client)?;
         self.store_tokens(config, token)?;
         self.status(server_id, Some(config))
     }
@@ -426,7 +611,11 @@ impl McpOAuthCoordinator {
                 Err(error) => return Err(error),
             };
         let returned_issuer = required_url_field(&authorization, "issuer")?;
-        if normalize_url(&returned_issuer)? != normalize_url(&issuer)? {
+        let exact_issuer = normalize_url(&returned_issuer)? == normalize_url(&issuer)?;
+        let legacy_same_origin_issuer = config.legacy_same_origin_issuer_discovery
+            && config.resource_metadata_url.is_empty()
+            && urls_have_same_origin(&returned_issuer, &issuer)?;
+        if !exact_issuer && !legacy_same_origin_issuer {
             return Err(McpError::new(
                 "mcp-oauth-metadata-issuer-mismatch",
                 returned_issuer,
@@ -456,6 +645,18 @@ impl McpOAuthCoordinator {
                     })
             })
             .transpose()?;
+        let client_id_metadata_document_supported = authorization
+            .get("client_id_metadata_document_supported")
+            .map(|value| {
+                value.as_bool().ok_or_else(|| {
+                    McpError::new(
+                        "mcp-oauth-client-metadata-support-invalid",
+                        "client_id_metadata_document_supported",
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or(false);
         let token_endpoint_auth_methods = authorization
             .get("token_endpoint_auth_methods_supported")
             .and_then(serde_json::Value::as_array)
@@ -468,6 +669,34 @@ impl McpOAuthCoordinator {
             })
             .filter(|methods| !methods.is_empty())
             .unwrap_or_else(|| vec!["none".to_owned()]);
+        let token_endpoint_auth_signing_algorithms = authorization
+            .get("token_endpoint_auth_signing_alg_values_supported")
+            .map(|value| {
+                value
+                    .as_array()
+                    .ok_or_else(|| {
+                        McpError::new(
+                            "mcp-oauth-token-signing-algs-invalid",
+                            "token_endpoint_auth_signing_alg_values_supported",
+                        )
+                    })?
+                    .iter()
+                    .map(|algorithm| {
+                        algorithm
+                            .as_str()
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| {
+                                McpError::new(
+                                    "mcp-oauth-token-signing-alg-invalid",
+                                    "token_endpoint_auth_signing_alg_values_supported",
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(|algorithms| algorithms.into_iter().map(str::to_owned).collect())
+            })
+            .transpose()?
+            .unwrap_or_default();
         let scopes_supported = authorization
             .get("scopes_supported")
             .or_else(|| {
@@ -495,7 +724,9 @@ impl McpOAuthCoordinator {
                 )?,
                 token_endpoint: required_url_field(&authorization, "token_endpoint")?,
                 registration_endpoint,
+                client_id_metadata_document_supported,
                 token_endpoint_auth_methods,
+                token_endpoint_auth_signing_algorithms,
                 scopes_supported,
             },
         ))
@@ -517,27 +748,53 @@ impl McpOAuthCoordinator {
                         .map_err(|error| McpError::new(error.code, error.message))?
                         .ok_or_else(|| {
                             McpError::new("mcp-oauth-client-secret-missing", credential_id)
-                        })?
-                        .expose_secret()
-                        .map(str::to_owned)
-                        .map_err(|error| McpError::new(error.code, error.message))
+                        })
                 })
                 .transpose()?;
+            let private_key = config
+                .private_key_jwt_credential_id
+                .as_ref()
+                .map(|credential_id| {
+                    self.credentials
+                        .get(&CredentialId::new(credential_id.clone()))
+                        .map_err(|error| McpError::new(error.code, error.message))?
+                        .ok_or_else(|| {
+                            McpError::new("mcp-oauth-private-key-missing", credential_id)
+                        })
+                })
+                .transpose()?;
+            if client_secret.is_some() && private_key.is_some() {
+                return Err(McpError::new(
+                    "mcp-oauth-client-credential-conflict",
+                    "client secret and private key cannot both be configured",
+                ));
+            }
             let token_endpoint_auth_method = config
                 .token_endpoint_auth_method
                 .clone()
                 .or_else(|| {
-                    client_secret.as_ref().and_then(|_| {
-                        ["client_secret_basic", "client_secret_post"]
-                            .into_iter()
-                            .find(|method| {
-                                metadata
-                                    .token_endpoint_auth_methods
-                                    .iter()
-                                    .any(|supported| supported == method)
+                    private_key
+                        .as_ref()
+                        .and_then(|_| {
+                            metadata
+                                .token_endpoint_auth_methods
+                                .iter()
+                                .any(|method| method == "private_key_jwt")
+                                .then(|| "private_key_jwt".to_owned())
+                        })
+                        .or_else(|| {
+                            client_secret.as_ref().and_then(|_| {
+                                ["client_secret_basic", "client_secret_post"]
+                                    .into_iter()
+                                    .find(|method| {
+                                        metadata
+                                            .token_endpoint_auth_methods
+                                            .iter()
+                                            .any(|supported| supported == method)
+                                    })
+                                    .map(str::to_owned)
                             })
-                            .map(str::to_owned)
-                    })
+                        })
                 })
                 .unwrap_or_else(|| "none".to_owned());
             if !metadata
@@ -550,9 +807,106 @@ impl McpOAuthCoordinator {
                     token_endpoint_auth_method,
                 ));
             }
+            let private_key_signing_algorithm = if token_endpoint_auth_method == "private_key_jwt" {
+                if client_secret.is_some() {
+                    return Err(McpError::new(
+                        "mcp-oauth-client-credential-conflict",
+                        "private_key_jwt cannot use a client secret",
+                    ));
+                }
+                if private_key.is_none() {
+                    return Err(McpError::new(
+                        "mcp-oauth-private-key-missing",
+                        "private_key_jwt",
+                    ));
+                }
+                let algorithm = config
+                    .private_key_jwt_signing_algorithm
+                    .as_deref()
+                    .ok_or_else(|| {
+                        McpError::new("mcp-oauth-private-key-algorithm-missing", "private_key_jwt")
+                    })?;
+                if !matches!(algorithm, "ES256" | "RS256") {
+                    return Err(McpError::new(
+                        "mcp-oauth-private-key-algorithm-unsupported",
+                        algorithm,
+                    ));
+                }
+                if !metadata
+                    .token_endpoint_auth_signing_algorithms
+                    .iter()
+                    .any(|supported| supported == algorithm)
+                {
+                    return Err(McpError::new(
+                        "mcp-oauth-private-key-algorithm-not-advertised",
+                        algorithm,
+                    ));
+                }
+                Some(algorithm.to_owned())
+            } else {
+                if private_key.is_some() {
+                    return Err(McpError::new(
+                        "mcp-oauth-private-key-auth-method-mismatch",
+                        token_endpoint_auth_method,
+                    ));
+                }
+                if token_endpoint_auth_method == "none" && client_secret.is_some() {
+                    return Err(McpError::new(
+                        "mcp-oauth-client-secret-auth-method-mismatch",
+                        token_endpoint_auth_method,
+                    ));
+                }
+                if matches!(
+                    token_endpoint_auth_method.as_str(),
+                    "client_secret_basic" | "client_secret_post"
+                ) && client_secret.is_none()
+                {
+                    return Err(McpError::new(
+                        "mcp-oauth-client-secret-missing",
+                        token_endpoint_auth_method,
+                    ));
+                }
+                None
+            };
             return Ok(RegisteredClient {
                 client_id: config.client_id.clone(),
                 client_secret,
+                private_key,
+                private_key_signing_algorithm,
+                private_key_id: config.private_key_jwt_key_id.clone(),
+                token_endpoint_auth_method,
+            });
+        }
+        if metadata.client_id_metadata_document_supported
+            && let Some(client_metadata_url) = config.client_metadata_url.as_deref()
+        {
+            validate_client_metadata_url(client_metadata_url)?;
+            let token_endpoint_auth_method = config
+                .token_endpoint_auth_method
+                .clone()
+                .unwrap_or_else(|| "none".to_owned());
+            if token_endpoint_auth_method != "none" {
+                return Err(McpError::new(
+                    "mcp-oauth-client-metadata-auth-unsupported",
+                    token_endpoint_auth_method,
+                ));
+            }
+            if !metadata
+                .token_endpoint_auth_methods
+                .iter()
+                .any(|supported| supported == &token_endpoint_auth_method)
+            {
+                return Err(McpError::new(
+                    "mcp-oauth-token-auth-unsupported",
+                    token_endpoint_auth_method,
+                ));
+            }
+            return Ok(RegisteredClient {
+                client_id: client_metadata_url.to_owned(),
+                client_secret: None,
+                private_key: None,
+                private_key_signing_algorithm: None,
+                private_key_id: None,
                 token_endpoint_auth_method,
             });
         }
@@ -606,7 +960,7 @@ impl McpOAuthCoordinator {
         let client_secret = value
             .get("client_secret")
             .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
+            .map(SecretString::new);
         let token_endpoint_auth_method = value
             .get("token_endpoint_auth_method")
             .and_then(serde_json::Value::as_str)
@@ -625,6 +979,9 @@ impl McpOAuthCoordinator {
         Ok(RegisteredClient {
             client_id,
             client_secret,
+            private_key: None,
+            private_key_signing_algorithm: None,
+            private_key_id: None,
             token_endpoint_auth_method,
         })
     }
@@ -644,22 +1001,59 @@ impl McpOAuthCoordinator {
             "none" => fields.push(("client_id".to_owned(), client.client_id.clone())),
             "client_secret_post" => {
                 fields.push(("client_id".to_owned(), client.client_id.clone()));
+                let secret = client.client_secret.as_ref().ok_or_else(|| {
+                    McpError::new("mcp-oauth-client-secret-missing", "client_secret_post")
+                })?;
                 fields.push((
                     "client_secret".to_owned(),
-                    client.client_secret.clone().ok_or_else(|| {
-                        McpError::new("mcp-oauth-client-secret-missing", "client_secret_post")
-                    })?,
+                    secret
+                        .expose_secret()
+                        .map(str::to_owned)
+                        .map_err(|error| McpError::new(error.code, error.message))?,
                 ));
             }
             "client_secret_basic" => {
                 let secret = client.client_secret.as_ref().ok_or_else(|| {
                     McpError::new("mcp-oauth-client-secret-missing", "client_secret_basic")
                 })?;
+                let secret = secret
+                    .expose_secret()
+                    .map_err(|error| McpError::new(error.code, error.message))?;
                 let encoded = base64_standard(format!("{}:{secret}", client.client_id).as_bytes());
                 request = request.with_sensitive_header(
                     "Authorization",
                     SecretString::new(format!("Basic {encoded}")),
                 );
+            }
+            "private_key_jwt" => {
+                let private_key = client.private_key.as_ref().ok_or_else(|| {
+                    McpError::new("mcp-oauth-private-key-missing", "private_key_jwt")
+                })?;
+                let private_key = private_key
+                    .expose_secret()
+                    .map_err(|error| McpError::new(error.code, error.message))?;
+                let algorithm =
+                    client
+                        .private_key_signing_algorithm
+                        .as_deref()
+                        .ok_or_else(|| {
+                            McpError::new(
+                                "mcp-oauth-private-key-algorithm-missing",
+                                "private_key_jwt",
+                            )
+                        })?;
+                let assertion = sign_client_assertion(
+                    &client.client_id,
+                    &metadata.issuer,
+                    private_key,
+                    algorithm,
+                    client.private_key_id.as_deref(),
+                )?;
+                fields.push((
+                    "client_assertion_type".to_owned(),
+                    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".to_owned(),
+                ));
+                fields.push(("client_assertion".to_owned(), assertion));
             }
             method => return Err(McpError::new("mcp-oauth-token-auth-unsupported", method)),
         }
@@ -722,6 +1116,14 @@ struct TokenResponse {
     _expires_in: Option<u64>,
     #[serde(rename = "scope")]
     _scope: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct IdentityTokenExchangeResponse {
+    access_token: String,
+    issued_token_type: String,
+    #[serde(rename = "token_type")]
+    _token_type: Option<String>,
 }
 
 fn fetch_json(
@@ -874,6 +1276,12 @@ fn validate_oauth_config(resource_endpoint: &str, config: &McpOAuthConfig) -> Re
         })?;
         validate_https_or_loopback(issuer)?;
     } else {
+        if config.legacy_same_origin_issuer_discovery {
+            return Err(McpError::new(
+                "mcp-oauth-legacy-issuer-mode-invalid",
+                "legacy issuer discovery requires PRM to be unavailable",
+            ));
+        }
         validate_https_or_loopback(&config.resource_metadata_url)?;
     }
     if config.credential_id.trim().is_empty() {
@@ -882,12 +1290,65 @@ fn validate_oauth_config(resource_endpoint: &str, config: &McpOAuthConfig) -> Re
             "credentialId required",
         ));
     }
+    if let Some(client_metadata_url) = config.client_metadata_url.as_deref() {
+        validate_client_metadata_url(client_metadata_url)?;
+    }
     if config
         .scopes
         .iter()
         .any(|scope| scope.trim().is_empty() || scope.contains(char::is_whitespace))
     {
         return Err(McpError::new("mcp-oauth-scope-invalid", "scope"));
+    }
+    Ok(())
+}
+
+fn validate_cross_app_config(config: &McpCrossAppAccessConfig) -> Result<(), McpError> {
+    validate_https_or_loopback(&config.idp_issuer)?;
+    let issuer = Url::parse(&config.idp_issuer)
+        .map_err(|error| McpError::new("mcp-oauth-cross-app-idp-issuer", error.to_string()))?;
+    if issuer.query().is_some() {
+        return Err(McpError::new(
+            "mcp-oauth-cross-app-idp-issuer-query",
+            &config.idp_issuer,
+        ));
+    }
+    if let Some(token_endpoint) = config.idp_token_endpoint.as_deref() {
+        validate_https_or_loopback(token_endpoint)?;
+    }
+    if config.idp_client_id.trim().is_empty() || config.idp_client_id.len() > 8 * 1024 {
+        return Err(McpError::new(
+            "mcp-oauth-cross-app-idp-client-id-invalid",
+            "idpClientId",
+        ));
+    }
+    if config.idp_id_token_credential_id.trim().is_empty() {
+        return Err(McpError::new(
+            "mcp-oauth-cross-app-id-token-credential-invalid",
+            "idpIdTokenCredentialId",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_client_metadata_url(value: &str) -> Result<(), McpError> {
+    let url = Url::parse(value).map_err(|error| {
+        McpError::new("mcp-oauth-client-metadata-url-invalid", error.to_string())
+    })?;
+    if url.scheme() != "https" {
+        return Err(McpError::new(
+            "mcp-oauth-client-metadata-url-insecure",
+            value,
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        return Err(McpError::new("mcp-oauth-client-metadata-url-unsafe", value));
+    }
+    if matches!(url.path(), "" | "/") {
+        return Err(McpError::new(
+            "mcp-oauth-client-metadata-path-required",
+            value,
+        ));
     }
     Ok(())
 }
@@ -950,6 +1411,14 @@ fn resource_matches_endpoint(resource: &str, endpoint: &str) -> Result<bool, Mcp
     Ok(resource.origin() == endpoint.origin()
         && matches!(resource.path(), "" | "/")
         && resource.query().is_none())
+}
+
+fn urls_have_same_origin(left: &str, right: &str) -> Result<bool, McpError> {
+    let left = Url::parse(left)
+        .map_err(|error| McpError::new("mcp-oauth-url-invalid", error.to_string()))?;
+    let right = Url::parse(right)
+        .map_err(|error| McpError::new("mcp-oauth-url-invalid", error.to_string()))?;
+    Ok(left.origin() == right.origin())
 }
 
 fn validate_https_or_loopback(value: &str) -> Result<(), McpError> {
@@ -1018,6 +1487,128 @@ fn base64_standard(bytes: &[u8]) -> String {
     output
 }
 
+fn sign_client_assertion(
+    client_id: &str,
+    audience: &str,
+    private_key_pem: &str,
+    algorithm: &str,
+    key_id: Option<&str>,
+) -> Result<String, McpError> {
+    if client_id.trim().is_empty() {
+        return Err(McpError::new(
+            "mcp-oauth-client-assertion-client-id-missing",
+            "private_key_jwt",
+        ));
+    }
+    let mut header = serde_json::Map::from_iter([
+        (
+            "alg".to_owned(),
+            serde_json::Value::String(algorithm.to_owned()),
+        ),
+        (
+            "typ".to_owned(),
+            serde_json::Value::String("JWT".to_owned()),
+        ),
+    ]);
+    if let Some(key_id) = key_id {
+        if key_id.is_empty() || key_id.len() > 1024 {
+            return Err(McpError::new("mcp-oauth-private-key-id-invalid", "kid"));
+        }
+        header.insert(
+            "kid".to_owned(),
+            serde_json::Value::String(key_id.to_owned()),
+        );
+    }
+    let issued_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs();
+    let expires_at = issued_at.saturating_add(300);
+    let claims = serde_json::json!({
+        "iss":client_id,
+        "sub":client_id,
+        "aud":audience,
+        "iat":issued_at,
+        "exp":expires_at,
+        "jti":random_base64url(18)?
+    });
+    let header = serde_json::to_vec(&header)
+        .map_err(|error| McpError::new("mcp-oauth-client-assertion-json", error.to_string()))?;
+    let claims = serde_json::to_vec(&claims)
+        .map_err(|error| McpError::new("mcp-oauth-client-assertion-json", error.to_string()))?;
+    let signing_input = format!("{}.{}", base64url(&header), base64url(&claims));
+    let mut private_key_der = decode_pkcs8_pem(private_key_pem)?;
+    let signature = (|| match algorithm {
+        "ES256" => {
+            let random = SystemRandom::new();
+            let key_pair = EcdsaKeyPair::from_pkcs8(
+                &ECDSA_P256_SHA256_FIXED_SIGNING,
+                &private_key_der,
+                &random,
+            )
+            .map_err(|_| McpError::new("mcp-oauth-private-key-invalid", "ES256 PKCS#8"))?;
+            key_pair
+                .sign(&random, signing_input.as_bytes())
+                .map(|signature| signature.as_ref().to_vec())
+                .map_err(|_| McpError::new("mcp-oauth-client-assertion-sign", "ES256"))
+        }
+        "RS256" => {
+            let random = SystemRandom::new();
+            let key_pair = RsaKeyPair::from_pkcs8(&private_key_der)
+                .map_err(|_| McpError::new("mcp-oauth-private-key-invalid", "RS256 PKCS#8"))?;
+            let mut signature = vec![0_u8; key_pair.public().modulus_len()];
+            key_pair
+                .sign(
+                    &RSA_PKCS1_SHA256,
+                    &random,
+                    signing_input.as_bytes(),
+                    &mut signature,
+                )
+                .map_err(|_| McpError::new("mcp-oauth-client-assertion-sign", "RS256"))?;
+            Ok(signature)
+        }
+        other => Err(McpError::new(
+            "mcp-oauth-private-key-algorithm-unsupported",
+            other,
+        )),
+    })();
+    private_key_der.fill(0);
+    let signature = signature?;
+    Ok(format!("{signing_input}.{}", base64url(&signature)))
+}
+
+fn decode_pkcs8_pem(private_key_pem: &str) -> Result<Vec<u8>, McpError> {
+    const MAX_PRIVATE_KEY_PEM_BYTES: usize = 256 * 1024;
+    if private_key_pem.len() > MAX_PRIVATE_KEY_PEM_BYTES {
+        return Err(McpError::new(
+            "mcp-oauth-private-key-too-large",
+            MAX_PRIVATE_KEY_PEM_BYTES.to_string(),
+        ));
+    }
+    let encoded = private_key_pem
+        .trim()
+        .strip_prefix("-----BEGIN PRIVATE KEY-----")
+        .and_then(|value| value.strip_suffix("-----END PRIVATE KEY-----"))
+        .ok_or_else(|| {
+            McpError::new(
+                "mcp-oauth-private-key-format",
+                "PKCS#8 PEM PRIVATE KEY required",
+            )
+        })?
+        .lines()
+        .map(str::trim)
+        .collect::<String>();
+    if encoded.is_empty() {
+        return Err(McpError::new(
+            "mcp-oauth-private-key-format",
+            "empty PKCS#8 PEM",
+        ));
+    }
+    STANDARD
+        .decode(encoded)
+        .map_err(|_| McpError::new("mcp-oauth-private-key-format", "invalid PEM base64"))
+}
+
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
@@ -1044,8 +1635,10 @@ mod tests {
     use std::collections::VecDeque;
     use std::io::{BufReader, Cursor};
 
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use harness_auth::{CredentialStore, MemoryCredentialStore};
     use harness_http::{HttpBody, HttpTransportError, StreamingHttpResponse};
+    use ring::signature::{ECDSA_P256_SHA256_FIXED, KeyPair, UnparsedPublicKey};
 
     use super::*;
 
@@ -1087,7 +1680,11 @@ mod tests {
     fn oauth_config() -> McpOAuthConfig {
         McpOAuthConfig {
             client_id: "public-client".to_owned(),
+            client_metadata_url: None,
             client_secret_credential_id: None,
+            private_key_jwt_credential_id: None,
+            private_key_jwt_signing_algorithm: None,
+            private_key_jwt_key_id: None,
             token_endpoint_auth_method: None,
             resource_metadata_url: "https://mcp.example.test/.well-known/oauth-protected-resource"
                 .to_owned(),
@@ -1095,6 +1692,7 @@ mod tests {
             scopes: vec!["tools.read".to_owned()],
             callback_port: Some(0),
             expected_issuer: Some("https://auth.example.test/tenant".to_owned()),
+            legacy_same_origin_issuer_discovery: false,
         }
     }
 
@@ -1215,6 +1813,256 @@ mod tests {
                 .iter()
                 .any(|(key, value)| key == "code_verifier" && value.len() >= 43)
         );
+    }
+
+    #[test]
+    fn oauth_prefers_client_id_metadata_document_over_dynamic_registration() {
+        let transport = Arc::new(MockTransport {
+            responses: Mutex::new(
+                [
+                    json_response(serde_json::json!({
+                        "resource":"https://mcp.example.test/mcp",
+                        "authorization_servers":["https://auth.example.test/tenant"]
+                    })),
+                    json_response(serde_json::json!({
+                        "issuer":"https://auth.example.test/tenant",
+                        "authorization_endpoint":"https://auth.example.test/authorize",
+                        "token_endpoint":"https://auth.example.test/token",
+                        "registration_endpoint":"https://auth.example.test/register",
+                        "code_challenge_methods_supported":["S256"],
+                        "token_endpoint_auth_methods_supported":["none"],
+                        "client_id_metadata_document_supported":true
+                    })),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            forms: Mutex::new(vec![]),
+        });
+        let coordinator =
+            McpOAuthCoordinator::new(Arc::new(MemoryCredentialStore::new()), transport.clone());
+        let mut config = oauth_config();
+        config.client_id.clear();
+        config.client_metadata_url =
+            Some("https://kernary.dev/oauth/client-metadata.json".to_owned());
+        let started = coordinator
+            .start("cimd", "https://mcp.example.test/mcp", &config)
+            .expect("start CIMD flow without DCR request");
+        let authorization = Url::parse(&started.authorization_url).expect("authorization URL");
+        let query = authorization
+            .query_pairs()
+            .into_owned()
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            query.get("client_id").map(String::as_str),
+            Some("https://kernary.dev/oauth/client-metadata.json")
+        );
+        assert!(
+            transport.responses.lock().expect("responses").is_empty(),
+            "CIMD must not consume a dynamic-registration response"
+        );
+    }
+
+    #[test]
+    fn oauth_rejects_insecure_or_root_client_metadata_urls() {
+        let mut config = oauth_config();
+        config.client_metadata_url = Some("http://kernary.dev/client.json".to_owned());
+        let error = validate_oauth_config("https://mcp.example.test/mcp", &config)
+            .expect_err("HTTP CIMD URL must be rejected");
+        assert_eq!(error.code, "mcp-oauth-client-metadata-url-insecure");
+
+        config.client_metadata_url = Some("https://kernary.dev/".to_owned());
+        let error = validate_oauth_config("https://mcp.example.test/mcp", &config)
+            .expect_err("root CIMD URL must be rejected");
+        assert_eq!(error.code, "mcp-oauth-client-metadata-path-required");
+    }
+
+    #[test]
+    fn private_key_jwt_es256_has_verified_signature_and_required_claims() {
+        let random = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &random)
+            .expect("generate ES256 key");
+        let key_pair =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &random)
+                .expect("parse ES256 key");
+        let encoded = STANDARD.encode(pkcs8.as_ref());
+        let pem = format!("-----BEGIN PRIVATE KEY-----\n{encoded}\n-----END PRIVATE KEY-----\n");
+        let jwt = sign_client_assertion(
+            "client-123",
+            "https://auth.example.test",
+            &pem,
+            "ES256",
+            Some("key-1"),
+        )
+        .expect("sign assertion");
+        let parts = jwt.split('.').collect::<Vec<_>>();
+        assert_eq!(parts.len(), 3);
+        let signature = URL_SAFE_NO_PAD.decode(parts[2]).expect("decode signature");
+        UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, key_pair.public_key().as_ref())
+            .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &signature)
+            .expect("verify ES256 signature");
+
+        let header: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).expect("decode header"))
+                .expect("header JSON");
+        assert_eq!(header["alg"], "ES256");
+        assert_eq!(header["kid"], "key-1");
+        let claims: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).expect("decode claims"))
+                .expect("claims JSON");
+        assert_eq!(claims["iss"], "client-123");
+        assert_eq!(claims["sub"], "client-123");
+        assert_eq!(claims["aud"], "https://auth.example.test");
+        assert!(claims["exp"].as_u64() > claims["iat"].as_u64());
+        assert!(
+            claims["jti"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+    }
+
+    #[test]
+    fn cross_app_access_exchanges_id_token_then_identity_grant() {
+        let transport = Arc::new(MockTransport {
+            responses: Mutex::new(
+                [
+                    json_response(serde_json::json!({
+                        "resource":"https://mcp.example.test/mcp",
+                        "authorization_servers":["https://auth.example.test/tenant"]
+                    })),
+                    json_response(serde_json::json!({
+                        "issuer":"https://auth.example.test/tenant",
+                        "authorization_endpoint":"https://auth.example.test/authorize",
+                        "token_endpoint":"https://auth.example.test/token",
+                        "code_challenge_methods_supported":["S256"],
+                        "token_endpoint_auth_methods_supported":["client_secret_basic"]
+                    })),
+                    json_response(serde_json::json!({
+                        "issuer":"https://idp.example.test",
+                        "token_endpoint":"https://idp.example.test/token"
+                    })),
+                    json_response(serde_json::json!({
+                        "access_token":"signed-id-jag",
+                        "issued_token_type":"urn:ietf:params:oauth:token-type:id-jag",
+                        "token_type":"N_A"
+                    })),
+                    json_response(serde_json::json!({
+                        "access_token":"mcp-access-token",
+                        "token_type":"Bearer"
+                    })),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            forms: Mutex::new(vec![]),
+        });
+        let credentials = Arc::new(MemoryCredentialStore::new());
+        credentials
+            .put(
+                &CredentialId::new("mcp:test:client-secret"),
+                SecretString::new("client-secret"),
+            )
+            .expect("client secret");
+        credentials
+            .put(
+                &CredentialId::new("mcp:test:id-token"),
+                SecretString::new("signed-id-token"),
+            )
+            .expect("ID token");
+        let coordinator = McpOAuthCoordinator::new(credentials.clone(), transport.clone());
+        let mut config = oauth_config();
+        config.client_secret_credential_id = Some("mcp:test:client-secret".to_owned());
+        config.token_endpoint_auth_method = Some("client_secret_basic".to_owned());
+        let status = coordinator
+            .cross_app_access(
+                "cross-app",
+                "https://mcp.example.test/mcp",
+                &config,
+                &McpCrossAppAccessConfig {
+                    idp_issuer: "https://idp.example.test".to_owned(),
+                    idp_token_endpoint: Some("https://idp.example.test/token".to_owned()),
+                    idp_client_id: "idp-client".to_owned(),
+                    idp_id_token_credential_id: "mcp:test:id-token".to_owned(),
+                },
+            )
+            .expect("cross-app access");
+        assert!(status.authenticated);
+        let forms = transport.forms.lock().expect("forms");
+        assert_eq!(forms.len(), 2);
+        assert!(forms[0].iter().any(|(key, value)| {
+            key == "grant_type" && value == "urn:ietf:params:oauth:grant-type:token-exchange"
+        }));
+        assert!(forms[0].iter().any(|(key, value)| {
+            key == "requested_token_type" && value == "urn:ietf:params:oauth:token-type:id-jag"
+        }));
+        assert!(forms[1].iter().any(|(key, value)| {
+            key == "grant_type" && value == "urn:ietf:params:oauth:grant-type:jwt-bearer"
+        }));
+        assert!(
+            forms[1]
+                .iter()
+                .any(|(key, value)| key == "assertion" && value == "signed-id-jag")
+        );
+        drop(forms);
+        assert_eq!(
+            credentials
+                .get(&CredentialId::new("mcp:test:access"))
+                .expect("access read")
+                .expect("access token")
+                .expose_secret()
+                .expect("access UTF-8"),
+            "mcp-access-token"
+        );
+    }
+
+    #[test]
+    fn legacy_metadata_accepts_only_explicit_same_origin_issuer_discovery() {
+        let response = || {
+            json_response(serde_json::json!({
+                "issuer":"https://mcp.example.test/oauth",
+                "authorization_endpoint":"https://mcp.example.test/oauth/authorize",
+                "token_endpoint":"https://mcp.example.test/oauth/token",
+                "code_challenge_methods_supported":["S256"],
+                "token_endpoint_auth_methods_supported":["none"]
+            }))
+        };
+        let mut config = oauth_config();
+        config.resource_metadata_url.clear();
+        config.expected_issuer = Some("https://mcp.example.test".to_owned());
+        config.legacy_same_origin_issuer_discovery = true;
+        let coordinator = McpOAuthCoordinator::new(
+            Arc::new(MemoryCredentialStore::new()),
+            Arc::new(MockTransport {
+                responses: Mutex::new([response()].into_iter().collect()),
+                forms: Mutex::new(vec![]),
+            }),
+        );
+        let (_, metadata) = coordinator
+            .discover("https://mcp.example.test/mcp", &config)
+            .expect("same-origin legacy issuer");
+        assert_eq!(metadata.issuer, "https://mcp.example.test/oauth");
+
+        let coordinator = McpOAuthCoordinator::new(
+            Arc::new(MemoryCredentialStore::new()),
+            Arc::new(MockTransport {
+                responses: Mutex::new(
+                    [json_response(serde_json::json!({
+                        "issuer":"https://evil.example/oauth",
+                        "authorization_endpoint":"https://evil.example/oauth/authorize",
+                        "token_endpoint":"https://evil.example/oauth/token",
+                        "code_challenge_methods_supported":["S256"],
+                        "token_endpoint_auth_methods_supported":["none"]
+                    }))]
+                    .into_iter()
+                    .collect(),
+                ),
+                forms: Mutex::new(vec![]),
+            }),
+        );
+        let error = coordinator
+            .discover("https://mcp.example.test/mcp", &config)
+            .expect_err("cross-origin legacy issuer must be rejected");
+        assert_eq!(error.code, "mcp-oauth-metadata-issuer-mismatch");
     }
 
     #[test]

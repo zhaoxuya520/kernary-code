@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/zhaoxuya520/kernary-code/actions/workflows/ci.yml"><img src="https://github.com/zhaoxuya520/kernary-code/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Apache-2.0"></a>
-  <img src="https://img.shields.io/badge/version-0.13.7-gold.svg" alt="0.13.7">
+  <img src="https://img.shields.io/badge/version-0.13.8-gold.svg" alt="0.13.8">
 </p>
 
 > [!IMPORTANT]
@@ -241,7 +241,7 @@ Kernary 内置 30 个版本化 Agent Profile，覆盖控制面、需求、架构
 kernary --model openai/gpt-5.6-sol exec --json "运行测试并总结结果"
 ```
 
-扩展能力包括 MCP stdio / HTTP / SSE / OAuth、Plugin、Skill、Browser Runtime、LSP 3.18、Git intelligence、Patch Preview 和安全 Undo。Browser、LSP 与 MCP 默认保持惰性，只有命令或 Agent 明确需要时才启动。
+扩展能力包括 MCP stdio / Streamable HTTP / SSE、PKCE OAuth、CIMD、scope step-up 与重试上限、离线访问、Client Credentials（Secret 与 ES256/RS256 `private_key_jwt`）及 SEP-990 Cross-App Access；另含 Plugin、Skill、Browser Runtime、LSP 3.18、Git intelligence、Patch Preview 和安全 Undo。私钥、Client Secret、IdP Token 与访问令牌只通过 Credential Store 引用，Browser、LSP 与 MCP 默认保持惰性，只有命令或 Agent 明确需要时才启动。
 
 ## 开发与验证
 
@@ -258,9 +258,10 @@ npm run fixtures:check
 ```bash
 python scripts/evaluate-cli.py --profile quick
 python scripts/evaluate-cli.py --profile full
+python scripts/run-mcp-conformance.py
 ```
 
-本地工程分与行业 Agent 分严格分离；未运行的 Terminal-Bench、SWE-bench、MCP Conformance 等基准不会冒充领先证据。完整矩阵和同模型配对规则见 [Kernary Evaluation](evals/README.md)。
+本地工程分与行业 Agent 分严格分离；MCP 官方稳定客户端套件当前为 26/26 场景、282/282 checks，Terminal-Bench、SWE-bench 等未运行项目仍不会冒充领先证据。完整矩阵和同模型配对规则见 [Kernary Evaluation](evals/README.md)。
 
 CI 还会构建 Windows x64、Linux x64 和 macOS arm64 便携产物，验证 `kernary` / `harness` 兼容命令、`doctor --json`、归档校验和及启动性能预算。
 

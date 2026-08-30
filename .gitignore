@@ -10,6 +10,7 @@
 /target/
 /dist/
 /node_modules/
+/evals/mcp-conformance/node_modules/
 /npm/kernary-code/node_modules/
 /npm/kernary-code-*/bin/
 /release/bin/
@@ -23,6 +24,8 @@
 *.log
 *.tmp
 *.trace
+__pycache__/
+*.pyc
 
 # 凭证和环境文件。
 .env

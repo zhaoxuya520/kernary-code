@@ -10124,7 +10124,7 @@ fn doctor(
         },
         "sandbox": sandbox_status.clone(),
         "extensions": {
-            "mcp": "oauth-pkce-streamable-http-legacy-sse-lazy",
+            "mcp": "oauth-pkce-cimd-scope-step-up-private-key-jwt-cross-app-streamable-http-sse-lazy",
             "plugin": "isolated-process-lazy",
             "skill": "metadata-first-lazy",
             "agents": "thirty-deep-profiles-fullstack-specialist-dag",
